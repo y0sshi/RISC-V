@@ -15,8 +15,8 @@ $(SIM_TOP).vcd: $(SIM_TOP).o
 $(SIM_TOP).o: $(SIM_FILES) $(MEM_FILES)
 	iverilog -DIVERILOG -o $(SIM_TOP).o -s $(SIM_TOP) $(SIM_FILES)
 
-sim_riscv32.shm: $(SIM_FILES)
-	xmverilog +access+rw $(SIM_FILES)
+sim_rv32i.shm: $(SIM_FILES)
+	xmverilog +access+rw +define+DXMVERILOG $(SIM_FILES)
 
 clean:
-	rm -rf *.log xmvelilog.* *.shm *.o *.vcd
+	rm -rf *.log xmverilog.* *.shm *.o *.vcd xcelium.d *.dump

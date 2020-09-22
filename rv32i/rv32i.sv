@@ -61,7 +61,9 @@ module rv32i
 		end
 	end
 
+	reg [DATA_WIDTH-1:0] ex_result, ex_pc;
 	reg [DATA_WIDTH-1:0] ft_pc;
+	reg ft_pc_we;
 	wire pc_jump_en;
 	always @(posedge clk) begin
 		if (rst) begin
@@ -230,11 +232,9 @@ module rv32i
 	(dc_opcode==`OP_LUI  ) ? dc_imm :
 	(dc_opcode==`OP_AUIPC) ? dc_pc + (dc_imm<<12):
 	alu_dout;
-	reg [DATA_WIDTH-1:0] ex_result, ex_pc;
 	reg [6:0]  ex_opcode;
 	reg [4:0]  ex_rd, ex_rs1, ex_rs2;
 	reg [2:0]  ex_funct3;
-	reg ft_pc_we;
 	always @(posedge clk) begin
 		if (rst) begin
 			ex_result   <=  'd0;
