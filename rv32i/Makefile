@@ -1,7 +1,8 @@
+MEM_SET   = 1
 SIM_TOP   = sim_rv32i
 MODULES   = rv32i.sv dmem.sv
 SIM_FILES = $(SIM_TOP).sv $(MODULES)
-MEM_FILES = mem/imem.dat mem/dmem.dat
+MEM_FILES = mem/memset$(MEM_SET)/imem.dat mem/memset$(MEM_SET)/dmem.dat
 
 all: $(SIM_TOP).vcd
 

@@ -9,7 +9,7 @@ module dmem
 		input  wire                     clk,
 		input  wire [$clog2(DEPTH)-1:0] addr0, addr1,
 		input  wire [DATA_WIDTH-1:0]    din,
-		input  wire                     we,
+		input  wire                     we0, we1, we2,
 		output wire [DATA_WIDTH-1:0]    dout0, dout1
 	);
 
@@ -22,13 +22,17 @@ module dmem
 		for (i=0; i<DEPTH; i+=1) begin
 			mem[i] = 'd0;
 		end
-		$readmemb("mem/imem.dat", mem);
-		$readmemh("mem/dmem.dat", mem);
+		$readmemb("mem/memset1/imem.dat", mem);
+		$readmemh("mem/memset1/dmem.dat", mem);
 	end
 	always @(posedge clk) begin
-		if (we) begin
+		if (we0) begin
 			mem[addr1  ] <= din[31:24];
+		end
+		if (we1) begin
 			mem[addr1+1] <= din[23:16];
+		end
+		if (we2) begin
 			mem[addr1+2] <= din[15: 8];
 			mem[addr1+3] <= din[ 7: 0];
 		end

@@ -45,7 +45,7 @@ module rv32i
 		input  wire [DATA_WIDTH-1:0] ddin,
 		output reg  [DATA_WIDTH-1:0] ddout,
 		output wire [DATA_WIDTH-1:0] daddr,
-		output reg                   dwe,
+		output reg                   dwe0, dwe1, dwe2,
 		input  wire [DATA_WIDTH-1:0] idin,
 		output wire [DATA_WIDTH-1:0] iaddr
 	);
@@ -233,6 +233,7 @@ module rv32i
 	reg [DATA_WIDTH-1:0] ex_result, ex_pc;
 	reg [6:0]  ex_opcode;
 	reg [4:0]  ex_rd, ex_rs1, ex_rs2;
+	reg [2:0]  ex_funct3;
 	reg ft_pc_we;
 	always @(posedge clk) begin
 		if (rst) begin
@@ -242,9 +243,12 @@ module rv32i
 			ex_rd       <= 5'd0;
 			ex_rs1      <= 5'd0;
 			ex_rs2      <= 5'd0;
+			ex_funct3   <= 3'd0;
 			ft_pc_we    <= 1'b0;
 			ddout       <=  'd0;
-			dwe         <= 1'b0;
+			dwe0        <= 1'b0;
+			dwe1        <= 1'b0;
+			dwe2        <= 1'b0;
 		end
 		else begin
 			ex_result   <= alu_result;
@@ -252,9 +256,26 @@ module rv32i
 			ex_rd       <= dc_rd;
 			ex_rs1      <= 5'd0;
 			ex_rs2      <= 5'd0;
+			ex_funct3   <= dc_funct3;
 			ex_opcode   <= dc_opcode;
-			ddout       <= dc_reg1;
-			dwe         <= (dc_opcode==`OP_STORE);
+			if (dc_funct3[1]) begin // SW
+				ddout     <= dc_reg1;
+				dwe0      <= (dc_opcode==`OP_STORE);
+				dwe1      <= (dc_opcode==`OP_STORE);
+				dwe2      <= (dc_opcode==`OP_STORE);
+			end
+			else if (dc_funct3[0]) begin // SH
+				ddout     <= {dc_reg1[15:8], dc_reg1[7:0], 16'd0};
+				dwe0      <= (dc_opcode==`OP_STORE);
+				dwe1      <= (dc_opcode==`OP_STORE);
+				dwe2      <= 1'b0;
+			end
+			else begin // SB
+				ddout     <= {dc_reg1[7:0], 24'd0};
+				dwe0      <= (dc_opcode==`OP_STORE);
+				dwe1      <= 1'b0;
+				dwe2      <= 1'b0;
+			end
 			if (dc_opcode==`OP_BRANCH) begin
 				if      (dc_funct3==3'b000 && dc_reg0 == dc_reg1) begin // BEQ
 					ft_pc_we    <= 1'b1;
@@ -286,6 +307,14 @@ module rv32i
 	assign daddr = ex_result;
 
 	/* MA (MemoryAccess) stage */
+	wire [DATA_WIDTH-1:0] load;
+	assign load = 
+		(ex_funct3==3'b000) ? {{24{ddin[DATA_WIDTH-1]}}, ddin[DATA_WIDTH-1:DATA_WIDTH-8]}  : // LB
+		(ex_funct3==3'b001) ? {{16{ddin[DATA_WIDTH-1]}}, ddin[DATA_WIDTH-1:DATA_WIDTH-15]} : // LH
+		(ex_funct3==3'b100) ? {24'd0, ddin[DATA_WIDTH-1:DATA_WIDTH-8]}                     : // LBU
+		(ex_funct3==3'b101) ? {16'd0, ddin[DATA_WIDTH-1:DATA_WIDTH-15]}                    : // LHU
+		ddin; // LW
+
 	reg [DATA_WIDTH-1:0] ma_result;
 	reg [4:0]  ma_rd;
 	reg reg_file_we;
@@ -297,7 +326,7 @@ module rv32i
 		end
 		else begin
 			ma_result   <= 
-			(ex_opcode==`OP_LOAD) ? ddin :
+			(ex_opcode==`OP_LOAD) ? load :
 			(ex_opcode==`OP_JAL | ex_opcode==`OP_JALR) ? ex_pc: 
 			ex_result;
 			ma_rd       <= ex_rd;
