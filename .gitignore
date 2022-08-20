@@ -1,0 +1,5 @@
+/rv32i/vivado_proj/
+/rv32i/script/*.log
+/rv32i/script/*.jou
+/rv32i/script/*.str
+

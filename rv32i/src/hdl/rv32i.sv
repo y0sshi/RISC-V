@@ -50,39 +50,39 @@ module rv32i
 		output wire [DATA_WIDTH-1:0] iaddr
 	);
 
-	/* FT (Fetch) stage */
-	reg [31:0] ft_instruction;
+	/* IF (Instruction Fetch) stage */
+	reg [DATA_WIDTH-1:0] if_instruction;
 	always @(posedge clk) begin
 		if (rst) begin
-			ft_instruction <= 32'd0;
+			if_instruction <= 32'd0;
 		end
 		else begin
-			ft_instruction <= idin;
+			if_instruction <= idin;
 		end
 	end
 
 	reg [DATA_WIDTH-1:0] ex_result, ex_pc;
-	reg [DATA_WIDTH-1:0] ft_pc;
-	reg ft_pc_we;
+	reg [DATA_WIDTH-1:0] if_pc;
+	reg if_pc_we;
 	wire pc_jump_en;
 	always @(posedge clk) begin
 		if (rst) begin
-			ft_pc <= 32'd0;
+			if_pc <= 32'd0;
 		end
 		else begin
-			ft_pc <= (ft_pc_we) ? ex_result : ft_pc + 32'd4;
+			if_pc <= (if_pc_we) ? ex_result : if_pc + 32'd4;
 		end
 	end
-	assign iaddr = ft_pc;
+	assign iaddr = if_pc;
 
-	/* DC (Decode) stage */
-	reg [31:0] dc_instruction;
+	/* ID (Instruction Decode) stage */
+	reg [DATA_WIDTH-1:0] id_instruction;
 	always @(posedge clk) begin
 		if (rst) begin
-			dc_instruction <= 32'd0;
+			id_instruction <= 32'd0;
 		end
 		else begin
-			dc_instruction <= ft_instruction;
+			id_instruction <= if_instruction;
 		end
 	end
 
@@ -100,18 +100,18 @@ module rv32i
 		.DATA_WIDTH(DATA_WIDTH)
 	)
 	decoder_inst (
-		.instruction (ft_instruction),
-		.opcode      (opcode),
-		.rd          (rd),
-		.funct3      (funct3),
-		.rs1         (rs1),
-		.rs2         (rs2),
-		.funct7      (funct7),
-		.imm_i       (imm_i),
-		.imm_s       (imm_s),
-		.imm_b       (imm_b),
-		.imm_u       (imm_u),
-		.imm_j       (imm_j)
+		.instruction (if_instruction),
+		.opcode      (opcode        ),
+		.rd          (rd            ),
+		.funct3      (funct3        ),
+		.rs1         (rs1           ),
+		.rs2         (rs2           ),
+		.funct7      (funct7        ),
+		.imm_i       (imm_i         ),
+		.imm_s       (imm_s         ),
+		.imm_b       (imm_b         ),
+		.imm_u       (imm_u         ),
+		.imm_j       (imm_j         )
 	);
 
 	wire [2:0] instruction_type;
@@ -135,85 +135,85 @@ module rv32i
 	endfunction
 	assign instruction_type = ir_type(opcode);
 
-	reg [6:0]  dc_opcode;
-	reg [4:0]  dc_rd, dc_rs1, dc_rs2;
-	reg [2:0]  dc_funct3;
-	reg [6:0]  dc_funct7;
-	reg [DATA_WIDTH-1:0] dc_imm, dc_imm_s, dc_reg0, dc_reg1;
-	reg [2:0] dc_type;
+	reg [6:0]  id_opcode;
+	reg [4:0]  id_rd, id_rs1, id_rs2;
+	reg [2:0]  id_funct3;
+	reg [6:0]  id_funct7;
+	reg [DATA_WIDTH-1:0] id_imm, id_imm_s, id_reg0, id_reg1;
+	reg [2:0] id_type;
 	always @(posedge clk) begin
 		if (rst) begin
-			dc_opcode   <= 7'd0;
-			dc_rd       <= 32'd0;
-			dc_rs1      <= 32'd0;
-			dc_rs2      <= 32'd0;
-			dc_funct3   <= 3'd0;
-			dc_funct7   <= 7'd0;
-			dc_imm      <= 32'd0;
-			dc_imm_s    <= 32'd0;
-			dc_reg0     <= 32'd0;
-			dc_reg1     <= 32'd0;
-			dc_type     <= instruction_type;
+			id_opcode   <= 7'd0;
+			id_rd       <= 32'd0;
+			id_rs1      <= 32'd0;
+			id_rs2      <= 32'd0;
+			id_funct3   <= 3'd0;
+			id_funct7   <= 7'd0;
+			id_imm      <= 32'd0;
+			id_imm_s    <= 32'd0;
+			id_reg0     <= 32'd0;
+			id_reg1     <= 32'd0;
+			id_type     <= instruction_type;
 		end
 		else begin
-			dc_opcode <= opcode;
-			dc_rd     <= rd;
-			dc_rs1    <= rs1;
-			dc_rs2    <= rs2;
-			dc_funct3 <= funct3;
-			dc_funct7 <= funct7;
-			dc_reg0   <= reg_file_dout0;
-			dc_reg1   <= reg_file_dout1;
-			dc_type   <= instruction_type;
+			id_opcode <= opcode;
+			id_rd     <= rd;
+			id_rs1    <= rs1;
+			id_rs2    <= rs2;
+			id_funct3 <= funct3;
+			id_funct7 <= funct7;
+			id_reg0   <= reg_file_dout0;
+			id_reg1   <= reg_file_dout1;
+			id_type   <= instruction_type;
 			case (instruction_type)
 				`TYPE_R : begin
-					dc_imm   <= 32'dx;
-					dc_imm_s <= 32'dx;
+					id_imm   <= 32'dx;
+					id_imm_s <= 32'dx;
 				end
 				`TYPE_I : begin
-					dc_imm   <= {20'd0, imm_i};
-					dc_imm_s <= {{20{imm_i[11]}}, imm_i};
+					id_imm   <= {20'd0, imm_i};
+					id_imm_s <= {{20{imm_i[11]}}, imm_i};
 				end
 				`TYPE_S : begin
-					dc_imm   <= {20'd0, imm_s};
-					dc_imm_s <= {{20{imm_s[11]}}, imm_s};
+					id_imm   <= {20'd0, imm_s};
+					id_imm_s <= {{20{imm_s[11]}}, imm_s};
 				end
 				`TYPE_B : begin
-					dc_imm   <= {19'd0, imm_b};
-					dc_imm_s <= {{19{imm_b[12]}}, imm_b};
+					id_imm   <= {19'd0, imm_b};
+					id_imm_s <= {{19{imm_b[12]}}, imm_b};
 				end
 				`TYPE_U : begin
-					dc_imm   <= imm_u;
-					dc_imm_s <= imm_u;
+					id_imm   <= imm_u;
+					id_imm_s <= imm_u;
 				end
 				`TYPE_J : begin
-					dc_imm   <= {19'd0, imm_j};
-					dc_imm_s <= {{11{imm_j[20]}}, imm_j};
+					id_imm   <= {19'd0, imm_j};
+					id_imm_s <= {{11{imm_j[20]}}, imm_j};
 				end
 			endcase
 		end
 	end
 
-	reg [31:0] dc_pc;
+	reg [31:0] id_pc;
 	always @(posedge clk) begin
 		if (rst) begin
-			dc_pc <= 32'd0;
+			id_pc <= 32'd0;
 		end
 		else begin
-			dc_pc <= ft_pc;
+			id_pc <= if_pc;
 		end
 	end
 
-	/* EX (Execute) stage */
+	/* EX (Execution) stage */
 	wire [DATA_WIDTH-1:0] alu_ain, alu_bin, alu_dout;
 	wire [2:0] alu_func;
 	wire       alu_ext, alu_addcom;
 
-	assign alu_addcom = (dc_opcode==`OP_LOAD | dc_opcode == `OP_STORE | dc_opcode==`OP_BRANCH | dc_opcode==`OP_JAL);
-	assign alu_ext    = (dc_opcode==`OP_REGISTER) & dc_funct7[5];
-	assign alu_func   = dc_funct3;
-	assign alu_ain    = (dc_opcode==`OP_BRANCH | dc_opcode==`OP_JAL) ? dc_pc : dc_reg0;
-	assign alu_bin    = (dc_opcode==`OP_REGISTER) ? dc_reg1 : dc_imm_s;
+	assign alu_addcom = (id_opcode==`OP_LOAD | id_opcode == `OP_STORE | id_opcode==`OP_BRANCH | id_opcode==`OP_JAL);
+	assign alu_ext    = (id_opcode==`OP_REGISTER) & id_funct7[5];
+	assign alu_func   = id_funct3;
+	assign alu_ain    = (id_opcode==`OP_BRANCH | id_opcode==`OP_JAL) ? id_pc : id_reg0;
+	assign alu_bin    = (id_opcode==`OP_REGISTER) ? id_reg1 : id_imm_s;
 
 	alu_rv32i #(
 		.DATA_WIDTH(DATA_WIDTH)
@@ -229,8 +229,8 @@ module rv32i
 
 	wire [DATA_WIDTH-1:0] alu_result;
 	assign alu_result =
-	(dc_opcode==`OP_LUI  ) ? dc_imm :
-	(dc_opcode==`OP_AUIPC) ? dc_pc + (dc_imm<<12):
+	(id_opcode==`OP_LUI  ) ? id_imm :
+	(id_opcode==`OP_AUIPC) ? id_pc + (id_imm<<12):
 	alu_dout;
 	reg [6:0]  ex_opcode;
 	reg [4:0]  ex_rd, ex_rs1, ex_rs2;
@@ -244,7 +244,7 @@ module rv32i
 			ex_rs1      <= 5'd0;
 			ex_rs2      <= 5'd0;
 			ex_funct3   <= 3'd0;
-			ft_pc_we    <= 1'b0;
+			if_pc_we    <= 1'b0;
 			ddout       <=  'd0;
 			dwe0        <= 1'b0;
 			dwe1        <= 1'b0;
@@ -252,61 +252,61 @@ module rv32i
 		end
 		else begin
 			ex_result   <= alu_result;
-			ex_pc       <= dc_pc;
-			ex_rd       <= dc_rd;
+			ex_pc       <= id_pc;
+			ex_rd       <= id_rd;
 			ex_rs1      <= 5'd0;
 			ex_rs2      <= 5'd0;
-			ex_funct3   <= dc_funct3;
-			ex_opcode   <= dc_opcode;
-			if (dc_funct3[1]) begin // SW
-				ddout     <= dc_reg1;
-				dwe0      <= (dc_opcode==`OP_STORE);
-				dwe1      <= (dc_opcode==`OP_STORE);
-				dwe2      <= (dc_opcode==`OP_STORE);
+			ex_funct3   <= id_funct3;
+			ex_opcode   <= id_opcode;
+			if (id_funct3[1]) begin // SW
+				ddout     <= id_reg1;
+				dwe0      <= (id_opcode==`OP_STORE);
+				dwe1      <= (id_opcode==`OP_STORE);
+				dwe2      <= (id_opcode==`OP_STORE);
 			end
-			else if (dc_funct3[0]) begin // SH
-				ddout     <= {dc_reg1[15:8], dc_reg1[7:0], 16'd0};
-				dwe0      <= (dc_opcode==`OP_STORE);
-				dwe1      <= (dc_opcode==`OP_STORE);
+			else if (id_funct3[0]) begin // SH
+				ddout     <= {id_reg1[15:8], id_reg1[7:0], 16'd0};
+				dwe0      <= (id_opcode==`OP_STORE);
+				dwe1      <= (id_opcode==`OP_STORE);
 				dwe2      <= 1'b0;
 			end
 			else begin // SB
-				ddout     <= {dc_reg1[7:0], 24'd0};
-				dwe0      <= (dc_opcode==`OP_STORE);
+				ddout     <= {id_reg1[7:0], 24'd0};
+				dwe0      <= (id_opcode==`OP_STORE);
 				dwe1      <= 1'b0;
 				dwe2      <= 1'b0;
 			end
-			if (dc_opcode==`OP_BRANCH) begin
-				if      (dc_funct3==3'b000 && dc_reg0 == dc_reg1) begin // BEQ
-					ft_pc_we    <= 1'b1;
+			if (id_opcode==`OP_BRANCH) begin
+				if      (id_funct3==3'b000 && id_reg0 == id_reg1) begin // BEQ
+					if_pc_we    <= 1'b1;
 				end
-				else if (dc_funct3==3'b001 && dc_reg0 != dc_reg1) begin // BNE
-					ft_pc_we    <= 1'b1;
+				else if (id_funct3==3'b001 && id_reg0 != id_reg1) begin // BNE
+					if_pc_we    <= 1'b1;
 				end
-				else if (dc_funct3==3'b100 && $signed(dc_reg0) <  $signed(dc_reg1)) begin // BLT
-					ft_pc_we    <= 1'b1;
+				else if (id_funct3==3'b100 && $signed(id_reg0) <  $signed(id_reg1)) begin // BLT
+					if_pc_we    <= 1'b1;
 				end
-				else if (dc_funct3==3'b101 && $signed(dc_reg0) >= $signed(dc_reg1)) begin // BGE
-					ft_pc_we    <= 1'b1;
+				else if (id_funct3==3'b101 && $signed(id_reg0) >= $signed(id_reg1)) begin // BGE
+					if_pc_we    <= 1'b1;
 				end
-				else if (dc_funct3==3'b110 && dc_reg0 <  dc_reg1) begin // BLTU
-					ft_pc_we    <= 1'b1;
+				else if (id_funct3==3'b110 && id_reg0 <  id_reg1) begin // BLTU
+					if_pc_we    <= 1'b1;
 				end
-				else if (dc_funct3==3'b111 && dc_reg0 >= dc_reg1) begin // BGEU
-					ft_pc_we    <= 1'b1;
+				else if (id_funct3==3'b111 && id_reg0 >= id_reg1) begin // BGEU
+					if_pc_we    <= 1'b1;
 				end
 				else begin
-					ft_pc_we    <= 1'b0;
+					if_pc_we    <= 1'b0;
 				end
 			end
 			else begin
-				ft_pc_we    <= (dc_opcode==`OP_JAL || dc_opcode==`OP_JALR);
+				if_pc_we    <= (id_opcode==`OP_JAL || id_opcode==`OP_JALR);
 			end
 		end
 	end
 	assign daddr = ex_result;
 
-	/* MA (MemoryAccess) stage */
+	/* MEM (Memory Access) stage */
 	wire [DATA_WIDTH-1:0] load;
 	assign load = 
 		(ex_funct3==3'b000) ? {{24{ddin[DATA_WIDTH-1]}}, ddin[DATA_WIDTH-1:DATA_WIDTH-8]}  : // LB
@@ -315,28 +315,28 @@ module rv32i
 		(ex_funct3==3'b101) ? {16'd0, ddin[DATA_WIDTH-1:DATA_WIDTH-15]}                    : // LHU
 		ddin; // LW
 
-	reg [DATA_WIDTH-1:0] ma_result;
-	reg [4:0]  ma_rd;
+	reg [DATA_WIDTH-1:0] mem_result;
+	reg [4:0]  mem_rd;
 	reg reg_file_we;
 	always @(posedge clk) begin
 		if (rst) begin
-			ma_result   <=  'd0;
-			ma_rd       <= 5'd0;
+			mem_result   <=  'd0;
+			mem_rd       <= 5'd0;
 			reg_file_we <= 1'b0;
 		end
 		else begin
-			ma_result   <= 
+			mem_result   <= 
 			(ex_opcode==`OP_LOAD) ? load :
 			(ex_opcode==`OP_JAL | ex_opcode==`OP_JALR) ? ex_pc: 
 			ex_result;
-			ma_rd       <= ex_rd;
+			mem_rd       <= ex_rd;
 			reg_file_we <= (ex_opcode==`OP_REGISTER | ex_opcode==`OP_LOAD | ex_opcode==`OP_IMMEDIATE | ex_opcode==`OP_LUI | ex_opcode==`OP_AUIPC | ex_opcode==`OP_JAL | ex_opcode==`OP_JALR);
 		end
 	end
 
-	/* WB (WriteBack) stage */
+	/* WB (Write Back) stage */
 	wire [DATA_WIDTH-1:0] reg_file_din;
-	assign reg_file_din = ma_result;
+	assign reg_file_din = mem_result;
 
 	reg_file #(
 		.DATA_WIDTH (DATA_WIDTH),
@@ -347,7 +347,7 @@ module rv32i
 		.rst   (rst),
 		.addr0 (rs1),
 		.addr1 (rs2),
-		.addr2 (ma_rd),
+		.addr2 (mem_rd),
 		.din   (reg_file_din),
 		.we    (reg_file_we),
 		.dout0 (reg_file_dout0),

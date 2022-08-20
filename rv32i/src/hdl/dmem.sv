@@ -22,8 +22,10 @@ module dmem
 		for (i=0; i<DEPTH; i+=1) begin
 			mem[i] = 'd0;
 		end
+		`ifdef SIM
 		$readmemb("mem/memset1/imem.dat", mem);
 		$readmemh("mem/memset1/dmem.dat", mem);
+		`endif
 	end
 	always @(posedge clk) begin
 		if (we0) begin
