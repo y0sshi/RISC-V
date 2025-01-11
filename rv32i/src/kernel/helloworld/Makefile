@@ -10,13 +10,13 @@ ARCH_CFLAGS=-march=rv32i
 
 CFLAGS=$(BASE_CFLAGS) $(OPT_CFLAGS) $(WARN_CFLAGS) $(ARCH_CFLAGS)
 ASFLAGS=$(ARCH_CFLAGS)
-LDFLAGS=-T rv32/link.ld
+LDFLAGS=-T link.ld
 
 C_SRC=$(wildcard *.c **/*.c)
 S_SRC=$(wildcard *.s **/*.s)
 OBJ_FILES=$(C_SRC:.c=.o) $(S_SRC:.s=.o)
 
-TARGET = kernel.x
+TARGET = helloworld.x
 
 $(TARGET): $(OBJ_FILES)
 	$(LD) $(LDFLAGS) -o $@ $^
