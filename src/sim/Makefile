@@ -1,0 +1,353 @@
+# =============================================================================
+# Makefile - iverilog Simulation
+# =============================================================================
+# Usage:
+#   make sim_alu          Run ALU testbench
+#   make sim_csr          Run CSR unit testbench
+#   make sim_rv64i        Run RV64I W-type ALU testbench (XLEN=64)
+#   make sim_mext         Run M-extension testbench (XLEN=32)
+#   make sim_mext64       Run M-extension testbench (XLEN=64, W-type ops)
+#   make sim_amo          Run A-extension AMO compute unit testbench (XLEN=32)
+#   make sim_amo64        Run A-extension AMO compute unit testbench (XLEN=64)
+#   make sim_mmu          Run MMU testbench (Sv32, XLEN=32)
+#   make sim_mmu64        Run MMU testbench (Sv39, XLEN=64)
+#   make sim_sv           Run Supervisor-mode CSR testbench (XLEN=32)
+#   make sim_sv64         Run Supervisor-mode CSR testbench (XLEN=64)
+#   make sim_timer        Run Machine Timer (CLINT) testbench (XLEN=32)
+#   make sim_timer64      Run Machine Timer (CLINT) testbench (XLEN=64)
+#   make sim_uart         Run UART (8N1) testbench
+#   make sim_gpio         Run GPIO testbench (4-bit, OUT/IN/DIR/IRQ_EN)
+#   make sim_plic         Run PLIC testbench (8 sources, 2 contexts)
+#   make sim_pipeline     Run pipeline integration testbench (forwarding/stall/branch/CSR)
+#   make sim_intr         Run interrupt integration testbench (MTIP/MEIP/MSIP/priority/MRET)
+#   make sim_core         Run core integration testbench
+#   make sim_core PROG=path/to/program.hex
+#   make wave_alu         Open ALU waveform in GTKWave
+#   make wave_csr         Open CSR waveform in GTKWave
+#   make wave_rv64i       Open RV64I waveform in GTKWave
+#   make wave_mext        Open M-extension waveform in GTKWave
+#   make wave_mext64      Open M-extension (64-bit) waveform in GTKWave
+#   make wave_amo         Open A-extension waveform in GTKWave
+#   make wave_amo64       Open A-extension (64-bit) waveform in GTKWave
+#   make wave_mmu         Open MMU (Sv32) waveform in GTKWave
+#   make wave_mmu64       Open MMU (Sv39) waveform in GTKWave
+#   make wave_sv          Open Supervisor-mode (32-bit) waveform in GTKWave
+#   make wave_sv64        Open Supervisor-mode (64-bit) waveform in GTKWave
+#   make wave_timer       Open Machine Timer waveform in GTKWave
+#   make wave_uart        Open UART waveform in GTKWave
+#   make wave_gpio        Open GPIO waveform in GTKWave
+#   make wave_plic        Open PLIC waveform in GTKWave
+#   make wave_pipeline    Open pipeline testbench waveform in GTKWave
+#   make wave_intr        Open interrupt testbench waveform in GTKWave
+#   make wave_core        Open core waveform in GTKWave
+#   make all              Run all testbenches
+#   make clean            Remove generated files
+# =============================================================================
+
+# Tool configuration
+IVERILOG  = iverilog
+VVP       = vvp
+GTKWAVE   = gtkwave
+
+# Source directories
+RTL_DIR   = ../rtl
+INC_DIR   = $(RTL_DIR)/include
+CORE_DIR  = $(RTL_DIR)/core
+ALU_DIR   = $(RTL_DIR)/alu
+MEM_DIR   = $(RTL_DIR)/memory
+SOC_DIR   = $(RTL_DIR)/soc
+PERI_DIR  = $(RTL_DIR)/peripherals
+TB_DIR    = tb
+
+# Output directory
+OUT_DIR   = out
+WAVE_DIR  = wave
+
+# Common flags
+IVFLAGS   = -g2012 -Wall
+IVFLAGS  += -I$(INC_DIR)
+IVFLAGS  += -DRISCV_FORMAL
+
+# Default program hex file
+PROG     ?= ../software/tests/test_basic.hex
+
+# Source file lists
+PKG_SRC   = $(INC_DIR)/rv_pkg.sv
+CSR_SRC   = $(PKG_SRC) $(CORE_DIR)/rv_csr.sv
+
+CORE_SRC  = $(PKG_SRC) \
+            $(CORE_DIR)/rv_regfile.sv \
+            $(CORE_DIR)/rv_decode.sv \
+            $(CORE_DIR)/rv_branch.sv \
+            $(ALU_DIR)/rv_alu.sv \
+            $(CORE_DIR)/rv_muldiv.sv \
+            $(CORE_DIR)/rv_amo.sv \
+            $(CORE_DIR)/rv_forward.sv \
+            $(CORE_DIR)/rv_csr.sv \
+            $(CORE_DIR)/rv_hazard.sv \
+            $(CORE_DIR)/rv_mmu.sv \
+            $(CORE_DIR)/rv_core.sv
+
+SOC_SRC   = $(CORE_SRC) \
+            $(MEM_DIR)/rv_imem.sv \
+            $(MEM_DIR)/rv_dmem.sv \
+            $(PERI_DIR)/clint/rv_timer.sv \
+            $(PERI_DIR)/uart/rv_uart.sv \
+            $(PERI_DIR)/gpio/rv_gpio.sv \
+            $(PERI_DIR)/plic/rv_plic.sv \
+            $(SOC_DIR)/rv_soc.sv
+
+# Peripheral-only source lists (for individual testbenches)
+PLIC_SRC  = $(PKG_SRC) $(PERI_DIR)/plic/rv_plic.sv
+UART_SRC  = $(PERI_DIR)/uart/rv_uart.sv
+GPIO_SRC  = $(PKG_SRC) $(PERI_DIR)/gpio/rv_gpio.sv
+TIMER_SRC = $(CSR_SRC)
+
+
+# =============================================================================
+# Targets
+# =============================================================================
+
+.PHONY: all sim_alu sim_csr sim_rv64i sim_mext sim_mext64 sim_amo sim_amo64 \
+            sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
+            sim_uart sim_gpio sim_plic sim_core sim_soc sim_bm \
+            sim_pipeline sim_intr \
+            wave_alu wave_csr wave_rv64i wave_mext wave_mext64 wave_amo wave_amo64 \
+            wave_mmu wave_mmu64 wave_sv wave_sv64 wave_timer wave_timer64 \
+            wave_uart wave_gpio wave_plic wave_core wave_soc wave_bm \
+            wave_pipeline wave_intr \
+            clean dirs
+
+all: sim_alu sim_csr sim_rv64i sim_mext sim_mext64 sim_amo sim_amo64 \
+     sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
+     sim_uart sim_gpio sim_plic sim_core sim_soc \
+     sim_pipeline sim_intr
+
+dirs:
+	mkdir -p $(OUT_DIR) $(WAVE_DIR)
+
+# --- ALU testbench ---
+sim_alu: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_alu.vvp \
+		$(PKG_SRC) $(ALU_DIR)/rv_alu.sv $(TB_DIR)/tb_rv_alu.sv
+	$(VVP) $(OUT_DIR)/tb_rv_alu.vvp
+
+wave_alu: sim_alu
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_alu.vcd &
+
+# --- CSR testbench ---
+sim_csr: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_csr.vvp \
+		$(CSR_SRC) $(TB_DIR)/tb_rv_csr.sv
+	$(VVP) $(OUT_DIR)/tb_rv_csr.vvp
+
+wave_csr: sim_csr
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_csr.vcd &
+
+# --- RV64I W-type ALU testbench (compiled with XLEN=64) ---
+sim_rv64i: dirs
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv64i.vvp \
+		$(PKG_SRC) $(ALU_DIR)/rv_alu.sv $(TB_DIR)/tb_rv64i.sv
+	$(VVP) $(OUT_DIR)/tb_rv64i.vvp
+
+wave_rv64i: sim_rv64i
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv64i.vcd &
+
+# --- M-extension testbench (XLEN=32: RV32M, XLEN=64: includes W-type) ---
+MEXT_SRC  = $(PKG_SRC) $(CORE_DIR)/rv_muldiv.sv
+
+# --- A-extension AMO compute unit testbench ---
+AMO_SRC   = $(PKG_SRC) $(CORE_DIR)/rv_amo.sv
+
+# --- MMU testbench ---
+MMU_SRC   = $(PKG_SRC) $(CORE_DIR)/rv_mmu.sv
+
+# --- Supervisor-mode testbench ---
+SV_SRC    = $(CSR_SRC)
+
+sim_mext: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_mext.vvp \
+		$(MEXT_SRC) $(TB_DIR)/tb_rv_mext.sv
+	$(VVP) $(OUT_DIR)/tb_rv_mext.vvp
+
+wave_mext: sim_mext
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_mext.vcd &
+
+sim_mext64: dirs
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_mext64.vvp \
+		$(MEXT_SRC) $(TB_DIR)/tb_rv_mext.sv
+	$(VVP) $(OUT_DIR)/tb_rv_mext64.vvp
+
+wave_mext64: sim_mext64
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_mext64.vcd &
+
+sim_amo: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_amo.vvp \
+		$(AMO_SRC) $(TB_DIR)/tb_rv_amo.sv
+	$(VVP) $(OUT_DIR)/tb_rv_amo.vvp
+
+wave_amo: sim_amo
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_amo.vcd &
+
+sim_amo64: dirs
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_amo64.vvp \
+		$(AMO_SRC) $(TB_DIR)/tb_rv_amo.sv
+	$(VVP) $(OUT_DIR)/tb_rv_amo64.vvp
+
+wave_amo64: sim_amo64
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_amo64.vcd &
+
+sim_mmu: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_mmu.vvp \
+		$(MMU_SRC) $(TB_DIR)/tb_rv_mmu.sv
+	$(VVP) $(OUT_DIR)/tb_rv_mmu.vvp
+
+wave_mmu: sim_mmu
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_mmu.vcd &
+
+sim_mmu64: dirs
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_mmu64.vvp \
+		$(MMU_SRC) $(TB_DIR)/tb_rv_mmu.sv
+	$(VVP) $(OUT_DIR)/tb_rv_mmu64.vvp
+
+wave_mmu64: sim_mmu64
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_mmu64.vcd &
+
+sim_sv: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_supervisor.vvp \
+		$(SV_SRC) $(TB_DIR)/tb_rv_supervisor.sv
+	$(VVP) $(OUT_DIR)/tb_rv_supervisor.vvp
+
+wave_sv: sim_sv
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_supervisor.vcd &
+
+sim_sv64: dirs
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_supervisor64.vvp \
+		$(SV_SRC) $(TB_DIR)/tb_rv_supervisor.sv
+	$(VVP) $(OUT_DIR)/tb_rv_supervisor64.vvp
+
+wave_sv64: sim_sv64
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_supervisor.vcd &
+
+# --- Machine Timer interrupt testbench ---
+TIMER_SRC = $(CSR_SRC)
+
+sim_timer: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_timer.vvp \
+		$(TIMER_SRC) $(TB_DIR)/tb_rv_timer.sv
+	$(VVP) $(OUT_DIR)/tb_rv_timer.vvp
+
+wave_timer: sim_timer
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_timer.vcd &
+
+sim_timer64: dirs
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_timer64.vvp \
+		$(TIMER_SRC) $(TB_DIR)/tb_rv_timer.sv
+	$(VVP) $(OUT_DIR)/tb_rv_timer64.vvp
+
+wave_timer64: sim_timer64
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_timer64.vcd &
+
+# --- UART testbench ---
+sim_uart: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_uart.vvp \
+		$(UART_SRC) $(TB_DIR)/tb_rv_uart.sv
+	$(VVP) $(OUT_DIR)/tb_rv_uart.vvp
+
+wave_uart: sim_uart
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_uart.vcd &
+
+# --- GPIO testbench ---
+sim_gpio: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_gpio.vvp \
+		$(GPIO_SRC) $(TB_DIR)/tb_rv_gpio.sv
+	$(VVP) $(OUT_DIR)/tb_rv_gpio.vvp
+
+wave_gpio: sim_gpio
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_gpio.vcd &
+
+# --- PLIC testbench ---
+sim_plic: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_plic.vvp \
+		$(PLIC_SRC) $(TB_DIR)/tb_rv_plic.sv
+	$(VVP) $(OUT_DIR)/tb_rv_plic.vvp
+
+wave_plic: sim_plic
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_plic.vcd &
+
+# --- Core testbench ---
+sim_core: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_core.vvp \
+		-PIMEM_FILE=\"$(PROG)\" \
+		$(SOC_SRC) $(TB_DIR)/tb_rv_core.sv
+	$(VVP) $(OUT_DIR)/tb_rv_core.vvp
+
+wave_core: sim_core
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_core.vcd &
+
+# --- SoC integration testbench ---
+# 基本統合テスト (手書き hex)
+#   make sim_soc
+# C ベアメタルプログラム実行 (IMEM + DMEM hex 指定)
+#   make sim_soc SOC_PROG=path/imem.hex SOC_DMEM=path/dmem.hex
+
+SOC_PROG ?= tests/test_soc_integ.hex
+SOC_DMEM ?=
+
+# DMEM_FILE が指定されていれば -PDMEM_FILE を追加
+ifneq ($(SOC_DMEM),)
+SOC_DMEM_FLAG = -PDMEM_FILE=\"$(SOC_DMEM)\"
+else
+SOC_DMEM_FLAG =
+endif
+
+sim_soc: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_soc.vvp \
+		-PIMEM_FILE=\"$(SOC_PROG)\" \
+		$(SOC_DMEM_FLAG) \
+		$(SOC_SRC) $(TB_DIR)/tb_rv_soc.sv
+	$(VVP) $(OUT_DIR)/tb_rv_soc.vvp
+
+wave_soc: sim_soc
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_soc.vcd &
+
+# --- ベアメタル C プログラム実行テストベンチ ---
+# make sim_bm IMEM_FILE=path/imem.hex DMEM_FILE=path/dmem.hex
+BM_IMEM ?=
+BM_DMEM ?=
+
+sim_bm: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_bm.vvp \
+		-Ptb_rv_bm.IMEM_FILE=\"$(BM_IMEM)\" \
+		-Ptb_rv_bm.DMEM_FILE=\"$(BM_DMEM)\" \
+		$(SOC_SRC) $(TB_DIR)/tb_rv_bm.sv
+	$(VVP) $(OUT_DIR)/tb_rv_bm.vvp
+
+wave_bm: sim_bm
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_bm.vcd &
+
+# --- Pipeline integration testbench ---
+# Exercises forwarding, stalls, branches, loads/stores, LUI/AUIPC, ECALL, CSR
+# through rv_core with a behavioral IMEM/DMEM.
+sim_pipeline: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_pipeline.vvp \
+		$(CORE_SRC) $(TB_DIR)/tb_rv_pipeline.sv
+	$(VVP) $(OUT_DIR)/tb_rv_pipeline.vvp
+
+wave_pipeline: sim_pipeline
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_pipeline.vcd &
+
+# --- Interrupt integration testbench ---
+# Exercises MTIP/MEIP/MSIP delivery, priority, masking, and MRET re-enable
+# through rv_core with a behavioral IMEM/DMEM.
+sim_intr: dirs
+	$(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_intr.vvp \
+		$(CORE_SRC) $(TB_DIR)/tb_rv_intr.sv
+	$(VVP) $(OUT_DIR)/tb_rv_intr.vvp
+
+wave_intr: sim_intr
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_intr.vcd &
+
+# --- Clean ---
+clean:
+	rm -rf $(OUT_DIR) $(WAVE_DIR)
