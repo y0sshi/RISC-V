@@ -88,7 +88,12 @@ module rv_csr
     // ---- MMU state outputs ---------------------------------------------------
     output logic [XLEN-1:0]  satp_val,
     output logic              mstatus_sum,
-    output logic              mstatus_mxr
+    output logic              mstatus_mxr,
+
+    // ---- F-extension fcsr ----------------------------------------------------
+    input  wire  [4:0]       fpu_fflags,    // FPU exception flags to OR into fflags
+    input  wire              fpu_fflags_we, // 1 = FPU produced result this cycle
+    output logic [2:0]       frm_out        // fcsr.frm -> FPU rounding mode (DYN)
 );
 
     // =========================================================================
@@ -129,6 +134,12 @@ module rv_csr
 
     logic [63:0]    mcycle_cnt;
     logic [63:0]    minstret_cnt;
+
+    // F-extension CSRs
+    logic [4:0]     fflags_reg;  // fcsr[4:0] : NV|DZ|OF|UF|NX (accumulated)
+    logic [2:0]     frm_reg;     // fcsr[7:5] : rounding mode
+
+    assign frm_out = frm_reg;
 
     priv_level_t    cur_priv;
     assign priv_level = cur_priv;
@@ -298,6 +309,10 @@ module rv_csr
     always_comb begin
         csr_rdata = '0;
         case (csr_addr)
+            // F-extension
+            CSR_FFLAGS:   csr_rdata = {{(XLEN-5){1'b0}}, fflags_reg};
+            CSR_FRM:      csr_rdata = {{(XLEN-3){1'b0}}, frm_reg};
+            CSR_FCSR:     csr_rdata = {{(XLEN-8){1'b0}}, frm_reg, fflags_reg};
             // Supervisor-level
             CSR_SSTATUS:  csr_rdata = sstatus_rval;
             CSR_SIE:      csr_rdata = sie_val;
@@ -380,6 +395,9 @@ module rv_csr
             // Counters
             mcycle_cnt    <= '0;
             minstret_cnt  <= '0;
+            // F-extension CSRs
+            fflags_reg    <= 5'h0;
+            frm_reg       <= 3'h0;
 
         end else begin
             // Free-running cycle counter
@@ -388,6 +406,12 @@ module rv_csr
             // Instruction retire counter
             if (retire_en)
                 minstret_cnt <= minstret_cnt + 1;
+
+            // FPU fflags accumulation (OR on every FPU result).
+            // CSR write takes priority if both happen on the same cycle.
+            if (fpu_fflags_we && !(csr_we && (csr_addr == CSR_FFLAGS ||
+                                               csr_addr == CSR_FCSR)))
+                fflags_reg <= fflags_reg | fpu_fflags;
 
             if (trap_enter) begin
                 // ---- Trap entry (delegation-aware) ---------------------------
@@ -428,6 +452,13 @@ module rv_csr
             end else if (csr_we) begin
                 // ---- Normal CSR write ----------------------------------------
                 case (csr_addr)
+                    // F-extension CSRs
+                    CSR_FFLAGS: fflags_reg <= csr_new_val[4:0];
+                    CSR_FRM:    frm_reg    <= csr_new_val[2:0];
+                    CSR_FCSR: begin
+                        fflags_reg <= csr_new_val[4:0];
+                        frm_reg    <= csr_new_val[7:5];
+                    end
                     // Supervisor CSRs
                     CSR_SSTATUS: begin
                         // Only update S-mode bits of mstatus

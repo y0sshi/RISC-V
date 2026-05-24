@@ -69,8 +69,39 @@ package rv_pkg;
         OP_SYSTEM   = 7'b1110011,   // System (ECALL, EBREAK, CSR*)
         OP_IMM_W    = 7'b0011011,   // RV64I: Word-width Register-Immediate
         OP_REG_W    = 7'b0111011,   // RV64I: Word-width Register-Register
-        OP_AMO      = 7'b0101111    // A extension: Atomic Memory Operations
+        OP_AMO      = 7'b0101111,   // A extension: Atomic Memory Operations
+        // F extension opcodes
+        OP_LOAD_FP  = 7'b0000111,   // FLW (single-precision load)
+        OP_STORE_FP = 7'b0100111,   // FSW (single-precision store)
+        OP_FMADD    = 7'b1000011,   // FMADD.S
+        OP_FMSUB    = 7'b1000111,   // FMSUB.S
+        OP_FNMSUB   = 7'b1001011,   // FNMSUB.S
+        OP_FNMADD   = 7'b1001111,   // FNMADD.S
+        OP_FP       = 7'b1010011    // All other FP ops (FADD/FSUB/FMUL/FDIV/etc.)
     } opcode_t;
+
+    // =========================================================================
+    // F-Extension (Single-Precision Float) Operation Codes
+    // =========================================================================
+    typedef enum logic [4:0] {
+        FPU_ADD    = 5'd0,   // FADD.S
+        FPU_SUB    = 5'd1,   // FSUB.S
+        FPU_MUL    = 5'd2,   // FMUL.S
+        FPU_DIV    = 5'd3,   // FDIV.S  (multi-cycle)
+        FPU_SQRT   = 5'd4,   // FSQRT.S (multi-cycle)
+        FPU_SGNJ   = 5'd5,   // FSGNJ.S / FSGNJN.S / FSGNJX.S  (rm selects)
+        FPU_MINMAX = 5'd6,   // FMIN.S / FMAX.S  (rm selects: 0=min, 1=max)
+        FPU_CMP    = 5'd7,   // FEQ.S / FLT.S / FLE.S  (rm selects)
+        FPU_CVTWS  = 5'd8,   // FCVT.W.S / FCVT.WU.S   (fp_rs2_sel[0] selects)
+        FPU_CVTSW  = 5'd9,   // FCVT.S.W / FCVT.S.WU   (fp_rs2_sel[0] selects)
+        FPU_MVXW   = 5'd10,  // FMV.X.W  (move float bits to int reg)
+        FPU_MVWX   = 5'd11,  // FMV.W.X  (move int bits to float reg)
+        FPU_CLASS  = 5'd12,  // FCLASS.S
+        FPU_MADD   = 5'd13,  // FMADD.S  (rd = rs1*rs2 + rs3)
+        FPU_MSUB   = 5'd14,  // FMSUB.S  (rd = rs1*rs2 - rs3)
+        FPU_NMSUB  = 5'd15,  // FNMSUB.S (rd = -(rs1*rs2 - rs3))
+        FPU_NMADD  = 5'd16   // FNMADD.S (rd = -(rs1*rs2 + rs3))
+    } fpu_op_t;
 
     // =========================================================================
     // M-Extension (Multiply-Divide) Operations
@@ -210,11 +241,12 @@ package rv_pkg;
     // =========================================================================
     // Writeback Source Selection
     // =========================================================================
-    typedef enum logic [1:0] {
-        WB_SRC_ALU  = 2'b00,   // ALU result
-        WB_SRC_MEM  = 2'b01,   // Memory read data
-        WB_SRC_PC4  = 2'b10,   // PC + 4 (for JAL/JALR)
-        WB_SRC_CSR  = 2'b11    // CSR read data
+    typedef enum logic [2:0] {
+        WB_SRC_ALU  = 3'b000,   // ALU result
+        WB_SRC_MEM  = 3'b001,   // Memory read data
+        WB_SRC_PC4  = 3'b010,   // PC + 4 (for JAL/JALR)
+        WB_SRC_CSR  = 3'b011,   // CSR read data
+        WB_SRC_FPU  = 3'b100    // FPU integer result (FMV.X.W/FCVT.W.S/FCMP/FCLASS)
     } wb_src_t;
 
     // =========================================================================
@@ -247,6 +279,17 @@ package rv_pkg;
         amo_op_t    amo_op;         // AMO operation selector
         // Zicsr / privileged
         logic       is_sfence_vma;  // SFENCE.VMA — flush TLB
+        // F extension (single-precision floating-point)
+        logic       is_fp;        // FP instruction (not FLW/FSW but any FPU op)
+        logic       fp_load;      // FLW: DMEM -> f-regfile
+        logic       fp_store;     // FSW: f-regfile -> DMEM (store data is float)
+        logic       freg_write;   // Write result to FP register file
+        logic       fp_to_int;    // FPU result -> integer regfile (FMV.X.W, FCVT.W.S, CMP, FCLASS)
+        logic       int_to_fp;    // rs1 from integer regfile (FMV.W.X, FCVT.S.W)
+        logic       fp_use_rs3;   // Read rs3 (FMADD / FMSUB / FNMADD / FNMSUB)
+        fpu_op_t    fpu_op;       // FPU operation selector
+        logic [2:0] fp_rm;        // Rounding mode from instruction field
+        logic [4:0] fp_rs2_sel;   // inst[24:20]: FCVT sub-type / FSQRT rs2 field
     } ctrl_signals_t;
 
     // =========================================================================
@@ -261,6 +304,10 @@ package rv_pkg;
     // =========================================================================
     // CSR Addresses (subset of commonly used ones)
     // =========================================================================
+    // F-extension floating-point CSRs
+    parameter logic [11:0] CSR_FFLAGS     = 12'h001;  // fp exception flags (fflags)
+    parameter logic [11:0] CSR_FRM        = 12'h002;  // fp rounding mode   (frm)
+    parameter logic [11:0] CSR_FCSR       = 12'h003;  // fp control/status  (frm|fflags)
     // Machine-level CSRs
     parameter logic [11:0] CSR_MSTATUS    = 12'h300;
     parameter logic [11:0] CSR_MISA       = 12'h301;

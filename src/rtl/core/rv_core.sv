@@ -100,6 +100,10 @@ module rv_core
     // Declared here; driven after AMO state logic below.
     logic amo_stall;
 
+    // fpu_busy_int: multi-cycle FPU (FDIV/FSQRT) in progress.
+    // Declared here (before stall assign); driven after FPU instantiation below.
+    logic fpu_busy_int;
+
     // Number of address bits that select a byte lane within one DMEM data word.
     // RV32: 2 bits (addr[1:0]) -> 4-byte word, wstrb is 4 bits
     // RV64: 3 bits (addr[2:0]) -> 8-byte logical word (two 32-bit BRAM halves), wstrb is 8 bits
@@ -118,9 +122,9 @@ module rv_core
         else        redirect_q <= branch_taken_ex | trap_or_mret;
     end
 
-    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall;
-    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall;
-    assign stall_ex = amo_stall;
+    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int;
+    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int;
+    assign stall_ex = amo_stall | fpu_busy_int;
     // Traps/MRET flush the same stages as branch (instructions after the trap insn).
     // flush_id is asserted for 2 cycles: cycle 0 (branch_taken_ex | trap_or_mret)
     // discards the instruction that was fetched alongside the branch; cycle 1
@@ -205,7 +209,7 @@ module rv_core
     // =========================================================================
     ctrl_signals_t   id_ctrl;
     logic [XLEN-1:0] id_imm;
-    reg_addr_t       id_rs1_addr, id_rs2_addr, id_rd_addr;
+    reg_addr_t       id_rs1_addr, id_rs2_addr, id_rs3_addr, id_rd_addr;
     logic            id_rs1_used, id_rs2_used;
     logic [XLEN-1:0] id_rs1_data, id_rs2_data;
 
@@ -215,6 +219,7 @@ module rv_core
         .imm        (id_imm),
         .rs1_addr   (id_rs1_addr),
         .rs2_addr   (id_rs2_addr),
+        .rs3_addr   (id_rs3_addr),
         .rd_addr    (id_rd_addr),
         .rs1_used   (id_rs1_used),
         .rs2_used   (id_rs2_used)
@@ -239,42 +244,74 @@ module rv_core
     );
 
     // =========================================================================
+    // F-Extension: FP Register File (32 x 32-bit, 3 read ports + 1 write port)
+    // =========================================================================
+    logic [31:0]  id_frs1_data, id_frs2_data, id_frs3_data;
+    logic [31:0]  wb_freg_data;   // FP WB write data
+    reg_addr_t    wb_frd_addr;    // FP WB write address
+    logic         wb_freg_write;  // FP WB write enable
+
+    rv_fregfile u_fregfile (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .rs1_addr (id_rs1_addr),
+        .rs2_addr (id_rs2_addr),
+        .rs3_addr (id_rs3_addr),
+        .rs1_data (id_frs1_data),
+        .rs2_data (id_frs2_data),
+        .rs3_data (id_frs3_data),
+        .rd_addr  (wb_frd_addr),
+        .rd_data  (wb_freg_data),
+        .rd_we    (wb_freg_write)
+    );
+
+    // =========================================================================
     // ID/EX Pipeline Register  (between ID and EX)
     // =========================================================================
     ctrl_signals_t   id_ex_ctrl;
     logic [XLEN-1:0] id_ex_rs1_data, id_ex_rs2_data;
     logic [XLEN-1:0] id_ex_imm;
-    reg_addr_t       id_ex_rs1_addr, id_ex_rs2_addr, id_ex_rd_addr;
+    reg_addr_t       id_ex_rs1_addr, id_ex_rs2_addr, id_ex_rs3_addr, id_ex_rd_addr;
     logic [XLEN-1:0] id_ex_pc;
     logic [2:0]      id_ex_funct3;
     logic [11:0]     id_ex_csr_addr;   // inst[31:20] — CSR address for Zicsr
     logic            id_ex_valid;
+    // FP operands registered from fregfile
+    logic [31:0]     id_ex_frs1_data, id_ex_frs2_data, id_ex_frs3_data;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush_ex) begin
-            id_ex_ctrl     <= '0;
-            id_ex_rs1_data <= '0;
-            id_ex_rs2_data <= '0;
-            id_ex_imm      <= '0;
-            id_ex_rs1_addr <= '0;
-            id_ex_rs2_addr <= '0;
-            id_ex_rd_addr  <= '0;
-            id_ex_pc       <= '0;
-            id_ex_funct3   <= '0;
-            id_ex_csr_addr <= '0;
-            id_ex_valid    <= 1'b0;
+            id_ex_ctrl      <= '0;
+            id_ex_rs1_data  <= '0;
+            id_ex_rs2_data  <= '0;
+            id_ex_imm       <= '0;
+            id_ex_rs1_addr  <= '0;
+            id_ex_rs2_addr  <= '0;
+            id_ex_rs3_addr  <= '0;
+            id_ex_rd_addr   <= '0;
+            id_ex_pc        <= '0;
+            id_ex_funct3    <= '0;
+            id_ex_csr_addr  <= '0;
+            id_ex_valid     <= 1'b0;
+            id_ex_frs1_data <= '0;
+            id_ex_frs2_data <= '0;
+            id_ex_frs3_data <= '0;
         end else if (!stall_id) begin
-            id_ex_ctrl     <= id_ctrl;
-            id_ex_rs1_data <= id_rs1_data;
-            id_ex_rs2_data <= id_rs2_data;
-            id_ex_imm      <= id_imm;
-            id_ex_rs1_addr <= id_rs1_addr;
-            id_ex_rs2_addr <= id_rs2_addr;
-            id_ex_rd_addr  <= id_rd_addr;
-            id_ex_pc       <= if_id_pc;
-            id_ex_funct3   <= if_id_inst[14:12];
-            id_ex_csr_addr <= if_id_inst[31:20];
-            id_ex_valid    <= if_id_valid;
+            id_ex_ctrl      <= id_ctrl;
+            id_ex_rs1_data  <= id_rs1_data;
+            id_ex_rs2_data  <= id_rs2_data;
+            id_ex_imm       <= id_imm;
+            id_ex_rs1_addr  <= id_rs1_addr;
+            id_ex_rs2_addr  <= id_rs2_addr;
+            id_ex_rs3_addr  <= id_rs3_addr;
+            id_ex_rd_addr   <= id_rd_addr;
+            id_ex_pc        <= if_id_pc;
+            id_ex_funct3    <= if_id_inst[14:12];
+            id_ex_csr_addr  <= if_id_inst[31:20];
+            id_ex_valid     <= if_id_valid;
+            id_ex_frs1_data <= id_frs1_data;
+            id_ex_frs2_data <= id_frs2_data;
+            id_ex_frs3_data <= id_frs3_data;
         end
         // else: stall_id=1 && !flush_ex — hold current ID/EX value
     end
@@ -394,6 +431,45 @@ module rv_core
     // EX-stage result: muldiv overrides ALU for M-extension instructions
     logic [XLEN-1:0] ex_result;
     assign ex_result = id_ex_ctrl.is_muldiv ? muldiv_result : ex_alu_result;
+
+    // =========================================================================
+    // F-Extension: FPU instantiation (EX stage)
+    // =========================================================================
+    // fpu_busy_int declared earlier (before stall assigns)
+    logic        fpu_result_valid;   // 1-cycle pulse when FPU result is ready
+    logic [31:0] fpu_result_f;       // FP result (to freg)
+    logic [XLEN-1:0] fpu_result_i;  // int result (FMV.X.W, FCVT.W.S, CMP, FCLASS)
+    logic [4:0]  fpu_fflags_ex;     // FPU exception flags
+    logic [2:0]  frm_csr;           // fcsr.frm from CSR (for DYN rounding mode)
+
+    // valid_in: pulse once on the first cycle a FP op enters EX.
+    // fpu_busy_int=0 on that first cycle (FPU is idle), goes to 1 afterward,
+    // suppressing re-trigger for multi-cycle ops (FDIV/FSQRT).
+    logic fpu_valid_in;
+    assign fpu_valid_in = id_ex_valid
+                          && id_ex_ctrl.is_fp
+                          && !id_ex_ctrl.fp_load
+                          && !id_ex_ctrl.fp_store
+                          && !fpu_busy_int;
+
+    rv_fpu #(.XLEN(XLEN)) u_fpu (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .fa          (id_ex_frs1_data),
+        .fb          (id_ex_frs2_data),
+        .fc          (id_ex_frs3_data),
+        .int_a       (fwd_rs1_data),       // integer rs1 for FCVT.S.W, FMV.W.X
+        .fpu_op      (id_ex_ctrl.fpu_op),
+        .fp_rm       (id_ex_ctrl.fp_rm),
+        .frm_in      (frm_csr),
+        .rs2_sel     (id_ex_ctrl.fp_rs2_sel),
+        .valid_in    (fpu_valid_in),
+        .result_f    (fpu_result_f),
+        .result_i    (fpu_result_i),
+        .fflags      (fpu_fflags_ex),
+        .fpu_busy    (fpu_busy_int),
+        .result_valid(fpu_result_valid)
+    );
 
     // =========================================================================
     // A-Extension: Atomic Memory Operations
@@ -551,9 +627,13 @@ module rv_core
         .timer_irq  (timer_irq),
         .sw_irq     (sw_irq),
         .ext_irq    (ext_irq),
-        .satp_val    (satp_val_int),
-        .mstatus_sum (mstatus_sum_int),
-        .mstatus_mxr (mstatus_mxr_int)
+        .satp_val      (satp_val_int),
+        .mstatus_sum   (mstatus_sum_int),
+        .mstatus_mxr   (mstatus_mxr_int),
+        // F-extension
+        .fpu_fflags    (fpu_fflags_ex),
+        .fpu_fflags_we (fpu_result_valid),
+        .frm_out       (frm_csr)
     );
 
     // --- MMU state outputs ---
@@ -584,34 +664,37 @@ module rv_core
     // EX/MEM Pipeline Register  (between EX and MEM)
     // =========================================================================
     logic [XLEN-1:0] ex_mem_csr_rdata;
+    logic [31:0]     ex_mem_fpu_result_f;   // FP result -> freg WB
+    logic [XLEN-1:0] ex_mem_fpu_result_i;  // FPU int result -> int reg WB
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush_ex_mem) begin
-            // Flush only for trap/MRET: discard the instruction that was in EX
-            // so it does not spuriously write its destination register.
-            // NOTE: branch_taken and load_use_hazard do NOT flush EX/MEM —
-            //   the instruction currently advancing through EX (JAL's rd writeback,
-            //   or the load proceeding to MEM) must be allowed to commit.
-            ex_mem_ctrl       <= '0;
-            ex_mem_alu_result <= '0;
-            ex_mem_rs2_data   <= '0;
-            ex_mem_rd_addr    <= '0;
-            ex_mem_pc4        <= '0;
-            ex_mem_funct3     <= '0;
-            ex_mem_csr_rdata  <= '0;
-            ex_mem_valid      <= 1'b0;
+            ex_mem_ctrl          <= '0;
+            ex_mem_alu_result    <= '0;
+            ex_mem_rs2_data      <= '0;
+            ex_mem_rd_addr       <= '0;
+            ex_mem_pc4           <= '0;
+            ex_mem_funct3        <= '0;
+            ex_mem_csr_rdata     <= '0;
+            ex_mem_valid         <= 1'b0;
+            ex_mem_fpu_result_f  <= '0;
+            ex_mem_fpu_result_i  <= '0;
         end else if (!stall_ex) begin
-            // Normal advance (stall_ex = amo_stall: hold EX in place during AMO read phase)
             ex_mem_ctrl       <= id_ex_ctrl;
-            ex_mem_alu_result <= ex_result;       // ALU or MUL/DIV result
-            ex_mem_rs2_data   <= fwd_rs2_data;   // forwarded store data
+            ex_mem_alu_result <= ex_result;
+            // FSW: store data comes from FP regfile (frs2), replicate to fill data bus
+            ex_mem_rs2_data   <= id_ex_ctrl.fp_store
+                                 ? {(XLEN/32){id_ex_frs2_data}}
+                                 : fwd_rs2_data;
             ex_mem_rd_addr    <= id_ex_rd_addr;
             ex_mem_pc4        <= id_ex_pc + XLEN'(4);
             ex_mem_funct3     <= id_ex_funct3;
-            ex_mem_csr_rdata  <= csr_rdata_ex;   // old CSR value for rd writeback
+            ex_mem_csr_rdata  <= csr_rdata_ex;
             ex_mem_valid      <= id_ex_valid;
+            ex_mem_fpu_result_f <= fpu_result_f;
+            ex_mem_fpu_result_i <= fpu_result_i;
         end
-        // else: stall_ex — hold EX/MEM (AMO read phase is in progress)
+        // else: stall_ex — hold EX/MEM
     end
 
     // =========================================================================
@@ -692,31 +775,36 @@ module rv_core
     logic [XLEN-1:0] mem_wb_csr_rdata;
     logic [2:0]      mem_wb_funct3;
     logic [1:0]      mem_wb_byte_offset;  // addr[1:0] — byte lane selector for sub-word loads
+    logic [31:0]     mem_wb_fpu_result_f;   // FP result -> freg
+    logic [XLEN-1:0] mem_wb_fpu_result_i;  // FPU int result -> int reg
 
     // SC result: 0 = success, 1 = failure (rd receives this value via WB_SRC_ALU)
     wire [XLEN-1:0] sc_result = {{(XLEN-1){1'b0}}, ~sc_success};
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            mem_wb_ctrl        <= '0;
-            mem_wb_alu_result  <= '0;
-            mem_wb_rd_addr     <= '0;
-            mem_wb_pc4         <= '0;
-            mem_wb_csr_rdata   <= '0;
-            mem_wb_funct3      <= '0;
-            mem_wb_byte_offset <= '0;
-            mem_wb_valid       <= 1'b0;
+            mem_wb_ctrl           <= '0;
+            mem_wb_alu_result     <= '0;
+            mem_wb_rd_addr        <= '0;
+            mem_wb_pc4            <= '0;
+            mem_wb_csr_rdata      <= '0;
+            mem_wb_funct3         <= '0;
+            mem_wb_byte_offset    <= '0;
+            mem_wb_valid          <= 1'b0;
+            mem_wb_fpu_result_f   <= '0;
+            mem_wb_fpu_result_i   <= '0;
         end else if (!amo_stall) begin
             // Hold MEM/WB during AMO read phase so AMO stays in MEM
-            mem_wb_ctrl        <= ex_mem_ctrl;
-            // SC: override alu_result with 0/1 success flag (WB_SRC_ALU path)
-            mem_wb_alu_result  <= ex_mem_ctrl.is_sc ? sc_result : ex_mem_alu_result;
-            mem_wb_rd_addr     <= ex_mem_rd_addr;
-            mem_wb_pc4         <= ex_mem_pc4;
-            mem_wb_csr_rdata   <= ex_mem_csr_rdata;
-            mem_wb_funct3      <= ex_mem_funct3;
-            mem_wb_byte_offset <= ex_mem_alu_result[1:0];
-            mem_wb_valid       <= ex_mem_valid;
+            mem_wb_ctrl           <= ex_mem_ctrl;
+            mem_wb_alu_result     <= ex_mem_ctrl.is_sc ? sc_result : ex_mem_alu_result;
+            mem_wb_rd_addr        <= ex_mem_rd_addr;
+            mem_wb_pc4            <= ex_mem_pc4;
+            mem_wb_csr_rdata      <= ex_mem_csr_rdata;
+            mem_wb_funct3         <= ex_mem_funct3;
+            mem_wb_byte_offset    <= ex_mem_alu_result[1:0];
+            mem_wb_valid          <= ex_mem_valid;
+            mem_wb_fpu_result_f   <= ex_mem_fpu_result_f;
+            mem_wb_fpu_result_i   <= ex_mem_fpu_result_i;
         end
         // else: amo_stall — hold MEM/WB (AMO read phase in progress)
     end
@@ -764,13 +852,27 @@ module rv_core
                 endcase
             end
             WB_SRC_PC4: wb_data = mem_wb_pc4;
-            WB_SRC_CSR: wb_data = mem_wb_csr_rdata;   // old CSR value (read before write)
+            WB_SRC_CSR: wb_data = mem_wb_csr_rdata;
+            WB_SRC_FPU: wb_data = mem_wb_fpu_result_i;  // FMV.X.W, FCVT.W.S, FEQ, FCLASS
             default:    wb_data = mem_wb_alu_result;
         endcase
     end
 
     assign wb_rd_addr   = mem_wb_rd_addr;
     assign wb_reg_write = mem_wb_ctrl.reg_write & mem_wb_valid;
+
+    // ---- FP register writeback ----
+    // freg_write: FLW (fp_load) or any FPU op writing a float result (freg_write)
+    // For FLW: write dmem_rdata[31:0] to freg
+    // For FPU: write mem_wb_fpu_result_f to freg
+    always_comb begin
+        wb_freg_write = mem_wb_valid && mem_wb_ctrl.freg_write;
+        wb_frd_addr   = mem_wb_rd_addr;
+        if (mem_wb_ctrl.fp_load)
+            wb_freg_data = dmem_shifted[31:0];   // FLW data from DMEM
+        else
+            wb_freg_data = mem_wb_fpu_result_f;  // FPU float result
+    end
 
     // =========================================================================
     // Hazard Detection Unit
@@ -781,6 +883,8 @@ module rv_core
         .id_ex_rd_addr   (id_ex_rd_addr),
         .id_rs1_addr     (id_rs1_addr),
         .id_rs2_addr     (id_rs2_addr),
+        .id_rs3_addr     (id_rs3_addr),
+        .id_ctrl         (id_ctrl),
         .id_rs1_used     (id_rs1_used),
         .id_rs2_used     (id_rs2_used),
         .load_use_hazard (load_use_hazard)
