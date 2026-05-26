@@ -439,7 +439,7 @@ module rv_csr
                 // ---- Supervisor trap return ----------------------------------
                 mstatus_sie  <= mstatus_spie;
                 mstatus_spie <= 1'b1;
-                cur_priv     <= mstatus_spp ? PRIV_S : PRIV_U;
+                cur_priv     <= priv_level_t'(mstatus_spp ? PRIV_S : PRIV_U);
                 mstatus_spp  <= 1'b0;  // SPP ← U after SRET
 
             end else if (mret_en) begin

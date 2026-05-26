@@ -78,6 +78,10 @@ module rv_core
     logic branch_taken_ex;
     logic [XLEN-1:0] branch_target_ex;
 
+    // CSR module outputs
+    logic [XLEN-1:0] sepc_out;        // sepc for SRET
+
+
     // Trap / MRET / SRET signals from EX stage (combinational, redirect PC next cycle)
     logic        ex_trap_enter;   // ECALL or EBREAK in EX
     logic        ex_mret_en;      // MRET in EX
@@ -556,7 +560,6 @@ module rv_core
     logic [XLEN-1:0] satp_val_int;
     logic            mstatus_sum_int;
     logic            mstatus_mxr_int;
-    logic [XLEN-1:0] sepc_out;        // sepc for SRET
 
     // Trap cause: depends on privilege level for ECALL
     logic [XLEN-1:0] ex_trap_cause;

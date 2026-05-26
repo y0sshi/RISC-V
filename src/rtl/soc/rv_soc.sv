@@ -33,6 +33,12 @@ module rv_soc
     input  wire              uart_rx,
     output logic             uart_tx
 );
+    // =========================================================================
+    // Forward declaration
+    // ========================================================================
+    logic       timer_irq_sig;
+    logic [1:0] plic_ext_irq;
+    logic       gpio_irq;
 
     // =========================================================================
     // Core → MMU buses (virtual addresses)
@@ -310,8 +316,6 @@ module rv_soc
     // =========================================================================
     // Timer (CLINT) - at 0xC000_0000
     // =========================================================================
-    logic        timer_irq_sig;
-
     rv_timer u_timer (
         .clk       (clk),
         .rst_n     (rst_n),
@@ -357,8 +361,6 @@ module rv_soc
     //   ext_irq[0] = Machine-mode external interrupt -> rv_core.ext_irq
     //   ext_irq[1] = Supervisor-mode external interrupt (future use)
     // =========================================================================
-    logic [1:0] plic_ext_irq;
-
     rv_plic #(
         .NSRC      (8),
         .NCTX      (2),
@@ -381,8 +383,6 @@ module rv_soc
     // Zybo Z7-20: gpio_out[3:0]=led[3:0], gpio_in[3:0]=sw[3:0]
     // IRQ -> PLIC src[3]
     // =========================================================================
-    logic gpio_irq;
-
     rv_gpio #(.WIDTH(4)) u_gpio (
         .clk      (clk),
         .rst_n    (rst_n),

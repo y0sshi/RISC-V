@@ -175,7 +175,7 @@ module rv_decode
                     F3_SLT:     ctrl.alu_op = ALU_SLT;
                     F3_SLTU:    ctrl.alu_op = ALU_SLTU;
                     F3_XOR:     ctrl.alu_op = ALU_XOR;
-                    F3_SRL_SRA: ctrl.alu_op = inst[30] ? ALU_SRA : ALU_SRL;
+                    F3_SRL_SRA: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SRA : ALU_SRL);
                     F3_OR:      ctrl.alu_op = ALU_OR;
                     F3_AND:     ctrl.alu_op = ALU_AND;
                     default:    ctrl.alu_op = ALU_ADD;
@@ -203,12 +203,12 @@ module rv_decode
                 end else begin
                     // RV32I / RV64I base integer R-type
                     case (funct3)
-                        F3_ADD_SUB: ctrl.alu_op = inst[30] ? ALU_SUB : ALU_ADD;
+                        F3_ADD_SUB: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SUB : ALU_ADD);
                         F3_SLL:     ctrl.alu_op = ALU_SLL;
                         F3_SLT:     ctrl.alu_op = ALU_SLT;
                         F3_SLTU:    ctrl.alu_op = ALU_SLTU;
                         F3_XOR:     ctrl.alu_op = ALU_XOR;
-                        F3_SRL_SRA: ctrl.alu_op = inst[30] ? ALU_SRA : ALU_SRL;
+                        F3_SRL_SRA: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SRA : ALU_SRL);
                         F3_OR:      ctrl.alu_op = ALU_OR;
                         F3_AND:     ctrl.alu_op = ALU_AND;
                         default:    ctrl.alu_op = ALU_ADD;
@@ -227,8 +227,9 @@ module rv_decode
                 case (funct3)
                     F3_ADD_SUB: ctrl.alu_op = ALU_ADDW;               // ADDIW
                     F3_SLL:     ctrl.alu_op = ALU_SLLW;               // SLLIW
-                    F3_SRL_SRA: ctrl.alu_op = inst[30] ? ALU_SRAW     // SRAIW
-                                                       : ALU_SRLW;    // SRLIW
+                    F3_SRL_SRA: ctrl.alu_op = alu_op_t'(inst[30]
+                                                ? ALU_SRAW            // SRAIW
+                                                : ALU_SRLW);          // SRLIW
                     default:    ctrl.alu_op = ALU_ADDW;
                 endcase
             end
@@ -255,9 +256,9 @@ module rv_decode
                 end else begin
                     // RV64I base W-type
                     case (funct3)
-                        F3_ADD_SUB: ctrl.alu_op = inst[30] ? ALU_SUBW : ALU_ADDW;
+                        F3_ADD_SUB: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SUBW : ALU_ADDW);
                         F3_SLL:     ctrl.alu_op = ALU_SLLW;
-                        F3_SRL_SRA: ctrl.alu_op = inst[30] ? ALU_SRAW : ALU_SRLW;
+                        F3_SRL_SRA: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SRAW : ALU_SRLW);
                         default:    ctrl.alu_op = ALU_ADDW;
                     endcase
                 end
