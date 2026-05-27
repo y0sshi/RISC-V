@@ -383,6 +383,12 @@ sim_intr: dirs
 wave_intr: sim_intr
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_intr.vcd &
 
+# --- ACT/riscv-tests testbench ---
+sim-act:
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_act.vvp \
+		$(CORE_SRC) $(TB_DIR)/tb_rv_act.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_act.vvp
+
 # --- Clean ---
 clean:
 	rm -rf $(OUT_DIR) $(WAVE_DIR)
