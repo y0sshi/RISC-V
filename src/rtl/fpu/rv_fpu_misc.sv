@@ -113,86 +113,141 @@ module rv_fpu_misc
     end
 
     // -------------------------------------------------------------------------
-    // FCVT.S.W / FCVT.S.WU  (integer -> float)
-    // All intermediates at module level (iverilog restriction)
+    // FCVT.S.W / FCVT.S.WU / FCVT.S.L / FCVT.S.LU  (integer -> float)
+    // rs2_sel[0]: 0=signed, 1=unsigned
+    // rs2_sel[1]: 0=32-bit W/WU, 1=64-bit L/LU
+    // Uses unified 64-bit magnitude path; W/WU zero-extend to 64 bits.
+    // biased_exp = 127 + 63 - csw_lz (same formula for both widths since
+    // W/WU have zeros in the upper 32 bits, making csw_lz >= 32).
+    // All intermediates at module level (iverilog restriction).
     // -------------------------------------------------------------------------
     logic        cvt_sw_sign;
-    logic [32:0] cvt_sw_mag;
+    logic [64:0] cvt_sw_mag;
     logic [31:0] cvt_sw_result;
     logic        cvt_sw_nx;
-    logic [4:0]  csw_lz;
+    logic [5:0]  csw_lz;
     logic [7:0]  csw_biased_exp;
-    logic [31:0] csw_shifted_mag;
+    logic [63:0] csw_shifted_mag;
     logic [22:0] csw_mant_frac;
     logic        csw_G, csw_R, csw_S;
     logic        csw_round_up;
     logic [23:0] csw_mant_rounded;
 
     always_comb begin
-        cvt_sw_result   = 32'h0;
-        cvt_sw_nx       = 1'b0;
-        csw_lz          = 5'd0;
-        csw_biased_exp  = 8'd0;
-        csw_shifted_mag = 32'h0;
-        csw_mant_frac   = 23'h0;
-        csw_G           = 1'b0;
-        csw_R           = 1'b0;
-        csw_S           = 1'b0;
-        csw_round_up    = 1'b0;
+        cvt_sw_result    = 32'h0;
+        cvt_sw_nx        = 1'b0;
+        csw_lz           = 6'd0;
+        csw_biased_exp   = 8'd0;
+        csw_shifted_mag  = 64'h0;
+        csw_mant_frac    = 23'h0;
+        csw_G            = 1'b0;
+        csw_R            = 1'b0;
+        csw_S            = 1'b0;
+        csw_round_up     = 1'b0;
         csw_mant_rounded = 24'h0;
 
-        if (rs2_sel[0]) begin
-            cvt_sw_sign = 1'b0;
-            cvt_sw_mag  = {1'b0, int_a[31:0]};
+        if (rs2_sel[1]) begin
+            // L / LU: use full 64-bit integer
+            if (rs2_sel[0]) begin
+                cvt_sw_sign = 1'b0;
+                cvt_sw_mag  = {1'b0, int_a[63:0]};
+            end else begin
+                cvt_sw_sign = int_a[63];
+                cvt_sw_mag  = cvt_sw_sign ? {1'b0, ~int_a[63:0] + 64'd1}
+                                          : {1'b0, int_a[63:0]};
+            end
         end else begin
-            cvt_sw_sign = int_a[XLEN-1];
-            cvt_sw_mag  = cvt_sw_sign ? {1'b0, ~int_a[31:0] + 32'd1}
-                                      : {1'b0, int_a[31:0]};
+            // W / WU: use lower 32 bits, zero-extend to 64 bits for uniform path
+            if (rs2_sel[0]) begin
+                cvt_sw_sign = 1'b0;
+                cvt_sw_mag  = {33'h0, int_a[31:0]};
+            end else begin
+                cvt_sw_sign = int_a[31];
+                cvt_sw_mag  = cvt_sw_sign ? {33'h0, ~int_a[31:0] + 32'd1}
+                                          : {33'h0, int_a[31:0]};
+            end
         end
 
         if (cvt_sw_mag == 0) begin
             cvt_sw_result = {cvt_sw_sign, 31'h0};
         end else begin
-            // Priority encode leading 1 in cvt_sw_mag[31:0]
-            if      (cvt_sw_mag[31]) csw_lz = 5'd0;
-            else if (cvt_sw_mag[30]) csw_lz = 5'd1;
-            else if (cvt_sw_mag[29]) csw_lz = 5'd2;
-            else if (cvt_sw_mag[28]) csw_lz = 5'd3;
-            else if (cvt_sw_mag[27]) csw_lz = 5'd4;
-            else if (cvt_sw_mag[26]) csw_lz = 5'd5;
-            else if (cvt_sw_mag[25]) csw_lz = 5'd6;
-            else if (cvt_sw_mag[24]) csw_lz = 5'd7;
-            else if (cvt_sw_mag[23]) csw_lz = 5'd8;
-            else if (cvt_sw_mag[22]) csw_lz = 5'd9;
-            else if (cvt_sw_mag[21]) csw_lz = 5'd10;
-            else if (cvt_sw_mag[20]) csw_lz = 5'd11;
-            else if (cvt_sw_mag[19]) csw_lz = 5'd12;
-            else if (cvt_sw_mag[18]) csw_lz = 5'd13;
-            else if (cvt_sw_mag[17]) csw_lz = 5'd14;
-            else if (cvt_sw_mag[16]) csw_lz = 5'd15;
-            else if (cvt_sw_mag[15]) csw_lz = 5'd16;
-            else if (cvt_sw_mag[14]) csw_lz = 5'd17;
-            else if (cvt_sw_mag[13]) csw_lz = 5'd18;
-            else if (cvt_sw_mag[12]) csw_lz = 5'd19;
-            else if (cvt_sw_mag[11]) csw_lz = 5'd20;
-            else if (cvt_sw_mag[10]) csw_lz = 5'd21;
-            else if (cvt_sw_mag[9])  csw_lz = 5'd22;
-            else if (cvt_sw_mag[8])  csw_lz = 5'd23;
-            else if (cvt_sw_mag[7])  csw_lz = 5'd24;
-            else if (cvt_sw_mag[6])  csw_lz = 5'd25;
-            else if (cvt_sw_mag[5])  csw_lz = 5'd26;
-            else if (cvt_sw_mag[4])  csw_lz = 5'd27;
-            else if (cvt_sw_mag[3])  csw_lz = 5'd28;
-            else if (cvt_sw_mag[2])  csw_lz = 5'd29;
-            else if (cvt_sw_mag[1])  csw_lz = 5'd30;
-            else                     csw_lz = 5'd31;
+            // Priority-encode leading 1 in cvt_sw_mag[63:0]
+            if      (cvt_sw_mag[63]) csw_lz = 6'd0;
+            else if (cvt_sw_mag[62]) csw_lz = 6'd1;
+            else if (cvt_sw_mag[61]) csw_lz = 6'd2;
+            else if (cvt_sw_mag[60]) csw_lz = 6'd3;
+            else if (cvt_sw_mag[59]) csw_lz = 6'd4;
+            else if (cvt_sw_mag[58]) csw_lz = 6'd5;
+            else if (cvt_sw_mag[57]) csw_lz = 6'd6;
+            else if (cvt_sw_mag[56]) csw_lz = 6'd7;
+            else if (cvt_sw_mag[55]) csw_lz = 6'd8;
+            else if (cvt_sw_mag[54]) csw_lz = 6'd9;
+            else if (cvt_sw_mag[53]) csw_lz = 6'd10;
+            else if (cvt_sw_mag[52]) csw_lz = 6'd11;
+            else if (cvt_sw_mag[51]) csw_lz = 6'd12;
+            else if (cvt_sw_mag[50]) csw_lz = 6'd13;
+            else if (cvt_sw_mag[49]) csw_lz = 6'd14;
+            else if (cvt_sw_mag[48]) csw_lz = 6'd15;
+            else if (cvt_sw_mag[47]) csw_lz = 6'd16;
+            else if (cvt_sw_mag[46]) csw_lz = 6'd17;
+            else if (cvt_sw_mag[45]) csw_lz = 6'd18;
+            else if (cvt_sw_mag[44]) csw_lz = 6'd19;
+            else if (cvt_sw_mag[43]) csw_lz = 6'd20;
+            else if (cvt_sw_mag[42]) csw_lz = 6'd21;
+            else if (cvt_sw_mag[41]) csw_lz = 6'd22;
+            else if (cvt_sw_mag[40]) csw_lz = 6'd23;
+            else if (cvt_sw_mag[39]) csw_lz = 6'd24;
+            else if (cvt_sw_mag[38]) csw_lz = 6'd25;
+            else if (cvt_sw_mag[37]) csw_lz = 6'd26;
+            else if (cvt_sw_mag[36]) csw_lz = 6'd27;
+            else if (cvt_sw_mag[35]) csw_lz = 6'd28;
+            else if (cvt_sw_mag[34]) csw_lz = 6'd29;
+            else if (cvt_sw_mag[33]) csw_lz = 6'd30;
+            else if (cvt_sw_mag[32]) csw_lz = 6'd31;
+            else if (cvt_sw_mag[31]) csw_lz = 6'd32;
+            else if (cvt_sw_mag[30]) csw_lz = 6'd33;
+            else if (cvt_sw_mag[29]) csw_lz = 6'd34;
+            else if (cvt_sw_mag[28]) csw_lz = 6'd35;
+            else if (cvt_sw_mag[27]) csw_lz = 6'd36;
+            else if (cvt_sw_mag[26]) csw_lz = 6'd37;
+            else if (cvt_sw_mag[25]) csw_lz = 6'd38;
+            else if (cvt_sw_mag[24]) csw_lz = 6'd39;
+            else if (cvt_sw_mag[23]) csw_lz = 6'd40;
+            else if (cvt_sw_mag[22]) csw_lz = 6'd41;
+            else if (cvt_sw_mag[21]) csw_lz = 6'd42;
+            else if (cvt_sw_mag[20]) csw_lz = 6'd43;
+            else if (cvt_sw_mag[19]) csw_lz = 6'd44;
+            else if (cvt_sw_mag[18]) csw_lz = 6'd45;
+            else if (cvt_sw_mag[17]) csw_lz = 6'd46;
+            else if (cvt_sw_mag[16]) csw_lz = 6'd47;
+            else if (cvt_sw_mag[15]) csw_lz = 6'd48;
+            else if (cvt_sw_mag[14]) csw_lz = 6'd49;
+            else if (cvt_sw_mag[13]) csw_lz = 6'd50;
+            else if (cvt_sw_mag[12]) csw_lz = 6'd51;
+            else if (cvt_sw_mag[11]) csw_lz = 6'd52;
+            else if (cvt_sw_mag[10]) csw_lz = 6'd53;
+            else if (cvt_sw_mag[9])  csw_lz = 6'd54;
+            else if (cvt_sw_mag[8])  csw_lz = 6'd55;
+            else if (cvt_sw_mag[7])  csw_lz = 6'd56;
+            else if (cvt_sw_mag[6])  csw_lz = 6'd57;
+            else if (cvt_sw_mag[5])  csw_lz = 6'd58;
+            else if (cvt_sw_mag[4])  csw_lz = 6'd59;
+            else if (cvt_sw_mag[3])  csw_lz = 6'd60;
+            else if (cvt_sw_mag[2])  csw_lz = 6'd61;
+            else if (cvt_sw_mag[1])  csw_lz = 6'd62;
+            else                     csw_lz = 6'd63;
 
-            csw_biased_exp  = 8'd127 + 8'd31 - {3'b0, csw_lz};
-            csw_shifted_mag = cvt_sw_mag[31:0] << (csw_lz + 1);
-            csw_mant_frac   = csw_shifted_mag[31:9];
-            csw_G           = csw_shifted_mag[8];
-            csw_R           = csw_shifted_mag[7];
-            csw_S           = |csw_shifted_mag[6:0];
+            // biased_exp = 127 + 63 - csw_lz
+            // Works for W/WU too: W values have csw_lz in [32,63], giving exp = 127+63-32..63 = 158..127
+            // which is exactly 127 + 31..0, matching the 32-bit formula 127+31-lz32.
+            csw_biased_exp  = 8'd127 + 8'd63 - {2'b0, csw_lz};
+            // Shift left by (csw_lz+1) to remove leading 1 and align mantissa at bit[63]
+            // Use 7-bit shift amount to avoid 6-bit overflow when csw_lz=63
+            csw_shifted_mag = cvt_sw_mag[63:0] << ({1'b0, csw_lz} + 7'd1);
+            csw_mant_frac   = csw_shifted_mag[63:41];
+            csw_G           = csw_shifted_mag[40];
+            csw_R           = csw_shifted_mag[39];
+            csw_S           = |csw_shifted_mag[38:0];
 
             case (rm)
                 3'b000: csw_round_up = csw_G & (csw_R | csw_S | csw_mant_frac[0]);
@@ -212,106 +267,189 @@ module rv_fpu_misc
     end
 
     // -------------------------------------------------------------------------
-    // FCVT.W.S / FCVT.WU.S  (float -> integer)
+    // FCVT.W.S / FCVT.WU.S / FCVT.L.S / FCVT.LU.S  (float -> integer)
+    // rs2_sel[0]: 0=signed, 1=unsigned
+    // rs2_sel[1]: 0=32-bit W/WU, 1=64-bit L/LU
+    //
+    // Per RISC-V spec (RV64): FCVT.W.S and FCVT.WU.S sign-extend their 32-bit
+    // result to XLEN bits (using bit[31] of the 32-bit result as the sign bit,
+    // regardless of signed/unsigned semantics).
+    //
+    // Saturation values (sign-extended to XLEN):
+    //   W  NaN/+inf/+overflow : {{XLEN-32{0}}, 32'h7FFF_FFFF} = 0x0000_0000_7FFF_FFFF
+    //   W  -inf/-overflow     : {{XLEN-32{1}}, 32'h8000_0000} = 0xFFFF_FFFF_8000_0000
+    //   WU NaN/+inf/+overflow : {XLEN{1}} (= UINT32_MAX sign-extended, all ones)
+    //   WU negative           : 0
+    //   L  NaN/+inf/+overflow : {0, {XLEN-1{1}}}
+    //   L  -inf/-overflow     : {1, {XLEN-1{0}}}
+    //   LU NaN/+inf/+overflow : {XLEN{1}}
+    //   LU negative           : 0
+    //
+    // Normal-path integer is computed via 88-bit intermediate:
+    //   {1'b1, frac_a, 64'h0} >> (63 - exp_unbiased)
+    //   -> integer in bits[87:24], fraction (G/R/S) in bits[23:0]
     // -------------------------------------------------------------------------
     logic [XLEN-1:0] cvt_ws_result;
     logic            cvt_ws_nv, cvt_ws_nx;
-    logic signed [8:0]  cws_exp_unbiased;
-    logic [55:0]        cws_sig_shifted;
-    logic [31:0]        cws_uint_val;
+    logic signed [8:0] cws_exp_unbiased;
+    logic [87:0]       cws_sig88;
+    logic [63:0]       cws_uint64;
 
     always_comb begin
-        cvt_ws_result   = '0;
-        cvt_ws_nv       = 1'b0;
-        cvt_ws_nx       = 1'b0;
+        cvt_ws_result    = '0;
+        cvt_ws_nv        = 1'b0;
+        cvt_ws_nx        = 1'b0;
         cws_exp_unbiased = 9'd0;
-        cws_sig_shifted = 56'h0;
-        cws_uint_val    = 32'h0;
+        cws_sig88        = 88'h0;
+        cws_uint64       = 64'h0;
 
         if (a_nan) begin
-            cvt_ws_result = rs2_sel[0] ? {XLEN{1'b1}} : {{1'b0},{(XLEN-1){1'b1}}};
-            cvt_ws_nv     = 1'b1;
-        end else if (a_inf) begin
-            if (rs2_sel[0]) begin
-                cvt_ws_result = sa ? {XLEN{1'b0}} : {XLEN{1'b1}};
+            // NaN: return saturated max for the type
+            if (!rs2_sel[0]) begin
+                // Signed: INT_MAX
+                cvt_ws_result = !rs2_sel[1]
+                    ? {{(XLEN-32){1'b0}}, 32'h7FFFFFFF}     // W
+                    : {1'b0, {(XLEN-1){1'b1}}};              // L
             end else begin
-                cvt_ws_result = sa ? {1'b1,{(XLEN-1){1'b0}}} : {{1'b0},{(XLEN-1){1'b1}}};
+                // Unsigned: UINT_MAX (sign-extended all-ones for WU)
+                cvt_ws_result = {XLEN{1'b1}};
             end
             cvt_ws_nv = 1'b1;
+
+        end else if (a_inf) begin
+            if (!rs2_sel[0]) begin
+                // Signed inf
+                cvt_ws_result = sa
+                    ? (!rs2_sel[1] ? {{(XLEN-32){1'b1}}, 32'h80000000}  // W -inf
+                                   : {1'b1, {(XLEN-1){1'b0}}})           // L -inf
+                    : (!rs2_sel[1] ? {{(XLEN-32){1'b0}}, 32'h7FFFFFFF}  // W +inf
+                                   : {1'b0, {(XLEN-1){1'b1}}});          // L +inf
+            end else begin
+                // Unsigned inf: -inf -> 0, +inf -> all-ones
+                cvt_ws_result = sa ? '0 : {XLEN{1'b1}};
+            end
+            cvt_ws_nv = 1'b1;
+
         end else if (a_zero) begin
             cvt_ws_result = '0;
+
         end else begin
             cws_exp_unbiased = $signed({1'b0, ea}) - 9'sd127;
 
             if (cws_exp_unbiased < 0) begin
+                // |value| < 1: truncates to 0
+                // For unsigned: negative-zero rounds to 0 with NX (not NV)
                 cvt_ws_result = '0;
                 cvt_ws_nx     = 1'b1;
-            end else if (rs2_sel[0]) begin
-                // Unsigned
-                if (cws_exp_unbiased >= 32) begin
-                    cvt_ws_result = {XLEN{1'b1}};
-                    cvt_ws_nv     = 1'b1;
+
+            end else if (!rs2_sel[0]) begin
+                // --------------- Signed path ---------------
+                // Overflow thresholds: W needs exp < 31, L needs exp < 63
+                if ((!rs2_sel[1] && cws_exp_unbiased >= 9'd31) ||
+                    ( rs2_sel[1] && cws_exp_unbiased >= 9'd63)) begin
+                    cvt_ws_result = sa
+                        ? (!rs2_sel[1] ? {{(XLEN-32){1'b1}}, 32'h80000000}
+                                       : {1'b1, {(XLEN-1){1'b0}}})
+                        : (!rs2_sel[1] ? {{(XLEN-32){1'b0}}, 32'h7FFFFFFF}
+                                       : {1'b0, {(XLEN-1){1'b1}}});
+                    cvt_ws_nv = 1'b1;
                 end else begin
-                    cws_sig_shifted   = {1'b1, frac_a, 32'h0} >> (31 - cws_exp_unbiased);
-                    cvt_ws_result     = {{(XLEN-32){1'b0}}, cws_sig_shifted[55:24]};
-                    cvt_ws_nx         = |cws_sig_shifted[23:0];
+                    // cws_sig88 = {1'b1, frac_a, 64'h0} >> (63 - exp_unbiased)
+                    // integer in [87:24], fraction in [23:0]
+                    cws_sig88    = {1'b1, frac_a, 64'h0} >> (9'd63 - cws_exp_unbiased);
+                    cws_uint64   = cws_sig88[87:24];
+                    cvt_ws_nx    = |cws_sig88[23:0];
                     if (cvt_ws_nx) begin
                         case (rm)
-                            3'b001: ; // RTZ
-                            3'b010: ; // RDN (positive)
-                            3'b011: cvt_ws_result = cvt_ws_result + 1; // RUP
+                            3'b001: ;                                          // RTZ
+                            3'b010: if (sa) cws_uint64 = cws_uint64 + 1;      // RDN
+                            3'b011: if (!sa) cws_uint64 = cws_uint64 + 1;     // RUP
                             3'b000: begin
-                                if (cws_sig_shifted[23] && (|cws_sig_shifted[22:0] ||
-                                    cvt_ws_result[0]))
-                                    cvt_ws_result = cvt_ws_result + 1;
+                                if (cws_sig88[23] && (|cws_sig88[22:0] || cws_uint64[0]))
+                                    cws_uint64 = cws_uint64 + 1;
                             end
                             3'b100: begin
-                                if (cws_sig_shifted[23]) cvt_ws_result = cvt_ws_result + 1;
+                                if (cws_sig88[23]) cws_uint64 = cws_uint64 + 1;
                             end
                             default: ;
                         endcase
                     end
                     if (sa) begin
-                        cvt_ws_result = {XLEN{1'b1}};
-                        cvt_ws_nv     = 1'b1;
-                    end
-                end
-            end else begin
-                // Signed
-                if (cws_exp_unbiased >= 31) begin
-                    cvt_ws_result = sa ? {1'b1,{(XLEN-1){1'b0}}} : {{1'b0},{(XLEN-1){1'b1}}};
-                    cvt_ws_nv     = 1'b1;
-                end else begin
-                    cws_sig_shifted = {1'b1, frac_a, 32'h0} >> (31 - cws_exp_unbiased);
-                    cws_uint_val    = cws_sig_shifted[55:24];
-                    cvt_ws_nx       = |cws_sig_shifted[23:0];
-                    if (cvt_ws_nx) begin
-                        case (rm)
-                            3'b001: ; // RTZ
-                            3'b010: if (sa) cws_uint_val = cws_uint_val + 1; // RDN
-                            3'b011: if (!sa) cws_uint_val = cws_uint_val + 1; // RUP
-                            3'b000: begin
-                                if (cws_sig_shifted[23] && (|cws_sig_shifted[22:0] ||
-                                    cws_uint_val[0]))
-                                    cws_uint_val = cws_uint_val + 1;
+                        if (!rs2_sel[1]) begin
+                            // W: negate 32-bit, sign-extend
+                            cvt_ws_result = {{(XLEN-32){1'b1}},
+                                            ~cws_uint64[31:0] + 32'd1};
+                            if (cws_uint64[31:0] > 32'h80000000) begin
+                                cvt_ws_result = {{(XLEN-32){1'b1}}, 32'h80000000};
+                                cvt_ws_nv     = 1'b1;
                             end
-                            3'b100: begin
-                                if (cws_sig_shifted[23]) cws_uint_val = cws_uint_val + 1;
+                        end else begin
+                            // L: negate 64-bit
+                            cvt_ws_result = ~cws_uint64 + 64'd1;
+                            if (cws_uint64 > 64'h8000000000000000) begin
+                                cvt_ws_result = {1'b1, {(XLEN-1){1'b0}}};
+                                cvt_ws_nv     = 1'b1;
                             end
-                            default: ;
-                        endcase
-                    end
-                    if (sa) begin
-                        cvt_ws_result = {{(XLEN-32){1'b1}}, ~cws_uint_val + 32'd1};
-                        if (cws_uint_val > 32'h80000000) begin
-                            cvt_ws_result = {1'b1, {(XLEN-1){1'b0}}};
-                            cvt_ws_nv     = 1'b1;
                         end
                     end else begin
-                        cvt_ws_result = {{(XLEN-32){1'b0}}, cws_uint_val};
-                        if (cws_uint_val >= 32'h80000000) begin
-                            cvt_ws_result = {{1'b0},{(XLEN-1){1'b1}}};
-                            cvt_ws_nv     = 1'b1;
+                        if (!rs2_sel[1]) begin
+                            // W: zero-extend to XLEN, check overflow
+                            cvt_ws_result = {{(XLEN-32){1'b0}}, cws_uint64[31:0]};
+                            if (cws_uint64[31:0] >= 32'h80000000) begin
+                                cvt_ws_result = {{(XLEN-32){1'b0}}, 32'h7FFFFFFF};
+                                cvt_ws_nv     = 1'b1;
+                            end
+                        end else begin
+                            // L: full 64-bit result, check overflow
+                            cvt_ws_result = cws_uint64;
+                            if (cws_uint64 >= 64'h8000000000000000) begin
+                                cvt_ws_result = {1'b0, {(XLEN-1){1'b1}}};
+                                cvt_ws_nv     = 1'b1;
+                            end
+                        end
+                    end
+                end
+
+            end else begin
+                // --------------- Unsigned path ---------------
+                if (sa) begin
+                    // Negative float (exp >= 0 means |val| >= 1): out of [0, UINT_MAX] -> 0, NV
+                    cvt_ws_result = '0;
+                    cvt_ws_nv     = 1'b1;
+                end else begin
+                    // Overflow thresholds: WU needs exp < 32, LU needs exp < 64
+                    if ((!rs2_sel[1] && cws_exp_unbiased >= 9'd32) ||
+                        ( rs2_sel[1] && cws_exp_unbiased >= 9'd64)) begin
+                        cvt_ws_result = {XLEN{1'b1}};
+                        cvt_ws_nv     = 1'b1;
+                    end else begin
+                        cws_sig88  = {1'b1, frac_a, 64'h0} >> (9'd63 - cws_exp_unbiased);
+                        cws_uint64 = cws_sig88[87:24];
+                        cvt_ws_nx  = |cws_sig88[23:0];
+                        if (cvt_ws_nx) begin
+                            case (rm)
+                                3'b001: ;                                     // RTZ
+                                3'b010: ;                                     // RDN (positive)
+                                3'b011: cws_uint64 = cws_uint64 + 1;         // RUP
+                                3'b000: begin
+                                    if (cws_sig88[23] && (|cws_sig88[22:0] ||
+                                        cws_uint64[0]))
+                                        cws_uint64 = cws_uint64 + 1;
+                                end
+                                3'b100: begin
+                                    if (cws_sig88[23]) cws_uint64 = cws_uint64 + 1;
+                                end
+                                default: ;
+                            endcase
+                        end
+                        if (!rs2_sel[1]) begin
+                            // WU: sign-extend the 32-bit result to XLEN bits
+                            // (spec: FCVT.WU.S sign-extends its 32-bit result)
+                            cvt_ws_result = {{(XLEN-32){cws_uint64[31]}},
+                                            cws_uint64[31:0]};
+                        end else begin
+                            // LU: full 64-bit result
+                            cvt_ws_result = cws_uint64;
                         end
                     end
                 end

@@ -48,9 +48,12 @@ module rv_dmem
     // -------------------------------------------------------------------------
     (* ram_style = "block" *) logic [31:0] mem [0:DEPTH-1];
 
-    // Word address (byte address >> 2)
+    // Word address: for RV64 align to the 8-byte boundary so that wstrb[7:0]
+    // correctly maps to the two 32-bit words within one 8-byte block.
+    // RV32: addr >> 2 (4-byte word index); RV64: (addr & ~7) >> 2 (even index).
     logic [$clog2(DEPTH)-1:0] word_addr;
-    assign word_addr = addr[$clog2(DEPTH)+1:2];
+    assign word_addr = (XLEN == 64) ? {addr[$clog2(DEPTH)+1:3], 1'b0}
+                                    : addr[$clog2(DEPTH)+1:2];
 
     // For RV64 double-word: upper word is at word_addr+1
     logic [$clog2(DEPTH)-1:0] word_addr_hi;

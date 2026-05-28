@@ -283,6 +283,58 @@ module tb_rv_fpu;
         check_multicycle_f("1/0=Inf(DZ)", 32'h3F800000, 32'h00000000,
                 FPU_DIV, 3'b000, 32'h7F800000, 5'b01000);
 
+        // ----- Exact-division precision regression (bug: fra[0] truncation set NX) -----
+        // 4.0 / 2.0 = 2.0, exact, fflags=0
+        check_multicycle_f("4/2=2.0 exact",
+                32'h40800000, 32'h40000000,
+                FPU_DIV, 3'b000, 32'h40000000, 5'b00000);
+        // pi / 1.0 = pi, exact, fflags=0  (fra[0]=1 was the trigger for the bug)
+        check_multicycle_f("pi/1.0=pi exact",
+                32'h40490FDB, 32'h3F800000,
+                FPU_DIV, 3'b000, 32'h40490FDB, 5'b00000);
+        // pi / pi = 1.0, exact, fflags=0
+        check_multicycle_f("pi/pi=1.0 exact",
+                32'h40490FDB, 32'h40490FDB,
+                FPU_DIV, 3'b000, 32'h3F800000, 5'b00000);
+        // 6.0 / 3.0 = 2.0, exact, fflags=0
+        check_multicycle_f("6/3=2.0 exact",
+                32'h40C00000, 32'h40400000,
+                FPU_DIV, 3'b000, 32'h40000000, 5'b00000);
+
+        // ----- Special-case FDIV (special_pending regression: previously hung pipeline) -----
+        // sNaN / 1.0 = qNaN, NV
+        check_multicycle_f("sNaN/1=qNaN(NV)",
+                32'h7FA00000, 32'h3F800000,
+                FPU_DIV, 3'b000, 32'h7FC00000, 5'b10000);
+        // qNaN / 1.0 = qNaN, no flag
+        check_multicycle_f("qNaN/1=qNaN",
+                32'h7FC00000, 32'h3F800000,
+                FPU_DIV, 3'b000, 32'h7FC00000, 5'b00000);
+        // Inf / Inf = qNaN, NV
+        check_multicycle_f("Inf/Inf=qNaN(NV)",
+                32'h7F800000, 32'h7F800000,
+                FPU_DIV, 3'b000, 32'h7FC00000, 5'b10000);
+        // 0 / 0 = qNaN, NV
+        check_multicycle_f("0/0=qNaN(NV)",
+                32'h00000000, 32'h00000000,
+                FPU_DIV, 3'b000, 32'h7FC00000, 5'b10000);
+        // -1.0 / 0 = -Inf, DZ
+        check_multicycle_f("-1/0=-Inf(DZ)",
+                32'hBF800000, 32'h00000000,
+                FPU_DIV, 3'b000, 32'hFF800000, 5'b01000);
+        // +Inf / 1.0 = +Inf
+        check_multicycle_f("Inf/1=Inf",
+                32'h7F800000, 32'h3F800000,
+                FPU_DIV, 3'b000, 32'h7F800000, 5'b00000);
+        // 1.0 / +Inf = 0
+        check_multicycle_f("1/Inf=0",
+                32'h3F800000, 32'h7F800000,
+                FPU_DIV, 3'b000, 32'h00000000, 5'b00000);
+        // Consecutive FDIV to verify pipeline recovery
+        check_multicycle_f("2/1=2.0(2nd)",
+                32'h40000000, 32'h3F800000,
+                FPU_DIV, 3'b000, 32'h40000000, 5'b00000);
+
         // =============================================================
         $display("=== FSQRT (multi-cycle) ===");
         // sqrt(1.0) = 1.0
@@ -367,7 +419,7 @@ module tb_rv_fpu;
             32'h00000000, 32'h0, FPU_SQRT, 3'b000,
             32'h00000000, 5'b00000);
 
-        // sqrt(-0) = -0 (IEEE 754 “ÁŽê‹K‘¥)
+        // sqrt(-0) = -0 (IEEE 754 ï¿½ï¿½ï¿½ï¿½Kï¿½ï¿½)
         check_multicycle_f("sqrt(-0)=-0",
             32'h80000000, 32'h0, FPU_SQRT, 3'b000,
             32'h80000000, 5'b00000);
@@ -397,7 +449,7 @@ module tb_rv_fpu;
             32'hBF800000, 32'h0, FPU_SQRT, 3'b000,
             32'h7FC00000, 5'b10000);
 
-        // sqrt(-¬‚³‚¢”) = qNaN, NV
+        // sqrt(-ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½) = qNaN, NV
         check_multicycle_f("sqrt(-0.5)=qNaN(NV)",
             32'hBF000000, 32'h0, FPU_SQRT, 3'b000,
             32'h7FC00000, 5'b10000);
@@ -453,7 +505,7 @@ module tb_rv_fpu;
         // sqrt(2^-127) = sqrt(2) * 2^-64
         check_multicycle_f("sqrt(2^-127)",
             32'h00400000, 32'h0, FPU_SQRT, 3'b000,
-            32'h1FB504F3, 5'b00001); // š 0x1F3504F3 -> 0x1FB504F3
+            32'h1FB504F3, 5'b00001); // ï¿½ï¿½ 0x1F3504F3 -> 0x1FB504F3
  
         // sqrt(max subnormal)
         check_multicycle_f("sqrt(max_subnormal)",

@@ -277,6 +277,8 @@ module rv_decode
             OP_AMO: begin
                 ctrl.reg_write = 1'b1;
                 ctrl.is_amo    = 1'b1;
+                ctrl.alu_op    = ALU_ADD;        // addr = rs1 + 0
+                ctrl.alu_src2  = ALU_SRC2_IMM;   // imm = 0 for AMO (no offset)
                 ctrl.wb_src    = WB_SRC_MEM;   // default: return old memory value
                 rs1_used       = 1'b1;          // rs1 = address
                 unique case (inst[31:27])

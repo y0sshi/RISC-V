@@ -104,9 +104,31 @@ module rv_core
     // Declared here; driven after AMO state logic below.
     logic amo_stall;
 
+    // mal_stall: holds the whole pipeline during misaligned access phase 0.
+    // Declared here; driven after misaligned FSM below.
+    logic mal_stall;
+    logic mal_state;                 // 0 = phase 0 (first word), 1 = phase 1 (second word)
+    logic [XLEN-1:0] mal_first_data; // first-read result saved during phase 1
+    logic mal_active_wb;             // MEM/WB: this load crossed a word boundary
+
     // fpu_busy_int: multi-cycle FPU (FDIV/FSQRT) in progress.
     // Declared here (before stall assign); driven after FPU instantiation below.
     logic fpu_busy_int;
+    // fpu_was_busy: 1-cycle delayed fpu_busy_int.
+    // Prevents re-triggering the FPU on the cycle when fpu_busy_int falls (result
+    // arrives), before ID/EX has advanced past the completed FDIV/FSQRT instruction.
+    logic fpu_was_busy;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) fpu_was_busy <= 1'b0;
+        else        fpu_was_busy <= fpu_busy_int;
+    end
+
+    // fpu_start_stall: stall IF/ID for the one cycle when FDIV/FSQRT first enters EX.
+    // Declared here (before stall assigns); driven after fpu_valid_in assignment below.
+    // Without this, the instruction after FDIV advances into ID/EX on the same cycle
+    // that fpu_busy_int goes high (NBA), so FDIV is lost from ID/EX before WB.
+    logic fpu_valid_in;    // forward-declared; driven below
+    logic fpu_start_stall; // forward-declared; driven below
 
     // Number of address bits that select a byte lane within one DMEM data word.
     // RV32: 2 bits (addr[1:0]) -> 4-byte word, wstrb is 4 bits
@@ -126,16 +148,20 @@ module rv_core
         else        redirect_q <= branch_taken_ex | trap_or_mret;
     end
 
-    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int;
-    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int;
-    assign stall_ex = amo_stall | fpu_busy_int;
+    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall;
+    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall;
+    assign stall_ex = amo_stall | fpu_busy_int | mal_stall;
     // Traps/MRET flush the same stages as branch (instructions after the trap insn).
     // flush_id is asserted for 2 cycles: cycle 0 (branch_taken_ex | trap_or_mret)
     // discards the instruction that was fetched alongside the branch; cycle 1
     // (redirect_q) discards the stale BRAM result from the OLD pc_reg that arrives
     // one cycle after the redirect due to synchronous-BRAM read latency.
     assign flush_id    = branch_taken_ex | redirect_q | trap_or_mret;
-    assign flush_ex    = load_use_hazard | branch_taken_ex | trap_or_mret;
+    // Suppress load-use bubble injection when stall_ex=1: the load can't
+    // advance to EX/MEM while the pipeline is frozen, so keep it in ID/EX
+    // (stall_id holds it there) rather than flushing it.  The bubble will be
+    // injected naturally on the cycle when stall_ex drops to 0.
+    assign flush_ex    = (load_use_hazard && !stall_ex) | branch_taken_ex | trap_or_mret;
     // EX/MEM must NOT be flushed for branch or load-use:
     //   - branch in EX: EX/MEM holds the instruction before the branch (already
     //     committed to EX; it must reach MEM/WB).  JAL's rd writeback also lives
@@ -332,6 +358,8 @@ module rv_core
     logic [XLEN-1:0] ex_mem_pc4;
     logic [2:0]      ex_mem_funct3;
     logic            ex_mem_valid;
+    logic [XLEN-1:0] ex_mem_csr_fwd;     // forward-decl: used in ex_mem_fwd_data mux before definition
+    logic [XLEN-1:0] ex_mem_fpu_result_i_fwd;  // forward-decl: FPU int result for EX/MEM forwarding
 
     ctrl_signals_t   mem_wb_ctrl;
     logic [XLEN-1:0] mem_wb_alu_result;
@@ -346,17 +374,21 @@ module rv_core
     logic [XLEN-1:0] ex_mem_fwd_data;
     always_comb begin
         case (ex_mem_ctrl.wb_src)
-            WB_SRC_PC4: ex_mem_fwd_data = ex_mem_pc4;
-            default:    ex_mem_fwd_data = ex_mem_alu_result;
+            WB_SRC_PC4:  ex_mem_fwd_data = ex_mem_pc4;
+            WB_SRC_CSR:  ex_mem_fwd_data = ex_mem_csr_fwd;
+            WB_SRC_FPU:  ex_mem_fwd_data = ex_mem_fpu_result_i_fwd;
+            default:     ex_mem_fwd_data = ex_mem_alu_result;
         endcase
     end
 
     // --- Forwarding unit ---
     logic [1:0] fwd_rs1_sel, fwd_rs2_sel;
+    logic [1:0] fwd_frs1_sel, fwd_frs2_sel, fwd_frs3_sel;
 
     rv_forward #(.XLEN(XLEN)) u_forward (
         .id_ex_rs1_addr (id_ex_rs1_addr),
         .id_ex_rs2_addr (id_ex_rs2_addr),
+        .id_ex_rs3_addr (id_ex_rs3_addr),
         .ex_mem_valid   (ex_mem_valid),
         .ex_mem_ctrl    (ex_mem_ctrl),
         .ex_mem_rd_addr (ex_mem_rd_addr),
@@ -364,7 +396,10 @@ module rv_core
         .mem_wb_ctrl    (mem_wb_ctrl),
         .mem_wb_rd_addr (mem_wb_rd_addr),
         .fwd_rs1_sel    (fwd_rs1_sel),
-        .fwd_rs2_sel    (fwd_rs2_sel)
+        .fwd_rs2_sel    (fwd_rs2_sel),
+        .fwd_frs1_sel   (fwd_frs1_sel),
+        .fwd_frs2_sel   (fwd_frs2_sel),
+        .fwd_frs3_sel   (fwd_frs3_sel)
     );
 
     // --- Forwarded operands ---
@@ -385,6 +420,37 @@ module rv_core
             2'b01:   fwd_rs2_data = ex_mem_fwd_data;   // EX/MEM forward
             2'b10:   fwd_rs2_data = wb_data;            // MEM/WB forward
             default: fwd_rs2_data = id_ex_rs2_data;     // register file
+        endcase
+    end
+
+    // --- FP forwarded operands ---
+    // Forward-declare pipeline register signals so the mux below can reference them
+    // before their full declaration in the EX/MEM and MEM/WB register sections.
+    logic [31:0] ex_mem_fpu_result_f;
+    logic [31:0] mem_wb_fpu_result_f;
+    logic [31:0] fwd_frs1_data, fwd_frs2_data, fwd_frs3_data;
+
+    always_comb begin
+        unique case (fwd_frs1_sel)
+            2'b01:   fwd_frs1_data = ex_mem_fpu_result_f;   // EX/MEM forward
+            2'b10:   fwd_frs1_data = wb_freg_data;          // MEM/WB: uses dmem_rdata for FLW, fpu_result for FPU ops
+            default: fwd_frs1_data = id_ex_frs1_data;       // FP register file
+        endcase
+    end
+
+    always_comb begin
+        unique case (fwd_frs2_sel)
+            2'b01:   fwd_frs2_data = ex_mem_fpu_result_f;
+            2'b10:   fwd_frs2_data = wb_freg_data;
+            default: fwd_frs2_data = id_ex_frs2_data;
+        endcase
+    end
+
+    always_comb begin
+        unique case (fwd_frs3_sel)
+            2'b01:   fwd_frs3_data = ex_mem_fpu_result_f;
+            2'b10:   fwd_frs3_data = wb_freg_data;
+            default: fwd_frs3_data = id_ex_frs3_data;
         endcase
     end
 
@@ -447,21 +513,26 @@ module rv_core
     logic [2:0]  frm_csr;           // fcsr.frm from CSR (for DYN rounding mode)
 
     // valid_in: pulse once on the first cycle a FP op enters EX.
-    // fpu_busy_int=0 on that first cycle (FPU is idle), goes to 1 afterward,
-    // suppressing re-trigger for multi-cycle ops (FDIV/FSQRT).
-    logic fpu_valid_in;
+    // Guard with !fpu_was_busy to prevent re-triggering FDIV/FSQRT on the cycle
+    // fpu_busy_int falls (result arrives), before ID/EX has advanced past the op.
+    // fpu_valid_in and fpu_start_stall are forward-declared near the stall signals.
     assign fpu_valid_in = id_ex_valid
                           && id_ex_ctrl.is_fp
                           && !id_ex_ctrl.fp_load
                           && !id_ex_ctrl.fp_store
-                          && !fpu_busy_int;
+                          && !fpu_busy_int
+                          && !fpu_was_busy;
+
+    assign fpu_start_stall = fpu_valid_in
+                             && (id_ex_ctrl.fpu_op == FPU_DIV ||
+                                 id_ex_ctrl.fpu_op == FPU_SQRT);
 
     rv_fpu #(.XLEN(XLEN)) u_fpu (
         .clk         (clk),
         .rst_n       (rst_n),
-        .fa          (id_ex_frs1_data),
-        .fb          (id_ex_frs2_data),
-        .fc          (id_ex_frs3_data),
+        .fa          (fwd_frs1_data),      // FP rs1 (with forwarding)
+        .fb          (fwd_frs2_data),      // FP rs2 (with forwarding)
+        .fc          (fwd_frs3_data),      // FP rs3 for FMADD family (with forwarding)
         .int_a       (fwd_rs1_data),       // integer rs1 for FCVT.S.W, FMV.W.X
         .fpu_op      (id_ex_ctrl.fpu_op),
         .fp_rm       (id_ex_ctrl.fp_rm),
@@ -522,24 +593,92 @@ module rv_core
                       && reservation_valid
                       && (reservation_addr == ex_mem_alu_result);
 
+    // =========================================================================
+    // Misaligned access 2-phase FSM
+    // =========================================================================
+    // mal_cross: the current MEM-stage access spans two word-aligned regions.
+    // Phase 0 (mal_state=0): issue read/write to first aligned word, stall pipeline.
+    // Phase 1 (mal_state=1): issue read/write to second aligned word, advance pipeline.
+    // WB stage: for loads, combine mal_first_data (phase-0 result) with dmem_rdata (phase-1).
+    //
+    // Access size = 1 << funct3[1:0]  (LB/SB=1, LH/SH=2, LW/SW=4, LD/SD=8)
+    // Cross occurs when: addr[BYTE_LANE_W-1:0] + size - 1 >= XLEN/8
+
+    logic [3:0] mal_size;
+    logic [3:0] mal_last_byte;
+    logic       mal_cross;
+
+    assign mal_size      = 4'd1 << ex_mem_funct3[1:0];
+    assign mal_last_byte = {1'b0, ex_mem_alu_result[BYTE_LANE_W-1:0]} + mal_size - 4'd1;
+    assign mal_cross     = ex_mem_valid
+                         && (ex_mem_ctrl.mem_read || ex_mem_ctrl.mem_write)
+                         && !ex_mem_ctrl.is_amo
+                         && (mal_last_byte >= 4'(XLEN/8));
+    assign mal_stall = mal_cross && !mal_state;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n || flush_ex_mem) begin
+            mal_state      <= 1'b0;
+            mal_first_data <= '0;
+        end else begin
+            if (mal_cross && !mal_state)
+                mal_state <= 1'b1;   // phase 0 -> phase 1
+            else
+                mal_state <= 1'b0;   // phase 1 -> idle
+
+            // Save first read result when advancing out of phase 1
+            if (mal_cross && mal_state && ex_mem_ctrl.mem_read)
+                mal_first_data <= dmem_rdata;
+        end
+    end
+
+    // Misaligned store: full byte-enable shifted by byte offset.
+    // Lower XLEN/8 bits -> phase-0 write strobe (first aligned word)
+    // Upper XLEN/8 bits -> phase-1 write strobe (second aligned word)
+    logic [XLEN/8-1:0]   mal_base_wstrb;
+    logic [2*(XLEN/8)-1:0] mal_wstrb_wide;
+    always_comb begin
+        case (ex_mem_funct3[1:0])
+            2'b00:   mal_base_wstrb = (XLEN/8)'(8'h01);
+            2'b01:   mal_base_wstrb = (XLEN/8)'(8'h03);
+            2'b10:   mal_base_wstrb = (XLEN/8)'(8'h0F);
+            default: mal_base_wstrb = {(XLEN/8){1'b1}};
+        endcase
+        mal_wstrb_wide = {(XLEN/8)'(0), mal_base_wstrb}
+                         << ex_mem_alu_result[BYTE_LANE_W-1:0];
+    end
+
+    // Misaligned address alignment mask (clears lower BYTE_LANE_W bits)
+    localparam [XLEN-1:0] WORD_MASK = ~(XLEN)'(XLEN/8 - 1);
+
+    // Shift amounts for misaligned store data (in bits)
+    logic [5:0] mal_shl;   // byte_off * 8  (shift store data left for phase 0)
+    logic [5:0] mal_shr;   // (XLEN/8 - byte_off) * 8  (shift store data right for phase 1)
+    assign mal_shl = {3'b0, ex_mem_alu_result[BYTE_LANE_W-1:0]} << 3;
+    assign mal_shr = {1'b0, 4'(XLEN/8) - {1'b0, ex_mem_alu_result[BYTE_LANE_W-1:0]}} << 3;
+
     // --- AMO compute unit ---
-    // new_data = f(old_data, rs2).  For LR/SC, rv_core overrides the write path.
-    logic [XLEN-1:0] amo_new_data;
+    // For .W AMO on a 64-bit BRAM, the 32-bit word may be in the upper half of the
+    // 8-byte word when addr[2]=1.  amo_shift selects which half to read/write.
+    logic [5:0]        amo_shift;   // bit shift: 32 when .W and addr[2]=1, else 0
+    logic [XLEN-1:0]   amo_old_data;
+    logic [XLEN-1:0]   amo_new_data;
+    logic [XLEN-1:0]   amo_wdata;
+    logic [XLEN/8-1:0] amo_wstrb;
+
+    assign amo_shift    = (!ex_mem_funct3[0] && ex_mem_alu_result[2]) ? 6'd32 : 6'd0;
+    assign amo_old_data = dmem_rdata >> amo_shift;   // extract correct 32-bit word
+    assign amo_wdata    = amo_new_data << amo_shift;  // place result at correct position
+    assign amo_wstrb    = ex_mem_funct3[0] ? {(XLEN/8){1'b1}}
+                                           : ((XLEN/8)'(8'h0F) << amo_shift[5:3]);
 
     rv_amo #(.XLEN(XLEN)) u_amo (
-        .old_data (dmem_rdata),          // BRAM output: valid during write phase
+        .old_data (amo_old_data),        // correct 32-bit word extracted from BRAM
         .rs2_data (ex_mem_rs2_data),
         .op       (ex_mem_ctrl.amo_op),
         .funct3   (ex_mem_funct3),
         .new_data (amo_new_data)
     );
-
-    // Write strobe for AMO / SC:
-    //   W (funct3=010, bit0=0): 4 bytes (8'h0F) — lower word in the BRAM array
-    //   D (funct3=011, bit0=1): 8 bytes (8'hFF)
-    logic [XLEN/8-1:0] amo_wstrb;
-    assign amo_wstrb = ex_mem_funct3[0] ? {(XLEN/8){1'b1}}    // D: all bytes
-                                        : (XLEN/8)'(8'h0F);   // W: lower 4 bytes
 
     // =========================================================================
     // EX stage: CSR interface and trap/MRET detection
@@ -666,39 +805,47 @@ module rv_core
     // =========================================================================
     // EX/MEM Pipeline Register  (between EX and MEM)
     // =========================================================================
-    logic [XLEN-1:0] ex_mem_csr_rdata;
-    logic [31:0]     ex_mem_fpu_result_f;   // FP result -> freg WB
-    logic [XLEN-1:0] ex_mem_fpu_result_i;  // FPU int result -> int reg WB
+    // ex_mem_csr_fwd declared earlier (forward-decl for ex_mem_fwd_data mux)
+    // ex_mem_fpu_result_f declared earlier (forward-decl for FP forwarding mux)
+    // ex_mem_fpu_result_i_fwd declared earlier (forward-decl for ex_mem_fwd_data mux)
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush_ex_mem) begin
-            ex_mem_ctrl          <= '0;
-            ex_mem_alu_result    <= '0;
-            ex_mem_rs2_data      <= '0;
-            ex_mem_rd_addr       <= '0;
-            ex_mem_pc4           <= '0;
-            ex_mem_funct3        <= '0;
-            ex_mem_csr_rdata     <= '0;
-            ex_mem_valid         <= 1'b0;
-            ex_mem_fpu_result_f  <= '0;
-            ex_mem_fpu_result_i  <= '0;
+            ex_mem_ctrl              <= '0;
+            ex_mem_alu_result        <= '0;
+            ex_mem_rs2_data          <= '0;
+            ex_mem_rd_addr           <= '0;
+            ex_mem_pc4               <= '0;
+            ex_mem_funct3            <= '0;
+            ex_mem_csr_fwd           <= '0;
+            ex_mem_valid             <= 1'b0;
+            ex_mem_fpu_result_f      <= '0;
+            ex_mem_fpu_result_i_fwd  <= '0;
         end else if (!stall_ex) begin
             ex_mem_ctrl       <= id_ex_ctrl;
             ex_mem_alu_result <= ex_result;
             // FSW: store data comes from FP regfile (frs2), replicate to fill data bus
             ex_mem_rs2_data   <= id_ex_ctrl.fp_store
-                                 ? {(XLEN/32){id_ex_frs2_data}}
+                                 ? {(XLEN/32){fwd_frs2_data}}
                                  : fwd_rs2_data;
             ex_mem_rd_addr    <= id_ex_rd_addr;
             ex_mem_pc4        <= id_ex_pc + XLEN'(4);
             ex_mem_funct3     <= id_ex_funct3;
-            ex_mem_csr_rdata  <= csr_rdata_ex;
-            ex_mem_valid      <= id_ex_valid;
-            ex_mem_fpu_result_f <= fpu_result_f;
-            ex_mem_fpu_result_i <= fpu_result_i;
+            ex_mem_csr_fwd    <= csr_rdata_ex;
+            ex_mem_valid      <= id_ex_valid && !(fpu_valid_in &&
+                                     (id_ex_ctrl.fpu_op == FPU_DIV ||
+                                      id_ex_ctrl.fpu_op == FPU_SQRT));
+            // Only capture FPU result for actual FP compute ops; FLW/FSW don't
+            // produce a meaningful fpu_result_f and may have X-bit operands from
+            // uninitialized FP registers (e.g. the rs2 imm field decoded as f0).
+            ex_mem_fpu_result_f     <= (id_ex_ctrl.is_fp && !id_ex_ctrl.fp_load
+                                        && !id_ex_ctrl.fp_store)
+                                       ? fpu_result_f : '0;
+            ex_mem_fpu_result_i_fwd <= fpu_result_i;
         end
         // else: stall_ex — hold EX/MEM
     end
+
 
     // =========================================================================
     // Stage 4: Memory Access (MEM)
@@ -726,19 +873,11 @@ module rv_core
             default: dmem_wstrb = '1;
         endcase
 
-        // --- Store data pre-conditioning for sub-word stores ---
-        // Replicate sub-word data across all byte lanes so that wstrb can
-        // select the correct lane regardless of byte offset within the word.
-        // Without this, SB at addr[1:0]=1 would write rs2[15:8] (wrong) into
-        // byte lane 1, not rs2[7:0] (correct).
-        if (ex_mem_ctrl.mem_write && !ex_mem_ctrl.is_amo) begin
-            case (ex_mem_funct3)
-                3'b000: dmem_wdata = {(XLEN/ 8){ex_mem_rs2_data[ 7:0]}};  // SB: replicate byte
-                3'b001: dmem_wdata = {(XLEN/16){ex_mem_rs2_data[15:0]}};  // SH: replicate halfword
-                3'b010: dmem_wdata = {(XLEN/32){ex_mem_rs2_data[31:0]}};  // SW: replicate word (nop RV32)
-                default: ;  // SD (RV64) or others: use ex_mem_rs2_data as-is
-            endcase
-        end
+        // --- Store data pre-conditioning ---
+        // Shift rs2 left by byte_off*8 so the data lands at the correct byte lanes.
+        // wstrb (already shifted above) selects the correct bytes for write.
+        if (ex_mem_ctrl.mem_write && !ex_mem_ctrl.is_amo)
+            dmem_wdata = ex_mem_rs2_data << mal_shl;
 
         // --- AMO / SC override ---
         if (ex_mem_ctrl.is_amo && ex_mem_valid) begin
@@ -752,9 +891,9 @@ module rv_core
                 dmem_wstrb = '0;
             end else if (ex_mem_ctrl.is_sc) begin
                 // SC: conditional write of rs2; read is not needed
-                dmem_req   = sc_success;           // only write on success
+                dmem_req   = sc_success;
                 dmem_we    = sc_success;
-                dmem_wdata = ex_mem_rs2_data;
+                dmem_wdata = ex_mem_rs2_data << amo_shift;  // shift for .W addr[2]=1
                 dmem_wstrb = sc_success ? amo_wstrb : '0;
             end else if (!amo_state) begin
                 // AMO phase 0: issue read
@@ -766,8 +905,29 @@ module rv_core
                 // AMO phase 1: issue write of computed new value
                 dmem_req   = 1'b1;
                 dmem_we    = 1'b1;
-                dmem_wdata = amo_new_data;
+                dmem_wdata = amo_wdata;   // shifted to correct byte position
                 dmem_wstrb = amo_wstrb;
+            end
+        end
+
+        // Misaligned access: override address and (for stores) wstrb/wdata.
+        // AMO addresses are required to be aligned, so this block is never
+        // entered for AMO operations.
+        if (mal_cross) begin
+            if (!mal_state) begin
+                // Phase 0: first aligned word
+                dmem_addr = ex_mem_alu_result & WORD_MASK;
+                if (ex_mem_ctrl.mem_write) begin
+                    dmem_wstrb = mal_wstrb_wide[XLEN/8-1:0];
+                    dmem_wdata = ex_mem_rs2_data << mal_shl;
+                end
+            end else begin
+                // Phase 1: second aligned word
+                dmem_addr = (ex_mem_alu_result & WORD_MASK) + (XLEN)'(XLEN/8);
+                if (ex_mem_ctrl.mem_write) begin
+                    dmem_wstrb = {(XLEN/8)'(0), mal_wstrb_wide[2*(XLEN/8)-1:XLEN/8]};
+                    dmem_wdata = ex_mem_rs2_data >> mal_shr;
+                end
             end
         end
     end
@@ -777,8 +937,8 @@ module rv_core
     // =========================================================================
     logic [XLEN-1:0] mem_wb_csr_rdata;
     logic [2:0]      mem_wb_funct3;
-    logic [1:0]      mem_wb_byte_offset;  // addr[1:0] — byte lane selector for sub-word loads
-    logic [31:0]     mem_wb_fpu_result_f;   // FP result -> freg
+    logic [BYTE_LANE_W-1:0] mem_wb_byte_offset;  // addr[BYTE_LANE_W-1:0] — byte lane selector for sub-word loads
+    // mem_wb_fpu_result_f declared earlier (forward-decl for FP forwarding mux)
     logic [XLEN-1:0] mem_wb_fpu_result_i;  // FPU int result -> int reg
 
     // SC result: 0 = success, 1 = failure (rd receives this value via WB_SRC_ALU)
@@ -796,20 +956,22 @@ module rv_core
             mem_wb_valid          <= 1'b0;
             mem_wb_fpu_result_f   <= '0;
             mem_wb_fpu_result_i   <= '0;
-        end else if (!amo_stall) begin
-            // Hold MEM/WB during AMO read phase so AMO stays in MEM
+            mal_active_wb         <= 1'b0;
+        end else if (!amo_stall && !mal_stall) begin
+            // Hold MEM/WB during AMO read phase or misaligned phase 0
             mem_wb_ctrl           <= ex_mem_ctrl;
             mem_wb_alu_result     <= ex_mem_ctrl.is_sc ? sc_result : ex_mem_alu_result;
             mem_wb_rd_addr        <= ex_mem_rd_addr;
             mem_wb_pc4            <= ex_mem_pc4;
-            mem_wb_csr_rdata      <= ex_mem_csr_rdata;
+            mem_wb_csr_rdata      <= ex_mem_csr_fwd;
             mem_wb_funct3         <= ex_mem_funct3;
-            mem_wb_byte_offset    <= ex_mem_alu_result[1:0];
+            mem_wb_byte_offset    <= ex_mem_alu_result[BYTE_LANE_W-1:0];
             mem_wb_valid          <= ex_mem_valid;
             mem_wb_fpu_result_f   <= ex_mem_fpu_result_f;
-            mem_wb_fpu_result_i   <= ex_mem_fpu_result_i;
+            mem_wb_fpu_result_i   <= ex_mem_fpu_result_i_fwd;
+            mal_active_wb         <= mal_cross;
         end
-        // else: amo_stall — hold MEM/WB (AMO read phase in progress)
+        // else: amo_stall or mal_stall — hold MEM/WB
     end
 
     // =========================================================================
@@ -828,14 +990,30 @@ module rv_core
     //   addr[1:0] = 1  →  shift right 8  →  rdata[15:8] in shifted[7:0]
     //   sign_extend(shifted[7:0]) = sign_extend(byte at 0x05) ✓
 
+    // Misaligned load: combine two aligned reads into one value.
+    // Phase-0 result (mal_first_data) holds bytes [0..XLEN/8-1-byte_off].
+    // Phase-1 result (dmem_rdata) holds bytes [XLEN/8-byte_off..size-1].
+    // Result = (first >> byte_off*8) | (second << (XLEN/8-byte_off)*8)
+    logic [5:0] wb_shr;   // byte_off * 8
+    logic [5:0] wb_shl;   // (XLEN/8 - byte_off) * 8
+    assign wb_shr = {3'b0, mem_wb_byte_offset} << 3;
+    assign wb_shl = {1'b0, 4'(XLEN/8) - {1'b0, mem_wb_byte_offset}} << 3;
+
+    logic [2*XLEN-1:0] mal_wide;
+    logic [XLEN-1:0]   mal_combined;
+    assign mal_wide     = ({(XLEN)'(0), mal_first_data} >> wb_shr)
+                        | ({(XLEN)'(0), dmem_rdata}     << wb_shl);
+    assign mal_combined = mal_wide[XLEN-1:0];
+
+    // dmem_shifted: for normal (non-crossing) loads, shift by byte offset.
+    // For misaligned crossing loads, use pre-combined data (already positioned).
     logic [XLEN-1:0] dmem_shifted;
     always_comb begin
-        unique case (mem_wb_byte_offset)
-            2'b00: dmem_shifted = dmem_rdata;
-            2'b01: dmem_shifted = dmem_rdata >>  8;
-            2'b10: dmem_shifted = dmem_rdata >> 16;
-            2'b11: dmem_shifted = dmem_rdata >> 24;
-        endcase
+        if (mal_active_wb)
+            dmem_shifted = mal_combined;
+        else
+            // Shift by byte_offset*8: RV32 max shift=24, RV64 max shift=56
+            dmem_shifted = dmem_rdata >> ({3'b0, mem_wb_byte_offset} << 3);
     end
 
     always_comb begin
@@ -847,11 +1025,11 @@ module rv_core
                     3'b000: wb_data = xlen_t'($signed(dmem_shifted[ 7:0]));  // LB
                     3'b001: wb_data = xlen_t'($signed(dmem_shifted[15:0]));  // LH
                     3'b010: wb_data = xlen_t'($signed(dmem_shifted[31:0]));  // LW
-                    3'b011: wb_data = dmem_rdata;                              // LD (8B aligned, no shift)
+                    3'b011: wb_data = dmem_shifted;                           // LD
                     3'b100: wb_data = xlen_t'(dmem_shifted[ 7:0]);            // LBU
                     3'b101: wb_data = xlen_t'(dmem_shifted[15:0]);            // LHU
                     3'b110: wb_data = xlen_t'(dmem_shifted[31:0]);            // LWU (RV64)
-                    default: wb_data = dmem_rdata;
+                    default: wb_data = dmem_shifted;
                 endcase
             end
             WB_SRC_PC4: wb_data = mem_wb_pc4;

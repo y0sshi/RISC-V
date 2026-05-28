@@ -101,6 +101,11 @@ module rv_fpu_div (
     // -------------------------------------------------------------------------
     logic [4:0]  iter_cnt;
     logic        computing;
+    // special_pending: route special cases (NaN/Inf/zero/div-by-zero) through a
+    // single busy cycle so they mirror the multi-cycle path timing
+    // (busy=1 for one cycle, then result_valid).  Without this the pipeline's
+    // fpu_start_stall would hang waiting for a fpu_busy pulse that never came.
+    logic        special_pending;
 
     logic [24:0] dividend_reg;  // unused after init but kept for clarity
     logic [24:0] divisor_reg;
@@ -113,7 +118,6 @@ module rv_fpu_div (
     // Temporaries (module-level to avoid iverilog local-decl restrictions)
     logic [9:0]  t_ea_e, t_eb_e;
     logic [10:0] t_er;
-    logic [25:0] t_rem2;
     logic [25:0] t_trial;
     logic        t_qbit;
     logic [9:0]  t_adj_exp;
@@ -122,15 +126,16 @@ module rv_fpu_div (
     logic        t_rup;
     logic [23:0] t_mant_r;
 
-    assign fpu_busy = computing;
+    assign fpu_busy = computing | special_pending;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            computing      <= 1'b0;
-            result_valid   <= 1'b0;
-            iter_cnt       <= 5'd0;
-            result         <= 32'h0;
-            fflags         <= 5'h0;
+            computing       <= 1'b0;
+            special_pending <= 1'b0;
+            result_valid    <= 1'b0;
+            iter_cnt        <= 5'd0;
+            result          <= 32'h0;
+            fflags          <= 5'h0;
         end else begin
             result_valid <= 1'b0;
 
@@ -150,23 +155,28 @@ module rv_fpu_div (
 
                 dividend_reg  <= {1'b0, !a_sub, fra};
                 divisor_reg   <= {1'b0, !b_sub, frb};
-                // Initialize remainder to N/2 so the first iteration computes
-                // 2*(N/2)=N vs D, correctly extracting the integer quotient bit.
-                // Without this, the first step computes 2*N vs D, producing a
-                // quotient twice as large as intended.
-                remainder_reg <= {3'b000, !a_sub, fra[22:1]};
+                // Work in the doubled-remainder (R = 2*rem) domain so the
+                // initial value R_0 = N is an exact integer.  The previous
+                // N/2 init ({3'b000,!a_sub,fra[22:1]}) dropped fra[0], which
+                // introduced a 1-ULP error and spuriously set NX for exact
+                // divisions (e.g. pi / 1.0).
+                remainder_reg <= {2'b00, !a_sub, fra};
                 quotient_reg  <= 27'h0;
 
             end else if (computing) begin
-                // One restoring step: test trial = 2*rem - divisor
-                t_rem2  = remainder_reg << 1;
-                t_trial = t_rem2 - {1'b0, divisor_reg};
-                t_qbit  = !t_trial[25];  // 1 if trial >= 0
+                // Restoring step in the doubled-remainder (R = 2*rem) domain.
+                // Compare BEFORE shifting:  q = (R >= D),
+                //   R_next = q ? 2*(R - D) : 2*R
+                // This is algebraically identical to the old "2*rem - D" form
+                // (same quotient-bit sequence) but keeps full precision because
+                // R_0 = N is exact (no fra[0] truncation).
+                t_trial = remainder_reg - {1'b0, divisor_reg};
+                t_qbit  = !t_trial[25];  // 1 if R >= D (no borrow)
 
                 if (t_qbit) begin
-                    remainder_reg <= t_trial;
+                    remainder_reg <= t_trial << 1;
                 end else begin
-                    remainder_reg <= t_rem2;
+                    remainder_reg <= remainder_reg << 1;
                 end
 
                 quotient_reg <= {quotient_reg[25:0], t_qbit};
@@ -230,10 +240,17 @@ module rv_fpu_div (
                     end
                 end
 
+            end else if (special_pending) begin
+                // Second cycle of a special case: emit the latched result.
+                special_pending <= 1'b0;
+                result_valid    <= 1'b1;
             end else if (valid_in && is_special) begin
-                result       <= special_result;
-                fflags       <= special_fflags;
-                result_valid <= 1'b1;
+                // First cycle of a special case: latch result, raise busy
+                // (special_pending) for one cycle so timing matches the
+                // multi-cycle iteration path.
+                special_pending <= 1'b1;
+                result          <= special_result;
+                fflags          <= special_fflags;
             end
         end
     end

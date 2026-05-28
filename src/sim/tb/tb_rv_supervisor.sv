@@ -175,10 +175,13 @@ module tb_rv_supervisor;
         // MIE[3] must NOT be visible in sstatus
         check_x("SSTATUS MIE[3]=0",  csr_rdata[3],  1'b0);
 
-        // Clear sstatus bits
+        // Clear sstatus writable bits.
+        // UXL[33:32]=2 is hardwired read-only in RV64 sstatus (per spec), so the
+        // expected value after writing 0 is 0x200000000, not 0x0.
         csr_write(CSR_SSTATUS, XLEN'(0));
         csr_rd(CSR_SSTATUS);
-        check_v("SSTATUS cleared",    csr_rdata, XLEN'(0));
+        check_v("SSTATUS cleared",    csr_rdata,
+                (XLEN == 64) ? XLEN'(64'h0000_0002_0000_0000) : XLEN'(0));
 
         // ----------------------------------------------------------------
         // [4] Non-delegated trap: ECALL_S → M-mode (medeleg=0)

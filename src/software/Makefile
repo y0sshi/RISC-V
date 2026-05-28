@@ -17,7 +17,15 @@ PROJECT_ROOT := $(shell dirname $(PARENT_DIR))
 
 # Docker image
 DOCKER_IMAGE := riscv_gcc:latest
-DOCKER_RUN   := docker run --rm -it \
+# Attach a pseudo-TTY only when stdout is connected to a real terminal.
+# This allows `make` to work both interactively (-it) and in non-TTY
+# environments such as CI pipelines or tool invocations (-i only).
+ifeq ($(OS),Windows_NT)
+DOCKER_TTY := $(shell powershell -Command "if (-not [Console]::IsInputRedirected) { Write-Output '-t' }")
+else
+DOCKER_TTY := $(shell test -t 0 && echo -t)
+endif
+DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) \
                 -v $(MAKEFILE_DIR):/workspace \
                 $(DOCKER_IMAGE)
 

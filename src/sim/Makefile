@@ -50,7 +50,15 @@ PROJECT_ROOT := $(shell dirname $(PARENT_DIR))
 
 # Docker image
 DOCKER_IMAGE := iverilog:13.0
-DOCKER_RUN   := docker run --rm -it \
+# Attach a pseudo-TTY only when stdout is connected to a real terminal.
+# This allows `make` to work both interactively (-it) and in non-TTY
+# environments such as CI pipelines or tool invocations (-i only).
+ifeq ($(OS),Windows_NT)
+DOCKER_TTY := $(shell powershell -Command "if (-not [Console]::IsInputRedirected) { Write-Output '-t' }")
+else
+DOCKER_TTY := $(shell test -t 0 && echo -t)
+endif
+DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) \
                 -v $(PROJECT_ROOT):/workspace \
                 -w /workspace/src/sim \
                 $(DOCKER_IMAGE)
@@ -133,18 +141,19 @@ TIMER_SRC = $(CSR_SRC)
             sim_alu sim_csr sim_rv64i sim_mext sim_mext64 sim_amo sim_amo64 \
             sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
             sim_uart sim_gpio sim_plic sim_core sim_soc sim_bm \
-            sim_pipeline sim_intr sim_fpu \
+            sim_pipeline sim_intr sim_fpu sim_fpu_pipe sim_mal \
             wave_alu wave_csr wave_rv64i wave_mext wave_mext64 wave_amo wave_amo64 \
             wave_mmu wave_mmu64 wave_sv wave_sv64 wave_timer wave_timer64 \
             wave_uart wave_gpio wave_plic wave_core wave_soc wave_bm \
-            wave_pipeline wave_intr wave_fpu \
+            wave_pipeline wave_intr wave_fpu wave_fpu_pipe wave_mal \
+            sim_act sim_act_internal wave_act \
             clean dirs
 
 all: image \
      sim_alu sim_csr sim_rv64i sim_mext sim_mext64 sim_amo sim_amo64 \
      sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
      sim_uart sim_gpio sim_plic sim_core sim_soc \
-     sim_pipeline sim_intr
+     sim_pipeline sim_intr sim_fpu_pipe sim_mal
 
 dirs:
 	mkdir -p $(OUT_DIR) $(WAVE_DIR)
@@ -361,6 +370,17 @@ sim_fpu: dirs
 wave_fpu: sim_fpu
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_fpu.vcd &
 
+# --- FP pipeline integration testbench ---
+# Validates FP forwarding (EX/MEM, MEM/WB), FSW forwarding, FLW load-use stall,
+# and FMADD rs3 forwarding through the full rv_core pipeline.
+sim_fpu_pipe: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_fpu_pipe.vvp \
+		$(CORE_SRC) $(TB_DIR)/tb_rv_fpu_pipe.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_fpu_pipe.vvp
+
+wave_fpu_pipe: sim_fpu_pipe
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_fpu_pipe.vcd &
+
 # --- Pipeline integration testbench ---
 # Exercises forwarding, stalls, branches, loads/stores, LUI/AUIPC, ECALL, CSR
 # through rv_core with a behavioral IMEM/DMEM.
@@ -383,11 +403,72 @@ sim_intr: dirs
 wave_intr: sim_intr
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_intr.vcd &
 
-# --- ACT/riscv-tests testbench ---
-sim-act:
-	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_act.vvp \
+# --- Misaligned memory access testbench ---
+# Exercises all hardware fixes for misaligned access:
+#   mem_wb_byte_offset widening, rv_dmem word_addr fix, non-crossing store wdata,
+#   crossing load combine, crossing store, SD+LD pipeline (flush_ex suppression),
+#   crossing LD + dependent ALU.
+MAL_SRC = $(CORE_SRC) $(MEM_DIR)/rv_dmem.sv
+
+sim_mal: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_mal.vvp \
+		$(MAL_SRC) $(TB_DIR)/tb_rv_mal.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_mal.vvp
+
+wave_mal: sim_mal
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_mal.vcd &
+
+# =============================================================================
+# riscv-arch-test / riscv-tests runner target
+#   Called from tests/compliance/Makefile
+#   Args:
+#     HEX_FILE    : Input hex file (Verilog format from objcopy -O verilog)
+#     SIG_FILE    : Output signature file path
+#     BEGIN_SIG   : begin_signature address (hex, no 0x prefix)
+#     END_SIG     : end_signature address (hex, no 0x prefix)
+#     TOHOST_ADDR : tohost address (default 80001000)
+# =============================================================================
+# Default addresses (overridden by caller)
+HEX_FILE    ?=
+SIG_FILE    ?=
+BEGIN_SIG   ?= 80002000
+END_SIG     ?= 80003000
+TOHOST_ADDR ?= 80001000
+
+ACT_TB_SRC = $(TB_DIR)/tb_rv_act.sv
+
+sim_act: dirs
+	@if [ -z "$(HEX_FILE)" ] || [ -z "$(SIG_FILE)" ]; then \
+		echo "ERROR: HEX and SIG must be specified"; exit 1; \
+	fi
+	$(DOCKER_RUN) $(MAKE) -f /workspace/src/sim/Makefile sim_act_internal \
+		HEX_FILE=$(HEX_FILE) SIG_FILE=$(SIG_FILE) \
+		BEGIN_SIG=$(BEGIN_SIG) END_SIG=$(END_SIG) TOHOST_ADDR=$(TOHOST_ADDR)
+
+sim_act_internal:
+	@if [ -z "$(HEX_FILE)" ] || [ -z "$(SIG_FILE)" ]; then \
+		echo "ERROR: HEX and SIG must be specified"; exit 1; \
+	fi
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 \
+		-DHEX_FILE=\"$(HEX_FILE)\"       \
+		-DSIG_FILE=\"$(SIG_FILE)\"       \
+		-DBEGIN_SIG=\"$(BEGIN_SIG)\"     \
+		-DEND_SIG=\"$(END_SIG)\"         \
+		-DTOHOST_ADDR=\"$(TOHOST_ADDR)\" \
+		-o $(OUT_DIR)/tb_rv_act.vvp      \
 		$(CORE_SRC) $(TB_DIR)/tb_rv_act.sv
-	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_act.vvp
+	$(VVP) $(OUT_DIR)/tb_rv_act.vvp
+
+sim_act_debug_internal:
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 \
+		-DHEX_FILE=\"$(HEX_FILE)\"       \
+		-DTOHOST_ADDR=\"$(TOHOST_ADDR)\" \
+		-o $(OUT_DIR)/tb_rv_act_debug.vvp \
+		$(CORE_SRC) $(TB_DIR)/tb_rv_act_debug.sv
+	$(VVP) $(OUT_DIR)/tb_rv_act_debug.vvp
+
+wave_act:
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_act.vcd
 
 # --- Clean ---
 clean:

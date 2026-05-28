@@ -213,7 +213,10 @@ module rv_csr
     // =========================================================================
     // mstatus reconstruction (full M-mode view)
     // Wire-based to avoid constant-select warnings in always_*.
+    // UXL[33:32]=2 and SXL[35:34]=2 are hardwired for RV64 (read-only constants).
     // =========================================================================
+    localparam [63:0] MSTATUS_UXL = (XLEN == 64) ? 64'h0000_0002_0000_0000 : 64'h0;
+    localparam [63:0] MSTATUS_SXL = (XLEN == 64) ? 64'h0000_0008_0000_0000 : 64'h0;
     wire [63:0] mstatus64 = ({63'b0, mstatus_sie}   << 1)
                           | ({63'b0, mstatus_mie}   << 3)
                           | ({63'b0, mstatus_spie}  << 5)
@@ -221,11 +224,15 @@ module rv_csr
                           | ({63'b0, mstatus_spp}   << 8)
                           | ({62'b0, mstatus_mpp}   << 11)
                           | ({63'b0, mstatus_sum_r} << 18)
-                          | ({63'b0, mstatus_mxr_r} << 19);
+                          | ({63'b0, mstatus_mxr_r} << 19)
+                          | MSTATUS_UXL
+                          | MSTATUS_SXL;
     wire [XLEN-1:0] mstatus_rval = mstatus64[XLEN-1:0];
 
-    // sstatus: restricted view of mstatus (S-mode accessible bits only)
-    wire [XLEN-1:0] sstatus_rval = mstatus_rval & SSTATUS_WMASK;
+    // sstatus: restricted view of mstatus (S-mode accessible bits + UXL read-only)
+    // UXL[33:32] is read-only in sstatus but must be visible to S-mode software.
+    localparam [XLEN-1:0] SSTATUS_RMASK = SSTATUS_WMASK | XLEN'(MSTATUS_UXL);
+    wire [XLEN-1:0] sstatus_rval = mstatus_rval & SSTATUS_RMASK;
 
     // =========================================================================
     // Trap delegation check (combinational)
@@ -337,7 +344,7 @@ module rv_csr
             CSR_MIP:      csr_rdata = mip_val;
             CSR_MCYCLE:   csr_rdata = xlen_t'(mcycle_cnt[XLEN-1:0]);
             CSR_MINSTRET: csr_rdata = xlen_t'(minstret_cnt[XLEN-1:0]);
-            CSR_MHARTID:  csr_rdata = xlen_t'(HARTID[XLEN-1:0]);
+            CSR_MHARTID:  csr_rdata = xlen_t'(HARTID);
             // RV32 upper-half counters
             12'hB80:      csr_rdata = (XLEN == 32) ? xlen_t'(mcycle_cnt[63:32])   : '0;
             12'hB82:      csr_rdata = (XLEN == 32) ? xlen_t'(minstret_cnt[63:32]) : '0;

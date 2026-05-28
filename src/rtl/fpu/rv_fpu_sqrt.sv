@@ -130,6 +130,11 @@ module rv_fpu_sqrt (
     // -------------------------------------------------------------------------
     logic [4:0]        iter_cnt;
     logic              computing;
+    // special_pending: route special cases (NaN/negative/zero/inf) through a
+    // single busy cycle so they mirror the multi-cycle path timing
+    // (busy=1 for one cycle, then result_valid).  Without this the pipeline's
+    // fpu_start_stall would hang waiting for a fpu_busy pulse that never came.
+    logic              special_pending;
     logic [2:0]        rm_reg;
     logic signed [9:0] exp_r_reg;
     logic [53:0]       rad_reg;
@@ -207,7 +212,7 @@ module rv_fpu_sqrt (
         rem_next         = t_qbit ? t_trial : t_rem_ext;
     end
 
-    assign fpu_busy = computing;
+    assign fpu_busy = computing | special_pending;
 
     // -------------------------------------------------------------------------
     // Rounding & packing (uses root_next / rem_next at final cycle)
@@ -267,24 +272,32 @@ module rv_fpu_sqrt (
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            computing    <= 1'b0;
-            result_valid <= 1'b0;
-            result       <= 32'h0;
-            fflags       <= 5'h0;
-            iter_cnt     <= 5'd0;
-            rad_reg      <= 54'h0;
-            root_reg     <= 27'h0;
-            rem_reg      <= 28'h0;
-            exp_r_reg    <= 10'sd0;
-            rm_reg       <= 3'b000;
+            computing       <= 1'b0;
+            special_pending <= 1'b0;
+            result_valid    <= 1'b0;
+            result          <= 32'h0;
+            fflags          <= 5'h0;
+            iter_cnt        <= 5'd0;
+            rad_reg         <= 54'h0;
+            root_reg        <= 27'h0;
+            rem_reg         <= 28'h0;
+            exp_r_reg       <= 10'sd0;
+            rm_reg          <= 3'b000;
         end else begin
             result_valid <= 1'b0;
 
-            if (!computing && valid_in && is_special) begin
-                // Special case: 1-cycle
-                result       <= special_result;
-                fflags       <= special_fflags;
-                result_valid <= 1'b1;
+            if (special_pending) begin
+                // Second cycle of a special case: emit the latched result.
+                special_pending <= 1'b0;
+                result_valid    <= 1'b1;
+
+            end else if (!computing && valid_in && is_special) begin
+                // First cycle of a special case: latch result, raise busy
+                // (special_pending) for one cycle so timing matches the
+                // multi-cycle iteration path.
+                special_pending <= 1'b1;
+                result          <= special_result;
+                fflags          <= special_fflags;
 
             end else if (!computing && valid_in && !is_special) begin
                 // Start iteration
