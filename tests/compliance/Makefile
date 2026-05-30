@@ -63,7 +63,7 @@ all: act
 help:
 	@echo "Usage:"
 	@echo "  make act               - Run riscv-arch-test (ACT)"
-	@echo "  make riscv-tests       - Build ELFs then run simulation (rv64ui-p + rv64um-p)"
+	@echo "  make riscv-tests       - Build ELFs then run simulation (rv64ui/um/ua/uf/ud/si-p)"
 	@echo "  make riscv-tests-build - Build ELFs only (compile inside container)"
 	@echo "  make riscv-tests-run   - Run simulation only (requires pre-built ELFs)"
 	@echo "  make run-single        - Run single test (TEST_SRC, TEST_NAME, SUITE)"
@@ -160,12 +160,12 @@ riscv-tests-build:
 	'
 
 # Run simulation using pre-built ELFs
-# Groups: rv64ui (I), rv64um (M), rv64ua (A), rv64uf (F), rv64si (S-mode)
+# Groups: rv64ui (I), rv64um (M), rv64ua (A), rv64uf (F), rv64ud (D), rv64si (S-mode)
 riscv-tests-run:
 	@mkdir -p $(PROJECT_ROOT)/tests/results
 	$(DOCKER_RUN) bash -c '\
 		total=0; pass=0; fail=0; \
-		for group in rv64ui-p rv64um-p rv64ua-p rv64uf-p rv64si-p; do \
+		for group in rv64ui-p rv64um-p rv64ua-p rv64uf-p rv64ud-p rv64si-p; do \
 			grp_total=0; grp_pass=0; grp_fail=0; \
 			echo "--- $$group ---"; \
 			for elf in $(RISCV_TESTS)/isa/$$group-*; do \

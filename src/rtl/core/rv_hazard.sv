@@ -63,7 +63,9 @@ module rv_hazard
 
         // ---- FP load-use: FLW in EX, FP consumer in ID ----
         // FLW result arrives in WB (one cycle after MEM), so ID cannot proceed.
-        if (id_ex_valid && id_ex_ctrl.fp_load && (id_ex_rd_addr != '0)) begin
+        // Note: no `!= '0` guard here -- f0 is a real, writable FP register
+        // (unlike integer x0), so a load targeting f0 must still stall.
+        if (id_ex_valid && id_ex_ctrl.fp_load) begin
             if (id_fp_reads_rs1 && (id_ex_rd_addr == id_rs1_addr))
                 load_use_hazard = 1'b1;
             if (id_fp_reads_rs2 && (id_ex_rd_addr == id_rs2_addr))

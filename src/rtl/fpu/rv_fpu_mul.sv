@@ -85,42 +85,87 @@ module rv_fpu_mul (
     assign exp_sum = {1'b0, ea_eff} + {1'b0, eb_eff} - 11'd127;
 
     // -------------------------------------------------------------------------
-    // Normalize: product is in range [1.0, 4.0) -> bit47 or bit46 is leading 1
-    // -------------------------------------------------------------------------
-    // If prod[47]=1: result = 1.prod[46:0] -> shift=0, exp_sum+1
-    // If prod[46]=1: result = 1.prod[45:0] -> shift=1, exp_sum
-    // We need 23 fraction bits + GRS for rounding
+    // Normalize: locate the leading 1 of the 48-bit product and left-align it
+    // to bit 47.  For two normalized inputs the leading 1 sits at bit 47 or 46
+    // (1-bit shift), but a subnormal operand has no implicit leading 1, so its
+    // 24-bit significand carries leading zeros and the product's leading 1 can
+    // fall well below bit 46.  That demands a multi-bit left shift.
     //
-    // Representation after normalization:
-    //   mantissa[23:0] = {1, frac[22:0]}
-    //   GRS = prod bits below the chosen fraction
+    // The leading-zero count is computed with an explicit if-else priority
+    // encoder (NOT casez: iverilog mishandles casez on wide part-selects, see
+    // rv_fpu_add_d.sv).  After shifting, the leading 1 is at bit 47:
+    //   prod_norm[47]   = hidden leading 1
+    //   prod_norm[46:24]= fraction[22:0]
+    //   prod_norm[23]   = G, [22] = R, [21:0] = sticky
+    // Exponent: leading 1 originally at bit (47 - prod_lzc), so relative to the
+    // bit-46 reference used by exp_sum the bias is +1 - prod_lzc.
+    // -------------------------------------------------------------------------
+    logic [5:0] prod_lzc;   // leading-zero count of prod[47:0] (0..47)
+    always_comb begin
+        if      (prod[47]) prod_lzc = 6'd0;
+        else if (prod[46]) prod_lzc = 6'd1;
+        else if (prod[45]) prod_lzc = 6'd2;
+        else if (prod[44]) prod_lzc = 6'd3;
+        else if (prod[43]) prod_lzc = 6'd4;
+        else if (prod[42]) prod_lzc = 6'd5;
+        else if (prod[41]) prod_lzc = 6'd6;
+        else if (prod[40]) prod_lzc = 6'd7;
+        else if (prod[39]) prod_lzc = 6'd8;
+        else if (prod[38]) prod_lzc = 6'd9;
+        else if (prod[37]) prod_lzc = 6'd10;
+        else if (prod[36]) prod_lzc = 6'd11;
+        else if (prod[35]) prod_lzc = 6'd12;
+        else if (prod[34]) prod_lzc = 6'd13;
+        else if (prod[33]) prod_lzc = 6'd14;
+        else if (prod[32]) prod_lzc = 6'd15;
+        else if (prod[31]) prod_lzc = 6'd16;
+        else if (prod[30]) prod_lzc = 6'd17;
+        else if (prod[29]) prod_lzc = 6'd18;
+        else if (prod[28]) prod_lzc = 6'd19;
+        else if (prod[27]) prod_lzc = 6'd20;
+        else if (prod[26]) prod_lzc = 6'd21;
+        else if (prod[25]) prod_lzc = 6'd22;
+        else if (prod[24]) prod_lzc = 6'd23;
+        else if (prod[23]) prod_lzc = 6'd24;
+        else if (prod[22]) prod_lzc = 6'd25;
+        else if (prod[21]) prod_lzc = 6'd26;
+        else if (prod[20]) prod_lzc = 6'd27;
+        else if (prod[19]) prod_lzc = 6'd28;
+        else if (prod[18]) prod_lzc = 6'd29;
+        else if (prod[17]) prod_lzc = 6'd30;
+        else if (prod[16]) prod_lzc = 6'd31;
+        else if (prod[15]) prod_lzc = 6'd32;
+        else if (prod[14]) prod_lzc = 6'd33;
+        else if (prod[13]) prod_lzc = 6'd34;
+        else if (prod[12]) prod_lzc = 6'd35;
+        else if (prod[11]) prod_lzc = 6'd36;
+        else if (prod[10]) prod_lzc = 6'd37;
+        else if (prod[9])  prod_lzc = 6'd38;
+        else if (prod[8])  prod_lzc = 6'd39;
+        else if (prod[7])  prod_lzc = 6'd40;
+        else if (prod[6])  prod_lzc = 6'd41;
+        else if (prod[5])  prod_lzc = 6'd42;
+        else if (prod[4])  prod_lzc = 6'd43;
+        else if (prod[3])  prod_lzc = 6'd44;
+        else if (prod[2])  prod_lzc = 6'd45;
+        else if (prod[1])  prod_lzc = 6'd46;
+        else               prod_lzc = 6'd47;  // prod[0] or prod==0 (unreachable here)
+    end
+
+    logic [47:0] prod_norm;
+    assign prod_norm = prod << prod_lzc;   // leading 1 left-aligned to bit 47
 
     logic [22:0] norm_frac;
     logic        G, R, S_bit;
     logic [10:0] norm_exp;
 
     always_comb begin
-        norm_exp  = 11'h0;
-        norm_frac = 23'h0;
-        G         = 1'b0;
-        R         = 1'b0;
-        S_bit     = 1'b0;
-
-        if (prod[47]) begin
-            // Leading 1 in bit 47: product = 1.prod[46:24] with GRS=prod[23:21]|...
-            norm_frac = prod[46:24];
-            G         = prod[23];
-            R         = prod[22];
-            S_bit     = |prod[21:0];
-            norm_exp  = exp_sum[10:0] + 11'd1;
-        end else begin
-            // Leading 1 in bit 46 (normal case for normalized inputs)
-            norm_frac = prod[45:23];
-            G         = prod[22];
-            R         = prod[21];
-            S_bit     = |prod[20:0];
-            norm_exp  = exp_sum[10:0];
-        end
+        norm_frac = prod_norm[46:24];
+        G         = prod_norm[23];
+        R         = prod_norm[22];
+        S_bit     = |prod_norm[21:0];
+        // exp_sum references the bit-46 leading position; shift moves it to 47
+        norm_exp  = exp_sum[10:0] + 11'd1 - {5'd0, prod_lzc};
     end
 
     // -------------------------------------------------------------------------

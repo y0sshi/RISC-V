@@ -27,9 +27,9 @@ module tb_rv_fpu;
     always #5 clk = ~clk;  // 100 MHz
 
     // -------------------------------------------------------------------------
-    // DUT signals
+    // DUT signals (64-bit FP bus; F-extension uses lower 32 bits)
     // -------------------------------------------------------------------------
-    logic [31:0]    fa, fb, fc;
+    logic [63:0]    fa, fb, fc;
     logic [31:0]    int_a;
     fpu_op_t        fpu_op;
     logic [2:0]     fp_rm;
@@ -37,7 +37,7 @@ module tb_rv_fpu;
     logic [4:0]     rs2_sel;
     logic           valid_in;
 
-    logic [31:0]    result_f;
+    logic [63:0]    result_f;
     logic [31:0]    result_i;
     logic [4:0]     fflags;
     logic           fpu_busy;
@@ -51,6 +51,7 @@ module tb_rv_fpu;
         .fc          (fc),
         .int_a       (int_a),
         .fpu_op      (fpu_op),
+        .fp_double   (1'b0),
         .fp_rm       (fp_rm),
         .frm_in      (frm_in),
         .rs2_sel     (rs2_sel),
@@ -84,7 +85,7 @@ module tb_rv_fpu;
             $display("TIMEOUT waiting for result_valid");
     endtask
 
-    // Issue a single-cycle FP operation and check result_f
+    // Issue a single-cycle FP operation and check result_f[31:0]
     task automatic check_f(
         input string       name,
         input logic [31:0] a_in,
@@ -97,9 +98,9 @@ module tb_rv_fpu;
         input logic [4:0]  exp_flags
     );
         @(negedge clk);
-        fa      = a_in;
-        fb      = b_in;
-        fc      = c_in;
+        fa      = {32'hFFFFFFFF, a_in};
+        fb      = {32'hFFFFFFFF, b_in};
+        fc      = {32'hFFFFFFFF, c_in};
         fpu_op  = op;
         fp_rm   = rm_in;
         rs2_sel = sel;
@@ -107,13 +108,12 @@ module tb_rv_fpu;
         valid_in = 1'b1;
         @(posedge clk);
         valid_in = 1'b0;
-        // combinational result visible before next clock edge
-        if (result_f === exp_f && fflags === exp_flags) begin
-            $display("  PASS: %s -> f=%h flags=%b", name, result_f, fflags);
+        if (result_f[31:0] === exp_f && fflags === exp_flags) begin
+            $display("  PASS: %s -> f=%h flags=%b", name, result_f[31:0], fflags);
             pass_cnt++;
         end else begin
             $display("  FAIL: %s -> f=%h (exp %h)  flags=%b (exp %b)",
-                     name, result_f, exp_f, fflags, exp_flags);
+                     name, result_f[31:0], exp_f, fflags, exp_flags);
             fail_cnt++;
         end
     endtask
@@ -130,9 +130,9 @@ module tb_rv_fpu;
         input logic [4:0]  exp_flags
     );
         @(negedge clk);
-        fa      = a_in;
-        fb      = b_in;
-        fc      = 32'h0;
+        fa      = {32'hFFFFFFFF, a_in};
+        fb      = {32'hFFFFFFFF, b_in};
+        fc      = 64'h0;
         fpu_op  = op;
         fp_rm   = rm_in;
         rs2_sel = sel;
@@ -157,9 +157,9 @@ module tb_rv_fpu;
         input logic [31:0] exp_f
     );
         @(negedge clk);
-        fa      = 32'h0;
-        fb      = 32'h0;
-        fc      = 32'h0;
+        fa      = 64'h0;
+        fb      = 64'h0;
+        fc      = 64'h0;
         int_a   = {32'h0, ia_in};
         fpu_op  = FPU_MVWX;
         fp_rm   = 3'b000;
@@ -167,11 +167,11 @@ module tb_rv_fpu;
         valid_in = 1'b1;
         @(posedge clk);
         valid_in = 1'b0;
-        if (result_f === exp_f) begin
-            $display("  PASS: %s -> f=%h", name, result_f);
+        if (result_f[31:0] === exp_f) begin
+            $display("  PASS: %s -> f=%h", name, result_f[31:0]);
             pass_cnt++;
         end else begin
-            $display("  FAIL: %s -> f=%h (exp %h)", name, result_f, exp_f);
+            $display("  FAIL: %s -> f=%h (exp %h)", name, result_f[31:0], exp_f);
             fail_cnt++;
         end
     endtask
@@ -186,12 +186,12 @@ module tb_rv_fpu;
         input logic [31:0] exp_f,
         input logic [4:0]  exp_flags
     );
-        logic [31:0] r_f;
+        logic [63:0] r_f;
         logic [4:0]  r_flags;
         @(negedge clk);
-        fa      = a_in;
-        fb      = b_in;
-        fc      = 32'h0;
+        fa      = {32'hFFFFFFFF, a_in};
+        fb      = {32'hFFFFFFFF, b_in};
+        fc      = 64'h0;
         fpu_op  = op;
         fp_rm   = rm_in;
         rs2_sel = 5'h0;
@@ -204,12 +204,12 @@ module tb_rv_fpu;
         r_f     = result_f;
         r_flags = fflags;
         @(negedge clk);
-        if (r_f === exp_f && r_flags === exp_flags) begin
-            $display("  PASS: %s -> f=%h flags=%b", name, r_f, r_flags);
+        if (r_f[31:0] === exp_f && r_flags === exp_flags) begin
+            $display("  PASS: %s -> f=%h flags=%b", name, r_f[31:0], r_flags);
             pass_cnt++;
         end else begin
             $display("  FAIL: %s -> f=%h (exp %h)  flags=%b (exp %b)",
-                     name, r_f, exp_f, r_flags, exp_flags);
+                     name, r_f[31:0], exp_f, r_flags, exp_flags);
             fail_cnt++;
         end
     endtask
@@ -237,7 +237,7 @@ module tb_rv_fpu;
         $dumpvars(0, tb_rv_fpu);
 
         // Reset
-        fa = 0; fb = 0; fc = 0; int_a = 0;
+        fa = 64'h0; fb = 64'h0; fc = 64'h0; int_a = 0;
         fpu_op = FPU_ADD; fp_rm = 3'b000; frm_in = 3'b000;
         rs2_sel = 5'h0; valid_in = 0;
         repeat(3) @(posedge clk);
@@ -672,9 +672,9 @@ module tb_rv_fpu;
         // rs2_sel[0]=0 -> signed
         // 3 -> 3.0 (exact)  3.0=0x40400000
         @(negedge clk);
-        fa      = 32'h0;
-        fb      = 32'h0;
-        fc      = 32'h0;
+        fa      = 64'h0;
+        fb      = 64'h0;
+        fc      = 64'h0;
         int_a   = 32'd3;
         fpu_op  = FPU_CVTSW;
         fp_rm   = 3'b000;
@@ -682,12 +682,12 @@ module tb_rv_fpu;
         valid_in = 1'b1;
         @(posedge clk);
         valid_in = 1'b0;
-        if (result_f === 32'h40400000 && fflags === 5'b00000) begin
-            $display("  PASS: FCVT.S.W(3)=3.0 -> f=%h flags=%b", result_f, fflags);
+        if (result_f[31:0] === 32'h40400000 && fflags === 5'b00000) begin
+            $display("  PASS: FCVT.S.W(3)=3.0 -> f=%h flags=%b", result_f[31:0], fflags);
             pass_cnt++;
         end else begin
             $display("  FAIL: FCVT.S.W(3) -> f=%h (exp 40400000) flags=%b (exp 00000)",
-                     result_f, fflags);
+                     result_f[31:0], fflags);
             fail_cnt++;
         end
 

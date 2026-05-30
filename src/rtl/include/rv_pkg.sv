@@ -81,26 +81,29 @@ package rv_pkg;
     } opcode_t;
 
     // =========================================================================
-    // F-Extension (Single-Precision Float) Operation Codes
+    // F/D-Extension Floating-Point Operation Codes
+    // fp_double in ctrl_signals_t selects D (double) vs S (single) precision.
     // =========================================================================
     typedef enum logic [4:0] {
-        FPU_ADD    = 5'd0,   // FADD.S
-        FPU_SUB    = 5'd1,   // FSUB.S
-        FPU_MUL    = 5'd2,   // FMUL.S
-        FPU_DIV    = 5'd3,   // FDIV.S  (multi-cycle)
-        FPU_SQRT   = 5'd4,   // FSQRT.S (multi-cycle)
-        FPU_SGNJ   = 5'd5,   // FSGNJ.S / FSGNJN.S / FSGNJX.S  (rm selects)
-        FPU_MINMAX = 5'd6,   // FMIN.S / FMAX.S  (rm selects: 0=min, 1=max)
-        FPU_CMP    = 5'd7,   // FEQ.S / FLT.S / FLE.S  (rm selects)
-        FPU_CVTWS  = 5'd8,   // FCVT.W.S / FCVT.WU.S   (fp_rs2_sel[0] selects)
-        FPU_CVTSW  = 5'd9,   // FCVT.S.W / FCVT.S.WU   (fp_rs2_sel[0] selects)
-        FPU_MVXW   = 5'd10,  // FMV.X.W  (move float bits to int reg)
-        FPU_MVWX   = 5'd11,  // FMV.W.X  (move int bits to float reg)
-        FPU_CLASS  = 5'd12,  // FCLASS.S
-        FPU_MADD   = 5'd13,  // FMADD.S  (rd = rs1*rs2 + rs3)
-        FPU_MSUB   = 5'd14,  // FMSUB.S  (rd = rs1*rs2 - rs3)
-        FPU_NMSUB  = 5'd15,  // FNMSUB.S (rd = -(rs1*rs2 - rs3))
-        FPU_NMADD  = 5'd16   // FNMADD.S (rd = -(rs1*rs2 + rs3))
+        FPU_ADD    = 5'd0,   // FADD.S/.D
+        FPU_SUB    = 5'd1,   // FSUB.S/.D
+        FPU_MUL    = 5'd2,   // FMUL.S/.D
+        FPU_DIV    = 5'd3,   // FDIV.S/.D  (multi-cycle)
+        FPU_SQRT   = 5'd4,   // FSQRT.S/.D (multi-cycle)
+        FPU_SGNJ   = 5'd5,   // FSGNJ/FSGNJN/FSGNJX .S/.D  (rm selects)
+        FPU_MINMAX = 5'd6,   // FMIN/FMAX .S/.D  (rm selects: 0=min, 1=max)
+        FPU_CMP    = 5'd7,   // FEQ/FLT/FLE .S/.D  (rm selects)
+        FPU_CVTWS  = 5'd8,   // FCVT.W.S/.D / FCVT.WU.S/.D  (fp_rs2_sel selects)
+        FPU_CVTSW  = 5'd9,   // FCVT.S.W/.D.W / FCVT.S.WU/.D.WU  (fp_rs2_sel selects)
+        FPU_MVXW   = 5'd10,  // FMV.X.W (S) / FMV.X.D (D)
+        FPU_MVWX   = 5'd11,  // FMV.W.X (S) / FMV.D.X (D)
+        FPU_CLASS  = 5'd12,  // FCLASS.S/.D
+        FPU_MADD   = 5'd13,  // FMADD.S/.D  (rd = rs1*rs2 + rs3)
+        FPU_MSUB   = 5'd14,  // FMSUB.S/.D  (rd = rs1*rs2 - rs3)
+        FPU_NMSUB  = 5'd15,  // FNMSUB.S/.D (rd = -(rs1*rs2 - rs3))
+        FPU_NMADD  = 5'd16,  // FNMADD.S/.D (rd = -(rs1*rs2 + rs3))
+        FPU_CVTSD  = 5'd17,  // FCVT.S.D  (double -> single, result=S)
+        FPU_CVTDS  = 5'd18   // FCVT.D.S  (single -> double, result=D)
     } fpu_op_t;
 
     // =========================================================================
@@ -279,14 +282,15 @@ package rv_pkg;
         amo_op_t    amo_op;         // AMO operation selector
         // Zicsr / privileged
         logic       is_sfence_vma;  // SFENCE.VMA — flush TLB
-        // F extension (single-precision floating-point)
+        // F/D extension floating-point
         logic       is_fp;        // FP instruction (not FLW/FSW but any FPU op)
-        logic       fp_load;      // FLW: DMEM -> f-regfile
-        logic       fp_store;     // FSW: f-regfile -> DMEM (store data is float)
+        logic       fp_load;      // FLW/FLD: DMEM -> f-regfile
+        logic       fp_store;     // FSW/FSD: f-regfile -> DMEM (store data is float)
         logic       freg_write;   // Write result to FP register file
         logic       fp_to_int;    // FPU result -> integer regfile (FMV.X.W, FCVT.W.S, CMP, FCLASS)
         logic       int_to_fp;    // rs1 from integer regfile (FMV.W.X, FCVT.S.W)
         logic       fp_use_rs3;   // Read rs3 (FMADD / FMSUB / FNMADD / FNMSUB)
+        logic       fp_double;    // 1 = double precision (D-ext), 0 = single precision (F-ext)
         fpu_op_t    fpu_op;       // FPU operation selector
         logic [2:0] fp_rm;        // Rounding mode from instruction field
         logic [4:0] fp_rs2_sel;   // inst[24:20]: FCVT sub-type / FSQRT rs2 field

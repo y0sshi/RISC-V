@@ -274,10 +274,11 @@ module rv_core
     );
 
     // =========================================================================
-    // F-Extension: FP Register File (32 x 32-bit, 3 read ports + 1 write port)
+    // F/D-Extension: FP Register File (32 x 64-bit, 3 read ports + 1 write port)
+    // F-extension values are NaN-boxed (upper 32 bits = 0xFFFFFFFF).
     // =========================================================================
-    logic [31:0]  id_frs1_data, id_frs2_data, id_frs3_data;
-    logic [31:0]  wb_freg_data;   // FP WB write data
+    logic [63:0]  id_frs1_data, id_frs2_data, id_frs3_data;
+    logic [63:0]  wb_freg_data;   // FP WB write data
     reg_addr_t    wb_frd_addr;    // FP WB write address
     logic         wb_freg_write;  // FP WB write enable
 
@@ -306,8 +307,8 @@ module rv_core
     logic [2:0]      id_ex_funct3;
     logic [11:0]     id_ex_csr_addr;   // inst[31:20] — CSR address for Zicsr
     logic            id_ex_valid;
-    // FP operands registered from fregfile
-    logic [31:0]     id_ex_frs1_data, id_ex_frs2_data, id_ex_frs3_data;
+    // FP operands registered from fregfile (64-bit for F+D extensions)
+    logic [63:0]     id_ex_frs1_data, id_ex_frs2_data, id_ex_frs3_data;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush_ex) begin
@@ -423,18 +424,18 @@ module rv_core
         endcase
     end
 
-    // --- FP forwarded operands ---
+    // --- FP forwarded operands (64-bit for F+D extensions) ---
     // Forward-declare pipeline register signals so the mux below can reference them
     // before their full declaration in the EX/MEM and MEM/WB register sections.
-    logic [31:0] ex_mem_fpu_result_f;
-    logic [31:0] mem_wb_fpu_result_f;
-    logic [31:0] fwd_frs1_data, fwd_frs2_data, fwd_frs3_data;
+    logic [63:0] ex_mem_fpu_result_f;
+    logic [63:0] mem_wb_fpu_result_f;
+    logic [63:0] fwd_frs1_data, fwd_frs2_data, fwd_frs3_data;
 
     always_comb begin
         unique case (fwd_frs1_sel)
-            2'b01:   fwd_frs1_data = ex_mem_fpu_result_f;   // EX/MEM forward
-            2'b10:   fwd_frs1_data = wb_freg_data;          // MEM/WB: uses dmem_rdata for FLW, fpu_result for FPU ops
-            default: fwd_frs1_data = id_ex_frs1_data;       // FP register file
+            2'b01:   fwd_frs1_data = ex_mem_fpu_result_f;
+            2'b10:   fwd_frs1_data = wb_freg_data;
+            default: fwd_frs1_data = id_ex_frs1_data;
         endcase
     end
 
@@ -506,16 +507,12 @@ module rv_core
     // F-Extension: FPU instantiation (EX stage)
     // =========================================================================
     // fpu_busy_int declared earlier (before stall assigns)
-    logic        fpu_result_valid;   // 1-cycle pulse when FPU result is ready
-    logic [31:0] fpu_result_f;       // FP result (to freg)
-    logic [XLEN-1:0] fpu_result_i;  // int result (FMV.X.W, FCVT.W.S, CMP, FCLASS)
-    logic [4:0]  fpu_fflags_ex;     // FPU exception flags
-    logic [2:0]  frm_csr;           // fcsr.frm from CSR (for DYN rounding mode)
+    logic        fpu_result_valid;
+    logic [63:0] fpu_result_f;       // FP result (64-bit: NaN-boxed SP or DP)
+    logic [XLEN-1:0] fpu_result_i;
+    logic [4:0]  fpu_fflags_ex;
+    logic [2:0]  frm_csr;
 
-    // valid_in: pulse once on the first cycle a FP op enters EX.
-    // Guard with !fpu_was_busy to prevent re-triggering FDIV/FSQRT on the cycle
-    // fpu_busy_int falls (result arrives), before ID/EX has advanced past the op.
-    // fpu_valid_in and fpu_start_stall are forward-declared near the stall signals.
     assign fpu_valid_in = id_ex_valid
                           && id_ex_ctrl.is_fp
                           && !id_ex_ctrl.fp_load
@@ -530,11 +527,12 @@ module rv_core
     rv_fpu #(.XLEN(XLEN)) u_fpu (
         .clk         (clk),
         .rst_n       (rst_n),
-        .fa          (fwd_frs1_data),      // FP rs1 (with forwarding)
-        .fb          (fwd_frs2_data),      // FP rs2 (with forwarding)
-        .fc          (fwd_frs3_data),      // FP rs3 for FMADD family (with forwarding)
-        .int_a       (fwd_rs1_data),       // integer rs1 for FCVT.S.W, FMV.W.X
+        .fa          (fwd_frs1_data),
+        .fb          (fwd_frs2_data),
+        .fc          (fwd_frs3_data),
+        .int_a       (fwd_rs1_data),
         .fpu_op      (id_ex_ctrl.fpu_op),
+        .fp_double   (id_ex_ctrl.fp_double),
         .fp_rm       (id_ex_ctrl.fp_rm),
         .frm_in      (frm_csr),
         .rs2_sel     (id_ex_ctrl.fp_rs2_sel),
@@ -806,7 +804,7 @@ module rv_core
     // EX/MEM Pipeline Register  (between EX and MEM)
     // =========================================================================
     // ex_mem_csr_fwd declared earlier (forward-decl for ex_mem_fwd_data mux)
-    // ex_mem_fpu_result_f declared earlier (forward-decl for FP forwarding mux)
+    // ex_mem_fpu_result_f declared earlier (forward-decl for FP forwarding mux, 64-bit)
     // ex_mem_fpu_result_i_fwd declared earlier (forward-decl for ex_mem_fwd_data mux)
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -825,9 +823,12 @@ module rv_core
             ex_mem_ctrl       <= id_ex_ctrl;
             ex_mem_alu_result <= ex_result;
             // FSW: store data comes from FP regfile (frs2), replicate to fill data bus
-            ex_mem_rs2_data   <= id_ex_ctrl.fp_store
-                                 ? {(XLEN/32){fwd_frs2_data}}
-                                 : fwd_rs2_data;
+            // FSD: full 64-bit value; FSW: replicate lower 32-bit to fill bus
+            ex_mem_rs2_data   <= (id_ex_ctrl.fp_store && id_ex_ctrl.fp_double)
+                                 ? fwd_frs2_data[XLEN-1:0]
+                                 : id_ex_ctrl.fp_store
+                                   ? {(XLEN/32){fwd_frs2_data[31:0]}}
+                                   : fwd_rs2_data;
             ex_mem_rd_addr    <= id_ex_rd_addr;
             ex_mem_pc4        <= id_ex_pc + XLEN'(4);
             ex_mem_funct3     <= id_ex_funct3;
@@ -835,9 +836,7 @@ module rv_core
             ex_mem_valid      <= id_ex_valid && !(fpu_valid_in &&
                                      (id_ex_ctrl.fpu_op == FPU_DIV ||
                                       id_ex_ctrl.fpu_op == FPU_SQRT));
-            // Only capture FPU result for actual FP compute ops; FLW/FSW don't
-            // produce a meaningful fpu_result_f and may have X-bit operands from
-            // uninitialized FP registers (e.g. the rs2 imm field decoded as f0).
+            // Only capture FPU result for actual compute ops (not FLW/FLD/FSW/FSD).
             ex_mem_fpu_result_f     <= (id_ex_ctrl.is_fp && !id_ex_ctrl.fp_load
                                         && !id_ex_ctrl.fp_store)
                                        ? fpu_result_f : '0;
@@ -938,8 +937,8 @@ module rv_core
     logic [XLEN-1:0] mem_wb_csr_rdata;
     logic [2:0]      mem_wb_funct3;
     logic [BYTE_LANE_W-1:0] mem_wb_byte_offset;  // addr[BYTE_LANE_W-1:0] — byte lane selector for sub-word loads
-    // mem_wb_fpu_result_f declared earlier (forward-decl for FP forwarding mux)
-    logic [XLEN-1:0] mem_wb_fpu_result_i;  // FPU int result -> int reg
+    // mem_wb_fpu_result_f declared earlier (forward-decl for FP forwarding mux, 64-bit)
+    logic [XLEN-1:0] mem_wb_fpu_result_i;
 
     // SC result: 0 = success, 1 = failure (rd receives this value via WB_SRC_ALU)
     wire [XLEN-1:0] sc_result = {{(XLEN-1){1'b0}}, ~sc_success};
@@ -1043,16 +1042,20 @@ module rv_core
     assign wb_reg_write = mem_wb_ctrl.reg_write & mem_wb_valid;
 
     // ---- FP register writeback ----
-    // freg_write: FLW (fp_load) or any FPU op writing a float result (freg_write)
-    // For FLW: write dmem_rdata[31:0] to freg
-    // For FPU: write mem_wb_fpu_result_f to freg
+    // FLW: NaN-box the 32-bit loaded value (upper 32 bits = 0xFFFFFFFF)
+    // FLD: write full 64-bit loaded value
+    // FPU: write fpu_result_f (64-bit; already NaN-boxed for SP by rv_fpu.sv)
     always_comb begin
         wb_freg_write = mem_wb_valid && mem_wb_ctrl.freg_write;
         wb_frd_addr   = mem_wb_rd_addr;
-        if (mem_wb_ctrl.fp_load)
-            wb_freg_data = dmem_shifted[31:0];   // FLW data from DMEM
-        else
-            wb_freg_data = mem_wb_fpu_result_f;  // FPU float result
+        if (mem_wb_ctrl.fp_load) begin
+            if (mem_wb_ctrl.fp_double)
+                wb_freg_data = dmem_shifted[63:0];              // FLD: 64-bit
+            else
+                wb_freg_data = {32'hFFFFFFFF, dmem_shifted[31:0]};  // FLW: NaN-boxed
+        end else begin
+            wb_freg_data = mem_wb_fpu_result_f;
+        end
     end
 
     // =========================================================================

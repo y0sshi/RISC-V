@@ -100,6 +100,11 @@ FPU_SRC   = $(FPU_DIR)/rv_fpu_add.sv \
             $(FPU_DIR)/rv_fpu_div.sv \
             $(FPU_DIR)/rv_fpu_sqrt.sv \
             $(FPU_DIR)/rv_fpu_misc.sv \
+            $(FPU_DIR)/rv_fpu_add_d.sv \
+            $(FPU_DIR)/rv_fpu_mul_d.sv \
+            $(FPU_DIR)/rv_fpu_div_d.sv \
+            $(FPU_DIR)/rv_fpu_sqrt_d.sv \
+            $(FPU_DIR)/rv_fpu_misc_d.sv \
             $(FPU_DIR)/rv_fpu.sv
 
 CORE_SRC  = $(PKG_SRC) \
@@ -141,7 +146,7 @@ TIMER_SRC = $(CSR_SRC)
             sim_alu sim_csr sim_rv64i sim_mext sim_mext64 sim_amo sim_amo64 \
             sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
             sim_uart sim_gpio sim_plic sim_core sim_soc sim_bm \
-            sim_pipeline sim_intr sim_fpu sim_fpu_pipe sim_mal \
+            sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal \
             wave_alu wave_csr wave_rv64i wave_mext wave_mext64 wave_amo wave_amo64 \
             wave_mmu wave_mmu64 wave_sv wave_sv64 wave_timer wave_timer64 \
             wave_uart wave_gpio wave_plic wave_core wave_soc wave_bm \
@@ -153,7 +158,7 @@ all: image \
      sim_alu sim_csr sim_rv64i sim_mext sim_mext64 sim_amo sim_amo64 \
      sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
      sim_uart sim_gpio sim_plic sim_core sim_soc \
-     sim_pipeline sim_intr sim_fpu_pipe sim_mal
+     sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal
 
 dirs:
 	mkdir -p $(OUT_DIR) $(WAVE_DIR)
@@ -369,6 +374,15 @@ sim_fpu: dirs
 
 wave_fpu: sim_fpu
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_fpu.vcd &
+
+# --- D-extension FPU standalone testbench ---
+sim_fpu_d: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_fpu_d.vvp \
+		$(PKG_SRC) $(FPU_SRC) $(TB_DIR)/tb_rv_fpu_d.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_fpu_d.vvp
+
+wave_fpu_d: sim_fpu_d
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_fpu_d.vcd &
 
 # --- FP pipeline integration testbench ---
 # Validates FP forwarding (EX/MEM, MEM/WB), FSW forwarding, FLW load-use stall,
