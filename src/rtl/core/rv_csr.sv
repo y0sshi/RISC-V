@@ -201,6 +201,7 @@ module rv_csr
         misa_val = '0;
         if (XLEN == 64) misa_val[XLEN-1:XLEN-2] = 2'd2;
         else            misa_val[XLEN-1:XLEN-2] = 2'd1;
+        misa_val[2]  = 1'b1;   // 'C' compressed
         misa_val[8]  = 1'b1;   // 'I'
         misa_val[18] = 1'b1;   // 'S' supervisor mode
         misa_val[20] = 1'b1;   // 'U' user mode

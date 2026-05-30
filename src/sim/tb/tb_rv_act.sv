@@ -30,8 +30,10 @@ module tb_rv_act;
     // DUT: rv_soc in ACT_MODE (includes rv_core + rv_mmu + rv_unified_mem).
     // INIT_FILE propagates to rv_unified_mem's INIT_FILE, which calls $readmemh
     // internally -- no explicit $readmemh needed in this testbench.
+    // XLEN follows rv_pkg::XLEN (32 by default, 64 with -DRV_XLEN_64) so the same
+    // testbench drives both RV64 and RV32 compliance runs.
     rv_soc #(
-        .XLEN      (64),
+        .XLEN      (XLEN),
         .RST_ADDR  (MEM_BASE),
         .INIT_FILE (`HEX_FILE)
     ) u_soc (
@@ -47,7 +49,7 @@ module tb_rv_act;
     logic [63:0] eff_wdata;
     always_comb begin
         eff_wdata = '0;
-        for (int i = 0; i < 8; i++) begin
+        for (int i = 0; i < XLEN/8; i++) begin
             if (u_soc.core_dmem_wstrb[i])
                 eff_wdata[i*8 +: 8] = u_soc.core_dmem_wdata[i*8 +: 8];
         end

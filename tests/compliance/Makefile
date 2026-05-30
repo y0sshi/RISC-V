@@ -160,12 +160,16 @@ riscv-tests-build:
 	'
 
 # Run simulation using pre-built ELFs
-# Groups: rv64ui (I), rv64um (M), rv64ua (A), rv64uf (F), rv64ud (D), rv64si (S-mode)
+# Groups: rv64ui (I), rv64um (M), rv64ua (A), rv64uf (F), rv64ud (D),
+#         rv64uc (C), rv64si (S-mode)
+# Override GROUPS / XLEN_DEF to run other ISA widths (see riscv-tests-run32).
+GROUPS   ?= rv64ui-p rv64um-p rv64ua-p rv64uf-p rv64ud-p rv64uc-p rv64si-p
+XLEN_DEF ?= -DRV_XLEN_64
 riscv-tests-run:
 	@mkdir -p $(PROJECT_ROOT)/tests/results
 	$(DOCKER_RUN) bash -c '\
 		total=0; pass=0; fail=0; \
-		for group in rv64ui-p rv64um-p rv64ua-p rv64uf-p rv64ud-p rv64si-p; do \
+		for group in $(GROUPS); do \
 			grp_total=0; grp_pass=0; grp_fail=0; \
 			echo "--- $$group ---"; \
 			for elf in $(RISCV_TESTS)/isa/$$group-*; do \
@@ -186,6 +190,7 @@ riscv-tests-run:
 						BEGIN_SIG=$$BEGIN_SIG \
 						END_SIG=$$END_SIG \
 						TOHOST_ADDR=$$TOHOST \
+						XLEN_DEF="$(XLEN_DEF)" \
 						> $(RESULTS_DIR)/$$name.log 2>&1; \
 				if grep -q "TEST PASSED" $(RESULTS_DIR)/$$name.log; then \
 					pass=$$(($$pass+1)); grp_pass=$$(($$grp_pass+1)); \
@@ -215,11 +220,39 @@ riscv-tests-debug:
 		cd $(SIM_DIR) && \
 			make sim_act_debug_internal \
 				HEX_FILE=$(RESULTS_DIR)/$(TEST).hex \
-				TOHOST_ADDR=$$TOHOST; \
+				TOHOST_ADDR=$$TOHOST \
+				XLEN_DEF="$(XLEN_DEF)"; \
 	'
 
 # Convenience: build then run
 riscv-tests: riscv-tests-build riscv-tests-run
+
+# =============================================================================
+# RV32 (XLEN=32) variants — build and run rv32* ELFs (e.g. rv32uc-p-rvc).
+#   make riscv-tests-build32          # build rv32 ELFs in isa/
+#   make riscv-tests-run32            # run default RV32 user groups
+#   make riscv-tests-run32 GROUPS32="rv32uc-p"   # run a single group
+# =============================================================================
+GROUPS32 ?= rv32ui-p rv32um-p rv32ua-p rv32uc-p
+
+riscv-tests-build32:
+	$(DOCKER_RUN) bash -c '\
+		find $(RISCV_TESTS) -type f \( -name "*.S" -o -name "*.c" -o -name "*.h" \
+			-o -name "*.ld" -o -name "Makefile*" \) \
+			-exec sed -i "s/\r//" {} +; \
+		cd $(RISCV_TESTS)/isa && \
+		make -k XLEN=32 || true; \
+	'
+
+# Run RV32 groups by reusing riscv-tests-run with XLEN_DEF empty (XLEN=32 RTL).
+# Use target-specific variables (not recursive make) so PROJECT_ROOT etc. stay
+# correct and to avoid Windows path/space issues with $(MAKE).
+riscv-tests-run32: GROUPS   := $(GROUPS32)
+riscv-tests-run32: XLEN_DEF :=
+riscv-tests-run32: riscv-tests-run
+	@true
+
+riscv-tests32: riscv-tests-build32 riscv-tests-run32
 
 # =============================================================================
 # Utility

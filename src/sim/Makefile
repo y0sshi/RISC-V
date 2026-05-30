@@ -110,6 +110,7 @@ FPU_SRC   = $(FPU_DIR)/rv_fpu_add.sv \
 CORE_SRC  = $(PKG_SRC) \
             $(CORE_DIR)/rv_regfile.sv \
             $(CORE_DIR)/rv_fregfile.sv \
+            $(CORE_DIR)/rv_cdecode.sv \
             $(CORE_DIR)/rv_decode.sv \
             $(CORE_DIR)/rv_branch.sv \
             $(ALU_DIR)/rv_alu.sv \
@@ -152,7 +153,9 @@ TIMER_SRC = $(CSR_SRC)
             sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
             sim_uart sim_gpio sim_plic sim_core sim_soc sim_bm \
             sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal \
+            sim_cdecode sim_cdecode64 \
             wave_alu wave_csr wave_rv64i wave_mext wave_mext64 wave_amo wave_amo64 \
+            wave_cdecode \
             wave_mmu wave_mmu64 wave_sv wave_sv64 wave_timer wave_timer64 \
             wave_uart wave_gpio wave_plic wave_core wave_soc wave_bm \
             wave_pipeline wave_intr wave_fpu wave_fpu_pipe wave_mal \
@@ -163,7 +166,8 @@ all: image \
      sim_alu sim_csr sim_rv64i sim_mext sim_mext64 sim_amo sim_amo64 \
      sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
      sim_uart sim_gpio sim_plic sim_core sim_soc \
-     sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal
+     sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal \
+     sim_cdecode sim_cdecode64
 
 dirs:
 	mkdir -p $(OUT_DIR) $(WAVE_DIR)
@@ -179,6 +183,24 @@ sim_alu: dirs
 
 wave_alu: sim_alu
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_alu.vcd &
+
+# --- C-extension compressed decoder (rv_cdecode) unit testbench ---
+CDEC_SRC = $(PKG_SRC) $(CORE_DIR)/rv_cdecode.sv
+
+# RV32C expansion
+sim_cdecode: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_cdecode.vvp \
+		$(CDEC_SRC) $(TB_DIR)/tb_rv_cdecode.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_cdecode.vvp
+
+# RV64C expansion
+sim_cdecode64: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_cdecode64.vvp \
+		$(CDEC_SRC) $(TB_DIR)/tb_rv_cdecode.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_cdecode64.vvp
+
+wave_cdecode: sim_cdecode
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_cdecode.vcd &
 
 # --- CSR testbench ---
 sim_csr: dirs
@@ -456,6 +478,11 @@ TOHOST_ADDR ?= 80001000
 
 ACT_TB_SRC = $(TB_DIR)/tb_rv_act.sv
 
+# XLEN selection for ACT runs.  Default RV64 (-DRV_XLEN_64); the compliance
+# Makefile passes XLEN_DEF= (empty) to build the RV32 (XLEN=32) variant for
+# rv32uc-p etc.
+XLEN_DEF ?= -DRV_XLEN_64
+
 sim_act: dirs
 	@if [ -z "$(HEX_FILE)" ] || [ -z "$(SIG_FILE)" ]; then \
 		echo "ERROR: HEX and SIG must be specified"; exit 1; \
@@ -468,7 +495,7 @@ sim_act_internal:
 	@if [ -z "$(HEX_FILE)" ] || [ -z "$(SIG_FILE)" ]; then \
 		echo "ERROR: HEX and SIG must be specified"; exit 1; \
 	fi
-	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -DACT_MODE \
+	$(IVERILOG) $(IVFLAGS) $(XLEN_DEF) -DACT_MODE \
 		-DHEX_FILE=\"$(HEX_FILE)\"       \
 		-DSIG_FILE=\"$(SIG_FILE)\"       \
 		-DBEGIN_SIG=\"$(BEGIN_SIG)\"     \
@@ -479,7 +506,7 @@ sim_act_internal:
 	$(VVP) $(OUT_DIR)/tb_rv_act.vvp
 
 sim_act_debug_internal:
-	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -DACT_MODE \
+	$(IVERILOG) $(IVFLAGS) $(XLEN_DEF) -DACT_MODE \
 		-DHEX_FILE=\"$(HEX_FILE)\"       \
 		-DTOHOST_ADDR=\"$(TOHOST_ADDR)\" \
 		-o $(OUT_DIR)/tb_rv_act_debug.vvp \

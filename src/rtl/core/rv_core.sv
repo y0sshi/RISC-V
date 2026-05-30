@@ -98,6 +98,29 @@ module rv_core
     logic        trap_or_mret;    // Combined: causes PC redirect + pipeline flush
     assign trap_or_mret = ex_trap_enter | ex_mret_en | ex_sret_en | mem_trap_enter;
 
+    // redirect_settle: hold IF/ID for 2 cycles after ANY PC redirect.
+    //
+    // With the variable-length fetch, the next sequential PC is derived from
+    // imem_rdata (the instruction currently being fetched).  Immediately after a
+    // redirect the in-flight imem_rdata is wrong-path data and, worse, may have
+    // been fetched under a stale translation regime (e.g. an SRET/MRET that
+    // changes privilege one cycle later, so the target virtual address was briefly
+    // fetched as a physical address and returned X from an unmapped region).
+    // Feeding that into seq_pc would corrupt fetch_pc.
+    //
+    // Holding the fetch (re-presenting fetch_pc) for two cycles after a redirect
+    // lets the privilege/SATP change settle and gives the MMU a cycle to evaluate
+    // the target address and assert mmu_stall on a TLB miss before we ever advance
+    // the PC from the (possibly invalid) fetched instruction.  In bare mode this
+    // simply adds a couple of fetch bubbles after a branch/jump/trap.
+    logic [1:0]  redirect_settle;
+    wire         any_redirect = branch_taken_ex | trap_or_mret;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) redirect_settle <= 2'b00;
+        else        redirect_settle <= {redirect_settle[0], any_redirect};
+    end
+    wire redirect_stall = |redirect_settle;
+
     // Trap destinations from rv_csr
     logic [XLEN-1:0] trap_vector; // mtvec — used on trap_enter
     logic [XLEN-1:0] mepc_out;    // mepc  — used on mret_en
@@ -145,20 +168,10 @@ module rv_core
     // Using [2:0] for RV32 causes overflow: SW to addr[2]=1 gives wstrb=0 (no write).
     localparam int BYTE_LANE_W = $clog2(XLEN/8);
 
-    // redirect_q: 1-cycle delayed version of any PC redirect (branch/trap/MRET).
-    // Because IMEM is a synchronous BRAM (1-cycle read latency), the cycle after a
-    // redirect the BRAM still outputs data fetched from the OLD PC.  We must flush
-    // the IF/ID register for two consecutive cycles to discard both the in-flight
-    // fetch that was already issued (flushed by flush_id cycle 0) and the stale
-    // BRAM result that arrives one cycle later (flushed by redirect_q cycle 1).
-    logic redirect_q;
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) redirect_q <= 1'b0;
-        else        redirect_q <= branch_taken_ex | trap_or_mret;
-    end
-
-    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall;
-    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall;
+    // redirect_stall holds IF/ID only (not EX) so the redirecting branch/trap can
+    // still complete; it must NOT be added to stall_ex.
+    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall | redirect_stall;
+    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall | redirect_stall;
     // mem_stall freezes EX/MEM: a load/store in MEM whose data translation is
     // still pending must remain in MEM (re-issuing its access) until the TLB is
     // filled.  Without this the access leaves MEM unwritten.  Note: IF-port PTW
@@ -166,11 +179,12 @@ module rv_core
     // resolving in EX and corrupt control flow.
     assign stall_ex = amo_stall | fpu_busy_int | mal_stall | mem_stall;
     // Traps/MRET flush the same stages as branch (instructions after the trap insn).
-    // flush_id is asserted for 2 cycles: cycle 0 (branch_taken_ex | trap_or_mret)
-    // discards the instruction that was fetched alongside the branch; cycle 1
-    // (redirect_q) discards the stale BRAM result from the OLD pc_reg that arrives
-    // one cycle after the redirect due to synchronous-BRAM read latency.
-    assign flush_id    = branch_taken_ex | redirect_q | trap_or_mret;
+    // With the variable-length fetch (see IF stage), the redirect target address is
+    // presented to IMEM combinationally on the cycle the redirect resolves, so the
+    // very next cycle already delivers the correct target instruction.  Only the
+    // single in-flight (wrong-path) fetch needs to be discarded, hence a 1-cycle
+    // flush_id (no redirect_q needed as in the old fixed-+4 / late-PC design).
+    assign flush_id    = branch_taken_ex | trap_or_mret;
     // Suppress load-use bubble injection when stall_ex=1: the load can't
     // advance to EX/MEM while the pipeline is frozen, so keep it in ID/EX
     // (stall_id holds it there) rather than flushing it.  The bubble will be
@@ -186,52 +200,59 @@ module rv_core
     assign flush_ex_mem = trap_or_mret;
 
     // =========================================================================
-    // Stage 1: Instruction Fetch (IF)
+    // Stage 1: Instruction Fetch (IF) — variable-length (C-extension capable)
     // =========================================================================
-    // pc_reg    : address sent to BRAM this cycle (BRAM latches it on posedge)
-    // fetch_pc  : address that was sent last cycle = PC of the instruction
-    //             that will appear on imem_rdata this cycle.
+    // fetch_pc : the address presented to IMEM in the PREVIOUS cycle = PC of the
+    //            instruction now appearing on imem_rdata (invariant: fetch_pc is
+    //            the byte address whose 32-bit window is in imem_rdata this cycle).
     //
-    // Timeline with 1-cycle BRAM:
-    //   cycle N  : pc_reg = X  → BRAM address registered
-    //   cycle N+1: imem_rdata = mem[X], imem_ready = 1
-    //              fetch_pc = X  ← captured from pc_reg of cycle N
+    // C-extension makes instructions 2 or 4 bytes long.  The length of the
+    // instruction currently on imem_rdata is known from imem_rdata[1:0]:
+    //   imem_rdata[1:0] == 2'b11  -> 4-byte (uncompressed)
+    //   otherwise                 -> 2-byte (compressed)
+    // The next sequential fetch address is therefore fetch_pc + (2 or 4).
     //
-    // IF/ID captures (imem_rdata, fetch_pc) so the correct PC is associated
-    // with each instruction.
+    // Unlike the old fixed-+4 design (where a separate leading pc_reg held the
+    // already-advanced address), the next address is derived combinationally from
+    // the arriving instruction, so a single register (fetch_pc) suffices.  The
+    // redirect target is driven onto imem_addr combinationally the same cycle the
+    // redirect resolves; thus the target instruction arrives on the next cycle and
+    // only a 1-cycle IF/ID flush is required (see flush_id).
+    //
+    // NOTE: This assumes the instruction memory returns the 32-bit window starting
+    // at any 2-byte-aligned byte address (true for rv_unified_mem in ACT mode and
+    // for the behavioral IMEMs in the unit testbenches).  A strictly word-addressed
+    // BRAM (rv_imem) would additionally need a half-word realignment buffer to fetch
+    // a 4-byte instruction that straddles a 4-byte boundary; that is out of scope
+    // here since RVC compliance runs in ACT mode.
 
-    logic [XLEN-1:0] pc_reg;
-    logic [XLEN-1:0] fetch_pc;  // delayed PC matching current imem_rdata
+    logic [XLEN-1:0] fetch_pc;  // PC of the instruction currently on imem_rdata
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            pc_reg <= RST_ADDR[XLEN-1:0];
-        // Traps always redirect even during stall_if (page fault must be taken immediately)
-        else if (ex_trap_enter || mem_trap_enter)
-            pc_reg <= trap_vector;
-        else if (ex_mret_en)
-            pc_reg <= mepc_out;
-        else if (ex_sret_en)
-            pc_reg <= sepc_out;
-        else if (!stall_if)
-            pc_reg <= branch_taken_ex ? branch_target_ex : (pc_reg + XLEN'(4));
+    // Length of the instruction currently on imem_rdata (2 or 4 bytes)
+    wire             if_is_compressed = (imem_rdata[1:0] != 2'b11);
+    wire [XLEN-1:0]  seq_pc           = fetch_pc + (if_is_compressed ? XLEN'(2) : XLEN'(4));
+
+    // Next IMEM address (combinational).  Priority:
+    //   trap / page-fault > MRET > SRET > taken branch (only when not stalled)
+    //   > stall hold (re-present current PC) > sequential next PC.
+    always_comb begin
+        if (ex_trap_enter || mem_trap_enter)      imem_addr = trap_vector;   // taken even during stall_if
+        else if (ex_mret_en)                      imem_addr = mepc_out;
+        else if (ex_sret_en)                      imem_addr = sepc_out;
+        else if (branch_taken_ex && !stall_if)    imem_addr = branch_target_ex;
+        else if (stall_if)                        imem_addr = fetch_pc;      // hold / re-fetch
+        else                                      imem_addr = seq_pc;
     end
 
-    // fetch_pc follows pc_reg with 1-cycle delay (tracks BRAM input address)
+    // fetch_pc tracks whatever address we present to IMEM (1-cycle read latency).
+    // Stall holding is already encoded in imem_addr (= fetch_pc), so this is an
+    // unconditional capture.
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)         fetch_pc <= RST_ADDR[XLEN-1:0];
-        else if (!stall_if) fetch_pc <= pc_reg;
+        if (!rst_n) fetch_pc <= RST_ADDR[XLEN-1:0];
+        else        fetch_pc <= imem_addr;
     end
 
-    // During a stall (stall_if=1), re-issue the fetch for fetch_pc rather than
-    // advancing to the stalled pc_reg.  Without this, the BRAM latches pc_reg
-    // (already advanced past the pending instruction) during the stall cycle, so
-    // the instruction arriving in imem_rdata this cycle is lost and the BRAM
-    // skips ahead by one instruction when the stall resolves.
-    // By re-feeding fetch_pc to the BRAM, it re-delivers mem[fetch_pc] in the
-    // first cycle after the stall, which if_id then correctly captures.
-    assign imem_addr = stall_if ? fetch_pc : pc_reg;
-    assign imem_req  = 1'b1;
+    assign imem_req = 1'b1;
 
     // =========================================================================
     // IF/ID Pipeline Register  (between IF and ID)
@@ -256,15 +277,35 @@ module rv_core
     // =========================================================================
     // Stage 2: Instruction Decode (ID)
     // =========================================================================
+    // C-extension: expand a 16-bit compressed instruction into its 32-bit base
+    // equivalent, then feed the expanded word to rv_decode so the rest of the
+    // pipeline (decode/execute/forwarding) is reused unchanged.  An instruction is
+    // compressed when if_id_inst[1:0] != 2'b11 (only the lower 16 bits are valid;
+    // the upper 16 belong to the next instruction).
     ctrl_signals_t   id_ctrl;
+    ctrl_signals_t   id_ctrl_raw;     // rv_decode output before is_compressed tag
     logic [XLEN-1:0] id_imm;
     reg_addr_t       id_rs1_addr, id_rs2_addr, id_rs3_addr, id_rd_addr;
     logic            id_rs1_used, id_rs2_used;
     logic [XLEN-1:0] id_rs1_data, id_rs2_data;
 
+    wire             id_is_compressed = (if_id_inst[1:0] != 2'b11);
+    logic [31:0]     id_cexpanded;     // 32-bit expansion of a compressed insn
+    logic            id_cillegal;      // reserved compressed encoding (unused for now)
+    logic [31:0]     decode_inst;      // instruction actually fed to rv_decode
+
+    rv_cdecode #(.XLEN(XLEN)) u_cdecode (
+        .cinst         (if_id_inst[15:0]),
+        .inst_out      (id_cexpanded),
+        .is_compressed (/* unused: derived from if_id_inst[1:0] above */),
+        .illegal       (id_cillegal)
+    );
+
+    assign decode_inst = id_is_compressed ? id_cexpanded : if_id_inst;
+
     rv_decode #(.XLEN(XLEN)) u_decode (
-        .inst       (if_id_inst),
-        .ctrl       (id_ctrl),
+        .inst       (decode_inst),
+        .ctrl       (id_ctrl_raw),
         .imm        (id_imm),
         .rs1_addr   (id_rs1_addr),
         .rs2_addr   (id_rs2_addr),
@@ -273,6 +314,12 @@ module rv_core
         .rs1_used   (id_rs1_used),
         .rs2_used   (id_rs2_used)
     );
+
+    // Tag the control bundle with the compressed flag (used for PC+2 link / mepc).
+    always_comb begin
+        id_ctrl               = id_ctrl_raw;
+        id_ctrl.is_compressed = id_is_compressed;
+    end
 
     // WB-stage signals (declared here; driven by always_comb after MEM/WB register).
     // Forward-referenced here because the register file and forwarding unit need them.
@@ -356,8 +403,10 @@ module rv_core
             id_ex_rs3_addr  <= id_rs3_addr;
             id_ex_rd_addr   <= id_rd_addr;
             id_ex_pc        <= if_id_pc;
-            id_ex_funct3    <= if_id_inst[14:12];
-            id_ex_csr_addr  <= if_id_inst[31:20];
+            // Use the expanded instruction so funct3 / CSR address are correct for
+            // compressed instructions too (decode_inst == if_id_inst when not RVC).
+            id_ex_funct3    <= decode_inst[14:12];
+            id_ex_csr_addr  <= decode_inst[31:20];
             id_ex_valid     <= if_id_valid;
             id_ex_frs1_data <= id_frs1_data;
             id_ex_frs2_data <= id_frs2_data;
@@ -678,13 +727,15 @@ module rv_core
     // --- AMO compute unit ---
     // For .W AMO on a 64-bit BRAM, the 32-bit word may be in the upper half of the
     // 8-byte word when addr[2]=1.  amo_shift selects which half to read/write.
-    logic [5:0]        amo_shift;   // bit shift: 32 when .W and addr[2]=1, else 0
+    // RV32 has a 4-byte data bus, so addr[2] never selects an upper half there and
+    // amo_shift must stay 0 (a 32-bit shift on a 32-bit value would zero the data).
+    logic [5:0]        amo_shift;   // bit shift: 32 when .W and addr[2]=1 (RV64), else 0
     logic [XLEN-1:0]   amo_old_data;
     logic [XLEN-1:0]   amo_new_data;
     logic [XLEN-1:0]   amo_wdata;
     logic [XLEN/8-1:0] amo_wstrb;
 
-    assign amo_shift    = (!ex_mem_funct3[0] && ex_mem_alu_result[2]) ? 6'd32 : 6'd0;
+    assign amo_shift    = ((XLEN == 64) && !ex_mem_funct3[0] && ex_mem_alu_result[2]) ? 6'd32 : 6'd0;
     assign amo_old_data = dmem_rdata >> amo_shift;   // extract correct 32-bit word
     assign amo_wdata    = amo_new_data << amo_shift;  // place result at correct position
     assign amo_wstrb    = ex_mem_funct3[0] ? {(XLEN/8){1'b1}}
@@ -896,7 +947,8 @@ module rv_core
                                    : fwd_rs2_data;
             ex_mem_rd_addr    <= id_ex_rd_addr;
             ex_mem_pc         <= id_ex_pc;
-            ex_mem_pc4        <= id_ex_pc + XLEN'(4);
+            // Link / return address: PC+2 for compressed (C.JAL/C.JALR), else PC+4.
+            ex_mem_pc4        <= id_ex_pc + (id_ex_ctrl.is_compressed ? XLEN'(2) : XLEN'(4));
             ex_mem_funct3     <= id_ex_funct3;
             ex_mem_csr_fwd    <= csr_rdata_ex;
             ex_mem_valid      <= id_ex_valid && !(fpu_valid_in &&

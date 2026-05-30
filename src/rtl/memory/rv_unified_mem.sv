@@ -59,7 +59,10 @@ module rv_unified_mem
     logic [63:0] i_boff;
     logic [63:0] d_boff;
     assign i_boff = i_addr - BASE_ADDR;
-    assign d_boff = (d_addr - BASE_ADDR) & ~64'h7;  // 8-byte aligned for XLEN=64
+    // Align the data byte offset to the XLEN-wide word: 8-byte for RV64, 4-byte
+    // for RV32.  Using a fixed ~7 mask would mis-address 4-byte RV32 accesses
+    // whose address has bit[2] set.
+    assign d_boff = (d_addr - BASE_ADDR) & ~64'(XLEN/8 - 1);
 
     // -------------------------------------------------------------------------
     // Port A: 1-cycle synchronous instruction read (BRAM model)
