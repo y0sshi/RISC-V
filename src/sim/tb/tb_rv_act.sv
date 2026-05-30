@@ -22,104 +22,44 @@ module tb_rv_act;
     import rv_pkg::*;
 
     localparam logic [63:0] MEM_BASE = 64'h8000_0000;
-    localparam int           MEM_SIZE = 256 * 1024;  // 256 KB
 
     logic clk   = 0;
     logic rst_n = 0;
     always #5 clk = ~clk;
 
-    // Byte-addressed memory (loaded via $readmemh with @addr byte format)
-    logic [7:0] mem_b [0 : MEM_SIZE-1];
+    // DUT: rv_soc in ACT_MODE (includes rv_core + rv_mmu + rv_unified_mem).
+    // INIT_FILE propagates to rv_unified_mem's INIT_FILE, which calls $readmemh
+    // internally -- no explicit $readmemh needed in this testbench.
+    rv_soc #(
+        .XLEN      (64),
+        .RST_ADDR  (MEM_BASE),
+        .INIT_FILE (`HEX_FILE)
+    ) u_soc (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .gpio_in  (4'b0),
+        .gpio_out (),
+        .uart_rx  (1'b1),
+        .uart_tx  ()
+    );
 
-    // rv_core memory interface
-    logic [63:0] imem_addr;
-    logic        imem_req;
-    logic [31:0] imem_rdata;
-    logic        imem_ready;
-
-    logic [63:0] dmem_addr;
-    logic [63:0] dmem_wdata;
-    logic [7:0]  dmem_wstrb;
-    logic        dmem_req;
-    logic        dmem_we;
-    logic [63:0] dmem_rdata;
-    logic        dmem_ready;
-
-    // MMU passthrough outputs (tie off in testbench)
-    logic [63:0] satp_out;
-    logic [1:0]  priv_out;
-    logic        mstatus_sum_out, mstatus_mxr_out, tlb_flush_out;
-
-    // Registered BRAM outputs (1-cycle latency)
-    logic [31:0] imem_rdata_r = '0;
-    logic        imem_ready_r = 0;
-    logic [63:0] dmem_rdata_r = '0;
-    logic        dmem_ready_r = 0;
-
-    assign imem_rdata = imem_rdata_r;
-    assign imem_ready = imem_ready_r;
-    assign dmem_rdata = dmem_rdata_r;
-    assign dmem_ready = dmem_ready_r;
-
-    // Byte offsets into mem_b (combinational).
-    // dmem_base_boff is 8-byte aligned: wstrb[i] selects byte (base+i) within
-    // the 8-byte word.  imem uses the exact address since instructions are read
-    // as 4 consecutive bytes from the aligned instruction address.
-    logic [63:0] imem_boff;
-    logic [63:0] dmem_boff;
-    logic [63:0] dmem_base_boff;
-    assign imem_boff      = imem_addr - MEM_BASE;
-    assign dmem_boff      = dmem_addr - MEM_BASE;
-    assign dmem_base_boff = dmem_boff & ~64'h7;  // 8-byte align
-
-    // BRAM-style memory model: 1-cycle read/write latency
-    always @(posedge clk) begin
-        // Instruction fetch (32-bit, little-endian from byte address)
-        imem_ready_r <= imem_req;
-        if (imem_req)
-            imem_rdata_r <= {mem_b[imem_boff+3], mem_b[imem_boff+2],
-                             mem_b[imem_boff+1], mem_b[imem_boff]};
-
-        // Data access: wstrb[i] selects byte i within the 8-byte-aligned word
-        dmem_ready_r <= dmem_req;
-        if (dmem_req && dmem_we) begin
-            if (dmem_wstrb[0]) mem_b[dmem_base_boff]   <= dmem_wdata[7:0];
-            if (dmem_wstrb[1]) mem_b[dmem_base_boff+1] <= dmem_wdata[15:8];
-            if (dmem_wstrb[2]) mem_b[dmem_base_boff+2] <= dmem_wdata[23:16];
-            if (dmem_wstrb[3]) mem_b[dmem_base_boff+3] <= dmem_wdata[31:24];
-            if (dmem_wstrb[4]) mem_b[dmem_base_boff+4] <= dmem_wdata[39:32];
-            if (dmem_wstrb[5]) mem_b[dmem_base_boff+5] <= dmem_wdata[47:40];
-            if (dmem_wstrb[6]) mem_b[dmem_base_boff+6] <= dmem_wdata[55:48];
-            if (dmem_wstrb[7]) mem_b[dmem_base_boff+7] <= dmem_wdata[63:56];
-        end else if (dmem_req)
-            dmem_rdata_r <= {mem_b[dmem_base_boff+7], mem_b[dmem_base_boff+6],
-                             mem_b[dmem_base_boff+5], mem_b[dmem_base_boff+4],
-                             mem_b[dmem_base_boff+3], mem_b[dmem_base_boff+2],
-                             mem_b[dmem_base_boff+1], mem_b[dmem_base_boff]};
-    end
-
-    // tohost address (resolved once at init)
-    longint tohost_addr_val;
-
-    // Effective write value: mask dmem_wdata with dmem_wstrb.
-    // rv_core replicates sub-word stores (e.g. SW -> wdata={val,val}), so we
-    // must extract only the bytes actually written to determine the tohost value.
+    // Effective write data: mask with wstrb to extract actual bytes written
     logic [63:0] eff_wdata;
     always_comb begin
         eff_wdata = '0;
-        if (dmem_wstrb[0]) eff_wdata[7:0]   = dmem_wdata[7:0];
-        if (dmem_wstrb[1]) eff_wdata[15:8]  = dmem_wdata[15:8];
-        if (dmem_wstrb[2]) eff_wdata[23:16] = dmem_wdata[23:16];
-        if (dmem_wstrb[3]) eff_wdata[31:24] = dmem_wdata[31:24];
-        if (dmem_wstrb[4]) eff_wdata[39:32] = dmem_wdata[39:32];
-        if (dmem_wstrb[5]) eff_wdata[47:40] = dmem_wdata[47:40];
-        if (dmem_wstrb[6]) eff_wdata[55:48] = dmem_wdata[55:48];
-        if (dmem_wstrb[7]) eff_wdata[63:56] = dmem_wdata[63:56];
+        for (int i = 0; i < 8; i++) begin
+            if (u_soc.core_dmem_wstrb[i])
+                eff_wdata[i*8 +: 8] = u_soc.core_dmem_wdata[i*8 +: 8];
+        end
     end
 
-    // Monitor writes to tohost address to detect test completion
+    // Monitor writes to tohost address to detect test completion.
+    // The core drives core_dmem_va (virtual address). In M-mode (where tohost
+    // is always written) VA == PA, so this is equivalent to the physical address.
+    longint tohost_addr_val;
     always @(posedge clk) begin
-        if (dmem_req && dmem_we && dmem_addr == tohost_addr_val[63:0]) begin
+        if (u_soc.core_dmem_req && u_soc.core_dmem_we
+                && u_soc.core_dmem_va == tohost_addr_val[63:0]) begin
             if (eff_wdata == 64'd1)
                 $display("TEST PASSED");
             else
@@ -131,13 +71,11 @@ module tb_rv_act;
 
     // Dump begin_signature..end_signature region to SIG_FILE (32-bit words, little-endian)
     task dump_signature;
-        longint begin_addr, end_addr, i;
+        longint begin_addr, end_addr, base;
         integer fd, rc;
-        logic [63:0] boff;
-        logic [31:0] word;
+        logic [7:0] b0, b1, b2, b3;
         begin
-            begin_addr = 0;
-            end_addr   = 0;
+            begin_addr = 0; end_addr = 0;
             rc = $sscanf(`BEGIN_SIG, "%h", begin_addr);
             rc = $sscanf(`END_SIG,   "%h", end_addr);
             if (begin_addr == 0 || end_addr <= begin_addr)
@@ -147,49 +85,22 @@ module tb_rv_act;
                 $display("ERROR: cannot open %s", `SIG_FILE);
                 return;
             end
-            for (i = begin_addr; i < end_addr; i = i + 4) begin
-                boff = i - MEM_BASE;
-                word = {mem_b[boff+3], mem_b[boff+2], mem_b[boff+1], mem_b[boff]};
-                $fwrite(fd, "%08x\n", word);
+            for (longint i = begin_addr; i < end_addr; i = i + 4) begin
+                base = i - MEM_BASE;
+                b0 = u_soc.u_umem.mem_b[base+0];
+                b1 = u_soc.u_umem.mem_b[base+1];
+                b2 = u_soc.u_umem.mem_b[base+2];
+                b3 = u_soc.u_umem.mem_b[base+3];
+                $fwrite(fd, "%02x%02x%02x%02x\n", b3, b2, b1, b0);
             end
             $fclose(fd);
         end
     endtask
 
-    // DUT: rv_core with MMU bypassed (mmu_stall=0, M-mode satp=0 => VA==PA)
-    rv_core #(
-        .XLEN     (64),
-        .RST_ADDR (MEM_BASE)
-    ) u_core (
-        .clk             (clk),
-        .rst_n           (rst_n),
-        .imem_addr       (imem_addr),
-        .imem_req        (imem_req),
-        .imem_rdata      (imem_rdata),
-        .imem_ready      (imem_ready),
-        .dmem_addr       (dmem_addr),
-        .dmem_wdata      (dmem_wdata),
-        .dmem_wstrb      (dmem_wstrb),
-        .dmem_req        (dmem_req),
-        .dmem_we         (dmem_we),
-        .dmem_rdata      (dmem_rdata),
-        .dmem_ready      (dmem_ready),
-        .satp_out        (satp_out),
-        .priv_out        (priv_out),
-        .mstatus_sum_out (mstatus_sum_out),
-        .mstatus_mxr_out (mstatus_mxr_out),
-        .tlb_flush_out   (tlb_flush_out),
-        .mmu_stall       (1'b0),
-        .timer_irq       (1'b0),
-        .sw_irq          (1'b0),
-        .ext_irq         (1'b0)
-    );
-
-    // Load hex and release reset
+    // Release reset (hex already loaded via rv_unified_mem's INIT_FILE parameter)
     initial begin
         integer rc;
         rc = $sscanf(`TOHOST_ADDR, "%h", tohost_addr_val);
-        $readmemh(`HEX_FILE, mem_b);
         #100;
         rst_n = 1;
     end

@@ -103,6 +103,9 @@ module tb_rv_mal;
         .mstatus_mxr_out (mstatus_mxr_out),
         .tlb_flush_out   (tlb_flush_out),
         .mmu_stall       (1'b0),
+        .mem_stall       (1'b0),
+        .if_fault        (1'b0),
+        .mem_fault       (1'b0),
         .timer_irq       (1'b0),
         .sw_irq          (1'b0),
         .ext_irq         (1'b0)

@@ -131,6 +131,11 @@ SOC_SRC   = $(CORE_SRC) \
             $(PERI_DIR)/plic/rv_plic.sv \
             $(SOC_DIR)/rv_soc.sv
 
+# ACT compliance: rv_soc in ACT_MODE (rv_unified_mem + MMU, no peripherals)
+ACT_SRC   = $(CORE_SRC) \
+            $(MEM_DIR)/rv_unified_mem.sv \
+            $(SOC_DIR)/rv_soc.sv
+
 # Peripheral-only source lists (for individual testbenches)
 PLIC_SRC  = $(PKG_SRC) $(PERI_DIR)/plic/rv_plic.sv
 UART_SRC  = $(PERI_DIR)/uart/rv_uart.sv
@@ -463,22 +468,22 @@ sim_act_internal:
 	@if [ -z "$(HEX_FILE)" ] || [ -z "$(SIG_FILE)" ]; then \
 		echo "ERROR: HEX and SIG must be specified"; exit 1; \
 	fi
-	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 \
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -DACT_MODE \
 		-DHEX_FILE=\"$(HEX_FILE)\"       \
 		-DSIG_FILE=\"$(SIG_FILE)\"       \
 		-DBEGIN_SIG=\"$(BEGIN_SIG)\"     \
 		-DEND_SIG=\"$(END_SIG)\"         \
 		-DTOHOST_ADDR=\"$(TOHOST_ADDR)\" \
 		-o $(OUT_DIR)/tb_rv_act.vvp      \
-		$(CORE_SRC) $(TB_DIR)/tb_rv_act.sv
+		$(ACT_SRC) $(TB_DIR)/tb_rv_act.sv
 	$(VVP) $(OUT_DIR)/tb_rv_act.vvp
 
 sim_act_debug_internal:
-	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 \
+	$(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -DACT_MODE \
 		-DHEX_FILE=\"$(HEX_FILE)\"       \
 		-DTOHOST_ADDR=\"$(TOHOST_ADDR)\" \
 		-o $(OUT_DIR)/tb_rv_act_debug.vvp \
-		$(CORE_SRC) $(TB_DIR)/tb_rv_act_debug.sv
+		$(ACT_SRC) $(TB_DIR)/tb_rv_act_debug.sv
 	$(VVP) $(OUT_DIR)/tb_rv_act_debug.vvp
 
 wave_act:

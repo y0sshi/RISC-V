@@ -89,6 +89,8 @@ module rv_csr
     output logic [XLEN-1:0]  satp_val,
     output logic              mstatus_sum,
     output logic              mstatus_mxr,
+    output logic              mstatus_mprv,  // mstatus.MPRV (bit 17)
+    output logic [1:0]        mstatus_mpp_out, // mstatus.MPP (bits 12:11)
 
     // ---- F-extension fcsr ----------------------------------------------------
     input  wire  [4:0]       fpu_fflags,    // FPU exception flags to OR into fflags
@@ -104,6 +106,7 @@ module rv_csr
     logic           mstatus_mie;    // [3]  Machine Interrupt Enable
     logic           mstatus_mpie;   // [7]  Machine Previous IE
     logic [1:0]     mstatus_mpp;    // [12:11] Machine Previous Privilege
+    logic           mstatus_mprv_r; // [17] Modify PRiVilege (data accesses use MPP)
     logic           mstatus_sum_r;  // [18] Supervisor User Memory access
     logic           mstatus_mxr_r;  // [19] Make eXecutable Readable
 
@@ -206,9 +209,11 @@ module rv_csr
     // =========================================================================
     // MMU state outputs
     // =========================================================================
-    assign satp_val    = satp_reg;
-    assign mstatus_sum = mstatus_sum_r;
-    assign mstatus_mxr = mstatus_mxr_r;
+    assign satp_val      = satp_reg;
+    assign mstatus_sum   = mstatus_sum_r;
+    assign mstatus_mxr   = mstatus_mxr_r;
+    assign mstatus_mprv  = mstatus_mprv_r;
+    assign mstatus_mpp_out = mstatus_mpp;
 
     // =========================================================================
     // mstatus reconstruction (full M-mode view)
@@ -217,14 +222,15 @@ module rv_csr
     // =========================================================================
     localparam [63:0] MSTATUS_UXL = (XLEN == 64) ? 64'h0000_0002_0000_0000 : 64'h0;
     localparam [63:0] MSTATUS_SXL = (XLEN == 64) ? 64'h0000_0008_0000_0000 : 64'h0;
-    wire [63:0] mstatus64 = ({63'b0, mstatus_sie}   << 1)
-                          | ({63'b0, mstatus_mie}   << 3)
-                          | ({63'b0, mstatus_spie}  << 5)
-                          | ({63'b0, mstatus_mpie}  << 7)
-                          | ({63'b0, mstatus_spp}   << 8)
-                          | ({62'b0, mstatus_mpp}   << 11)
-                          | ({63'b0, mstatus_sum_r} << 18)
-                          | ({63'b0, mstatus_mxr_r} << 19)
+    wire [63:0] mstatus64 = ({63'b0, mstatus_sie}    << 1)
+                          | ({63'b0, mstatus_mie}    << 3)
+                          | ({63'b0, mstatus_spie}   << 5)
+                          | ({63'b0, mstatus_mpie}   << 7)
+                          | ({63'b0, mstatus_spp}    << 8)
+                          | ({62'b0, mstatus_mpp}    << 11)
+                          | ({63'b0, mstatus_mprv_r} << 17)
+                          | ({63'b0, mstatus_sum_r}  << 18)
+                          | ({63'b0, mstatus_mxr_r}  << 19)
                           | MSTATUS_UXL
                           | MSTATUS_SXL;
     wire [XLEN-1:0] mstatus_rval = mstatus64[XLEN-1:0];
@@ -375,9 +381,10 @@ module rv_csr
             // M-mode mstatus fields
             mstatus_mie   <= 1'b0;
             mstatus_mpie  <= 1'b1;
-            mstatus_mpp   <= 2'b11;  // MPP reset: M-mode
-            mstatus_sum_r <= 1'b0;
-            mstatus_mxr_r <= 1'b0;
+            mstatus_mpp    <= 2'b11; // MPP reset: M-mode
+            mstatus_mprv_r <= 1'b0;
+            mstatus_sum_r  <= 1'b0;
+            mstatus_mxr_r  <= 1'b0;
             // S-mode mstatus fields
             mstatus_sie   <= 1'b0;
             mstatus_spie  <= 1'b1;
@@ -455,6 +462,9 @@ module rv_csr
                 mstatus_mpie <= 1'b1;
                 cur_priv     <= priv_level_t'(mstatus_mpp);
                 mstatus_mpp  <= 2'b00;  // MPP ← U after MRET
+                // Spec: clear MPRV when returning to non-M privilege
+                if (mstatus_mpp != 2'b11)
+                    mstatus_mprv_r <= 1'b0;
 
             end else if (csr_we) begin
                 // ---- Normal CSR write ----------------------------------------
@@ -488,14 +498,15 @@ module rv_csr
                     CSR_SATP:     satp_reg     <= csr_new_val;
                     // Machine CSRs
                     CSR_MSTATUS: begin
-                        mstatus_sie   <= csr_new_val[1];
-                        mstatus_mie   <= csr_new_val[3];
-                        mstatus_spie  <= csr_new_val[5];
-                        mstatus_mpie  <= csr_new_val[7];
-                        mstatus_spp   <= csr_new_val[8];
-                        mstatus_mpp   <= csr_new_val[12:11];
-                        mstatus_sum_r <= csr_new_val[18];
-                        mstatus_mxr_r <= csr_new_val[19];
+                        mstatus_sie    <= csr_new_val[1];
+                        mstatus_mie    <= csr_new_val[3];
+                        mstatus_spie   <= csr_new_val[5];
+                        mstatus_mpie   <= csr_new_val[7];
+                        mstatus_spp    <= csr_new_val[8];
+                        mstatus_mpp    <= csr_new_val[12:11];
+                        mstatus_mprv_r <= csr_new_val[17];
+                        mstatus_sum_r  <= csr_new_val[18];
+                        mstatus_mxr_r  <= csr_new_val[19];
                     end
                     CSR_MEDELEG:  medeleg_reg  <= csr_new_val;
                     CSR_MIDELEG:  mideleg_reg  <= csr_new_val;

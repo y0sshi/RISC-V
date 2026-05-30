@@ -12,16 +12,17 @@ module rv_soc
     import rv_pkg::*;
 #(
     parameter int XLEN = rv_pkg::XLEN,
-    parameter int IMEM_DEPTH = 4069,
-    parameter int DMEM_DEPTH = 4096,
 `ifdef ACT_MODE
     parameter int UMEM_DEPTH = 65536, // 256KB
     parameter logic [63:0] RST_ADDR = 64'h8000_0000, // ACT entry point
+    parameter INIT_FILE = "",
 `else
+    parameter int IMEM_DEPTH = 4069,
+    parameter int DMEM_DEPTH = 4096,
     parameter logic [63:0] RST_ADDR = 64'h0,
-`endif
     parameter IMEM_FILE = "",
     parameter DMEM_FILE = "",
+`endif
     parameter int CLK_FREQ = 125_000_000,
     parameter int BAUD_RATE = 115_200
 )(
@@ -68,8 +69,11 @@ module rv_soc
     logic mstatus_mxr_out;
     logic tlb_flush_out;
     logic mmu_stall;
+    logic mem_stall;
     logic if_fault_mmu;
     logic mem_fault_mmu;
+    logic mstatus_mprv_out;
+    logic [1:0] mstatus_mpp_out_sig;
 
     logic timer_irq_sig;
     logic [1:0] plic_ext_irq;
@@ -97,10 +101,15 @@ module rv_soc
         .dmem_ready (dmem_ready),
         .satp_out (satp_out),
         .priv_out (priv_out),
-        .mstatus_sum_out (mstatus_sum_out),
-        .mstatus_mxr_out (mstatus_mxr_out),
+        .mstatus_sum_out  (mstatus_sum_out),
+        .mstatus_mxr_out  (mstatus_mxr_out),
+        .mstatus_mprv_out (mstatus_mprv_out),
+        .mstatus_mpp_out  (mstatus_mpp_out_sig),
         .tlb_flush_out (tlb_flush_out),
         .mmu_stall (mmu_stall),
+        .mem_stall (mem_stall),
+        .if_fault  (if_fault_mmu),
+        .mem_fault (mem_fault_mmu),
 `ifdef ACT_MODE
         .timer_irq (1'b0),
         .sw_irq (1'b0),
@@ -123,8 +132,10 @@ module rv_soc
         .rst_n (rst_n),
         .satp (satp_out),
         .priv_level (priv_out),
-        .mstatus_sum (mstatus_sum_out),
-        .mstatus_mxr (mstatus_mxr_out),
+        .mstatus_sum  (mstatus_sum_out),
+        .mstatus_mxr  (mstatus_mxr_out),
+        .mstatus_mprv (mstatus_mprv_out),
+        .mstatus_mpp  (mstatus_mpp_out_sig),
         .tlb_flush (tlb_flush_out),
         .if_va (core_imem_va),
         .if_req (core_imem_req),
@@ -139,6 +150,7 @@ module rv_soc
         .mem_we_out (mmu_dmem_we),
         .mem_fault (mem_fault_mmu),
         .mmu_stall (mmu_stall),
+        .mem_stall (mem_stall),
         .ptw_paddr (ptw_paddr),
         .ptw_req (ptw_req),
         .ptw_rdata (ptw_rdata),
@@ -176,22 +188,22 @@ module rv_soc
     logic umem_d_ready;
 
     rv_unified_mem #(
-        .XLEN (XLEN),
-        .DEPTH (UMEM_DEPTH),
+        .XLEN      (XLEN),
+        .DEPTH     (UMEM_DEPTH),
         .BASE_ADDR (64'h8000_0000),
-        .INIT_FILE (IMEM_FILE) // Same hex for I and D
+        .INIT_FILE (INIT_FILE)
     ) u_umem (
-        .clk (clk),
-        .rst_n (rst_n),
-        .i_addr (mmu_imem_pa),
-        .i_req (mmu_imem_req),
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .i_addr  (mmu_imem_pa),
+        .i_req   (mmu_imem_req),
         .i_rdata (imem_rdata),
         .i_ready (imem_ready),
-        .d_addr (umem_d_addr),
+        .d_addr  (umem_d_addr),
         .d_wdata (umem_d_wdata),
         .d_wstrb (umem_d_wstrb),
-        .d_req (umem_d_req),
-        .d_we (umem_d_we),
+        .d_req   (umem_d_req),
+        .d_we    (umem_d_we),
         .d_rdata (umem_d_rdata),
         .d_ready (umem_d_ready)
     );

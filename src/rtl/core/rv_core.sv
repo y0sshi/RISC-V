@@ -57,13 +57,20 @@ module rv_core
 
     // MMU state outputs (to rv_mmu)
     output logic [XLEN-1:0]  satp_out,        // SATP CSR value
-    output priv_level_t      priv_out,        // current privilege level
-    output logic             mstatus_sum_out, // mstatus.SUM
-    output logic             mstatus_mxr_out, // mstatus.MXR
-    output logic             tlb_flush_out,   // SFENCE.VMA pulse
+    output priv_level_t      priv_out,         // current privilege level
+    output logic             mstatus_sum_out,  // mstatus.SUM
+    output logic             mstatus_mxr_out,  // mstatus.MXR
+    output logic             mstatus_mprv_out, // mstatus.MPRV
+    output logic [1:0]       mstatus_mpp_out,  // mstatus.MPP
+    output logic             tlb_flush_out,    // SFENCE.VMA pulse
 
-    // MMU stall input (from rv_mmu, when PTW in progress)
-    input  wire              mmu_stall,
+    // MMU stall inputs (from rv_mmu)
+    input  wire              mmu_stall,   // IF/ID stall (any translation pending)
+    input  wire              mem_stall,   // EX/MEM stall (MEM-port translation pending)
+
+    // MMU fault inputs (from rv_mmu, when TLB hit but permission denied)
+    input  wire              if_fault,    // instruction page fault
+    input  wire              mem_fault,   // load/store page fault
 
     // External interrupt inputs
     input  wire              timer_irq,   // machine timer interrupt (MTIP/STIP via mideleg)
@@ -86,8 +93,10 @@ module rv_core
     logic        ex_trap_enter;   // ECALL or EBREAK in EX
     logic        ex_mret_en;      // MRET in EX
     logic        ex_sret_en;      // SRET in EX
+    // MEM stage page fault (load/store page fault from MMU, TLB-hit permission fail)
+    logic        mem_trap_enter;
     logic        trap_or_mret;    // Combined: causes PC redirect + pipeline flush
-    assign trap_or_mret = ex_trap_enter | ex_mret_en | ex_sret_en;
+    assign trap_or_mret = ex_trap_enter | ex_mret_en | ex_sret_en | mem_trap_enter;
 
     // Trap destinations from rv_csr
     logic [XLEN-1:0] trap_vector; // mtvec — used on trap_enter
@@ -150,7 +159,12 @@ module rv_core
 
     assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall;
     assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall;
-    assign stall_ex = amo_stall | fpu_busy_int | mal_stall;
+    // mem_stall freezes EX/MEM: a load/store in MEM whose data translation is
+    // still pending must remain in MEM (re-issuing its access) until the TLB is
+    // filled.  Without this the access leaves MEM unwritten.  Note: IF-port PTW
+    // (mmu_stall) must NOT freeze EX/MEM, or it would stall a branch/MRET/trap
+    // resolving in EX and corrupt control flow.
+    assign stall_ex = amo_stall | fpu_busy_int | mal_stall | mem_stall;
     // Traps/MRET flush the same stages as branch (instructions after the trap insn).
     // flush_id is asserted for 2 cycles: cycle 0 (branch_taken_ex | trap_or_mret)
     // discards the instruction that was fetched alongside the branch; cycle 1
@@ -190,12 +204,17 @@ module rv_core
     logic [XLEN-1:0] fetch_pc;  // delayed PC matching current imem_rdata
 
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)          pc_reg <= RST_ADDR[XLEN-1:0];
-        else if (!stall_if)  pc_reg <= ex_trap_enter    ? trap_vector       :
-                                        ex_mret_en       ? mepc_out          :
-                                        ex_sret_en       ? sepc_out          :
-                                        branch_taken_ex  ? branch_target_ex  :
-                                                           (pc_reg + XLEN'(4));
+        if (!rst_n)
+            pc_reg <= RST_ADDR[XLEN-1:0];
+        // Traps always redirect even during stall_if (page fault must be taken immediately)
+        else if (ex_trap_enter || mem_trap_enter)
+            pc_reg <= trap_vector;
+        else if (ex_mret_en)
+            pc_reg <= mepc_out;
+        else if (ex_sret_en)
+            pc_reg <= sepc_out;
+        else if (!stall_if)
+            pc_reg <= branch_taken_ex ? branch_target_ex : (pc_reg + XLEN'(4));
     end
 
     // fetch_pc follows pc_reg with 1-cycle delay (tracks BRAM input address)
@@ -356,6 +375,7 @@ module rv_core
     logic [XLEN-1:0] ex_mem_alu_result;
     logic [XLEN-1:0] ex_mem_rs2_data;
     reg_addr_t       ex_mem_rd_addr;
+    logic [XLEN-1:0] ex_mem_pc;    // PC of instruction in MEM stage (for fault mepc)
     logic [XLEN-1:0] ex_mem_pc4;
     logic [2:0]      ex_mem_funct3;
     logic            ex_mem_valid;
@@ -697,6 +717,8 @@ module rv_core
     logic [XLEN-1:0] satp_val_int;
     logic            mstatus_sum_int;
     logic            mstatus_mxr_int;
+    logic            mstatus_mprv_int;
+    logic [1:0]      mstatus_mpp_int;
 
     // Trap cause: depends on privilege level for ECALL
     logic [XLEN-1:0] ex_trap_cause;
@@ -739,6 +761,44 @@ module rv_core
         end
     end
 
+    // -------------------------------------------------------------------------
+    // MEM stage page fault detection
+    // -------------------------------------------------------------------------
+    // Fires when a valid load/store in MEM has a TLB-hit permission failure.
+    // mem_fault is combinational from rv_mmu (TLB hit, no PTW stall needed).
+    logic [XLEN-1:0] mem_trap_cause;
+    logic [XLEN-1:0] mem_trap_val;
+
+    always_comb begin
+        mem_trap_enter = ex_mem_valid
+                         && (ex_mem_ctrl.mem_read || ex_mem_ctrl.mem_write)
+                         && mem_fault;
+        mem_trap_cause = ex_mem_ctrl.mem_read ? xlen_t'(EXC_LOAD_PAGE_FAULT)
+                                              : xlen_t'(EXC_STORE_PAGE_FAULT);
+        mem_trap_val   = ex_mem_alu_result;  // faulting virtual address
+    end
+
+    // Combined trap signals: MEM fault takes priority over EX exceptions
+    // (they're mutually exclusive in practice since EX traps flush before MEM)
+    logic            csr_trap_enter;
+    logic [XLEN-1:0] csr_trap_cause;
+    logic [XLEN-1:0] csr_trap_val;
+    logic [XLEN-1:0] csr_trap_epc;
+
+    always_comb begin
+        if (mem_trap_enter) begin
+            csr_trap_enter = 1'b1;
+            csr_trap_cause = mem_trap_cause;
+            csr_trap_val   = mem_trap_val;
+            csr_trap_epc   = ex_mem_pc;
+        end else begin
+            csr_trap_enter = ex_trap_enter;
+            csr_trap_cause = ex_trap_cause;
+            csr_trap_val   = ex_trap_val;
+            csr_trap_epc   = id_ex_pc;
+        end
+    end
+
     rv_csr #(
         .XLEN   (XLEN),
         .HARTID (0)
@@ -750,10 +810,10 @@ module rv_core
         .csr_op     (id_ex_funct3),
         .csr_we     (id_ex_ctrl.csr_write & id_ex_valid),
         .csr_rdata  (csr_rdata_ex),
-        .trap_enter (ex_trap_enter),
-        .trap_cause (ex_trap_cause),
-        .trap_val   (ex_trap_val),
-        .trap_epc   (id_ex_pc),
+        .trap_enter (csr_trap_enter),
+        .trap_cause (csr_trap_cause),
+        .trap_val   (csr_trap_val),
+        .trap_epc   (csr_trap_epc),
         .mret_en    (ex_mret_en),
         .sret_en    (ex_sret_en),
         .trap_vector(trap_vector),
@@ -767,9 +827,11 @@ module rv_core
         .timer_irq  (timer_irq),
         .sw_irq     (sw_irq),
         .ext_irq    (ext_irq),
-        .satp_val      (satp_val_int),
-        .mstatus_sum   (mstatus_sum_int),
-        .mstatus_mxr   (mstatus_mxr_int),
+        .satp_val        (satp_val_int),
+        .mstatus_sum     (mstatus_sum_int),
+        .mstatus_mxr     (mstatus_mxr_int),
+        .mstatus_mprv    (mstatus_mprv_int),
+        .mstatus_mpp_out (mstatus_mpp_int),
         // F-extension
         .fpu_fflags    (fpu_fflags_ex),
         .fpu_fflags_we (fpu_result_valid),
@@ -777,10 +839,12 @@ module rv_core
     );
 
     // --- MMU state outputs ---
-    assign satp_out        = satp_val_int;
-    assign priv_out        = priv_level;
-    assign mstatus_sum_out = mstatus_sum_int;
-    assign mstatus_mxr_out = mstatus_mxr_int;
+    assign satp_out         = satp_val_int;
+    assign priv_out         = priv_level;
+    assign mstatus_sum_out  = mstatus_sum_int;
+    assign mstatus_mxr_out  = mstatus_mxr_int;
+    assign mstatus_mprv_out = mstatus_mprv_int;
+    assign mstatus_mpp_out  = mstatus_mpp_int;
 
     // SFENCE.VMA in EX stage → TLB flush pulse (1-cycle)
     assign tlb_flush_out   = id_ex_valid && id_ex_ctrl.is_sfence_vma;
@@ -813,6 +877,7 @@ module rv_core
             ex_mem_alu_result        <= '0;
             ex_mem_rs2_data          <= '0;
             ex_mem_rd_addr           <= '0;
+            ex_mem_pc                <= '0;
             ex_mem_pc4               <= '0;
             ex_mem_funct3            <= '0;
             ex_mem_csr_fwd           <= '0;
@@ -830,6 +895,7 @@ module rv_core
                                    ? {(XLEN/32){fwd_frs2_data[31:0]}}
                                    : fwd_rs2_data;
             ex_mem_rd_addr    <= id_ex_rd_addr;
+            ex_mem_pc         <= id_ex_pc;
             ex_mem_pc4        <= id_ex_pc + XLEN'(4);
             ex_mem_funct3     <= id_ex_funct3;
             ex_mem_csr_fwd    <= csr_rdata_ex;

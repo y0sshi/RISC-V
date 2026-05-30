@@ -1,109 +1,114 @@
 // =============================================================================
-// @file rv_unified_mem.sv
-// @brief Unified Instruction and Data Memory Model for Simulation (256 KB)
-//
-// 64-bit wide SRAM with byte-write enablement.
-// Dual-ported (pseudo or true depending on access conflict handling):
-//   Port A: Instruction Fetch (Read-Only)
-//   Port B: Data Access (Read/Write)
-//
-// Address Space: 0x8000_0000 - 0x8003_FFFF (256 KB)
+/// @file rv_unified_mem.sv
+/// @brief Unified Instruction/Data Memory for ACT_MODE simulation (256 KB)
+///
+/// Single SRAM block shared by instruction fetch (Port A, 32-bit read) and
+/// data access (Port B, XLEN-bit read/write with byte-enable).
+/// Used exclusively in rv_soc ACT_MODE; not instantiated in production.
+///
+/// @param XLEN        Data path width (32 or 64).
+/// @param DEPTH       Memory size in 32-bit words (default 65536 = 256 KB).
+/// @param BASE_ADDR   Physical base address (default 0x8000_0000).
+/// @param INIT_FILE   Optional hex file loaded at simulation start.
 // =============================================================================
 
 `default_nettype none
 
-module rv_unified_mem #(
-    parameter int          MEM_SIZE_BYTES = 256 * 1024, // 256 KB
-    parameter int          MEM_DEPTH      = MEM_SIZE_BYTES / 8, // 32768 words
-    parameter logic [63:0] BASE_ADDR      = 64'h8000_0000
+module rv_unified_mem
+    import rv_pkg::*;
+#(
+    parameter int           XLEN      = rv_pkg::XLEN,
+    parameter int           DEPTH     = 65536,           // 32-bit words → 256 KB
+    parameter logic [63:0]  BASE_ADDR = 64'h8000_0000,
+    parameter               INIT_FILE = ""
 ) (
-    input  wire        clk,
-    
-    // Port A: Instruction Fetch
-    input  logic [63:0] imem_addr,
-    output logic [63:0] imem_rdata,
-    
-    // Port B: Data Access
-    input  logic [63:0] dmem_addr,
-    input  logic [63:0] dmem_wdata,
-    input  logic        dmem_we,
-    input  logic [7:0]  dmem_be,
-    output logic [63:0] dmem_rdata
+    input  wire             clk,
+    input  wire             rst_n,
+
+    // Port A: Instruction fetch (read-only, 32-bit, 1-cycle latency)
+    input  logic [XLEN-1:0] i_addr,
+    input  logic             i_req,
+    output logic [31:0]      i_rdata,
+    output logic             i_ready,
+
+    // Port B: Data read/write (XLEN-bit, byte-enable, 1-cycle latency)
+    input  logic [XLEN-1:0]      d_addr,
+    input  logic [XLEN-1:0]      d_wdata,
+    input  logic [(XLEN/8)-1:0]  d_wstrb,
+    input  logic                  d_req,
+    input  logic                  d_we,
+    output logic [XLEN-1:0]      d_rdata,
+    output logic                  d_ready
 );
+    // -------------------------------------------------------------------------
+    // Memory: byte-addressable backing store for easy $readmemh loading
+    // -------------------------------------------------------------------------
+    localparam int MEM_BYTES = DEPTH * 4;  // DEPTH in 32-bit words
 
-    // -------------------------------------------------------------------------
-    // Memory Array Definition
-    // -------------------------------------------------------------------------
-    logic [63:0] mem [0:MEM_DEPTH-1];
+    logic [7:0] mem_b [0:MEM_BYTES-1];
 
-    // -------------------------------------------------------------------------
-    // Address Translation (Byte Address -> Word Index)
-    // -------------------------------------------------------------------------
-    logic [63:0] imem_idx_raw, dmem_idx_raw;
-    assign imem_idx_raw = (imem_addr - BASE_ADDR) >> 3;
-    assign dmem_idx_raw = (dmem_addr - BASE_ADDR) >> 3;
-
-    // Truncate to prevent out-of-bound warnings in simulation
-    localparam int ADDR_WIDTH = $clog2(MEM_DEPTH);
-    logic [ADDR_WIDTH-1:0] imem_idx, dmem_idx;
-    assign imem_idx = imem_idx_raw[ADDR_WIDTH-1:0];
-    assign dmem_idx = dmem_idx_raw[ADDR_WIDTH-1:0];
-
-    // -------------------------------------------------------------------------
-    // Port A: Synchronous Instruction Read
-    // -------------------------------------------------------------------------
-    always_ff @(posedge clk) begin
-        imem_rdata <= mem[imem_idx];
+    initial begin
+        for (int i = 0; i < MEM_BYTES; i++) mem_b[i] = 8'h0;
+        if (INIT_FILE != "")
+            $readmemh(INIT_FILE, mem_b);
     end
 
     // -------------------------------------------------------------------------
-    // Port B: Synchronous Data Read / Byte-Enabled Write
+    // Byte offset helpers
     // -------------------------------------------------------------------------
-    always_ff @(posedge clk) begin
-        if (dmem_we) begin
-            if (dmem_be[0]) mem[dmem_idx][7:0]   <= dmem_wdata[7:0];
-            if (dmem_be[1]) mem[dmem_idx][15:8]  <= dmem_wdata[15:8];
-            if (dmem_be[2]) mem[dmem_idx][23:16] <= dmem_wdata[23:16];
-            if (dmem_be[3]) mem[dmem_idx][31:24] <= dmem_wdata[31:24];
-            if (dmem_be[4]) mem[dmem_idx][39:32] <= dmem_wdata[39:32];
-            if (dmem_be[5]) mem[dmem_idx][47:40] <= dmem_wdata[47:40];
-            if (dmem_be[6]) mem[dmem_idx][55:48] <= dmem_wdata[55:48];
-            if (dmem_be[7]) mem[dmem_idx][63:56] <= dmem_wdata[63:56];
-        end
-        dmem_rdata <= mem[dmem_idx];
-    end
+    logic [63:0] i_boff;
+    logic [63:0] d_boff;
+    assign i_boff = i_addr - BASE_ADDR;
+    assign d_boff = (d_addr - BASE_ADDR) & ~64'h7;  // 8-byte aligned for XLEN=64
 
     // -------------------------------------------------------------------------
-    // Simulation Helper Task: Dump Signature Region to File
+    // Port A: 1-cycle synchronous instruction read (BRAM model)
     // -------------------------------------------------------------------------
-    task automatic dump_signature(
-        input string filename,
-        input logic [63:0] start_addr,
-        input logic [63:0] end_addr
-    );
-        integer fd;
-        logic [63:0] start_idx, end_idx;
-        begin
-            start_idx = (start_addr - BASE_ADDR) >> 3;
-            end_idx   = (end_addr - BASE_ADDR) >> 3;
-            
-            fd = $fopen(filename, "w");
-            if (fd == 0) begin
-                $display("ERROR: Could not open signature file: %s", filename);
-                $finish;
-            end
-            
-            $display("--- Dumping Signature [0x%0x - 0x%0x] ---", start_addr, end_addr);
-            for (logic [63:0] i = start_idx; i < end_idx; i = i + 1) begin
-                // Dump 32-bit words (low then high) to match riscv-arch-test requirements
-                $fwrite(fd, "%08x\n", mem[i[ADDR_WIDTH-1:0]][31:0]);
-                $fwrite(fd, "%08x\n", mem[i[ADDR_WIDTH-1:0]][63:32]);
-            end
-            $fclose(fd);
+    logic [31:0] i_rdata_r;
+    logic        i_ready_r;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            i_ready_r <= 1'b0;
+            i_rdata_r <= '0;
+        end else begin
+            i_ready_r <= i_req;
+            if (i_req)
+                i_rdata_r <= {mem_b[i_boff+3], mem_b[i_boff+2],
+                              mem_b[i_boff+1], mem_b[i_boff+0]};
         end
-    endtask
+    end
+
+    assign i_rdata = i_rdata_r;
+    assign i_ready = i_ready_r;
+
+    // -------------------------------------------------------------------------
+    // Port B: 1-cycle synchronous data read/write
+    // -------------------------------------------------------------------------
+    logic [XLEN-1:0] d_rdata_r;
+    logic            d_ready_r;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            d_ready_r <= 1'b0;
+            d_rdata_r <= '0;
+        end else begin
+            d_ready_r <= d_req;
+            if (d_req && d_we) begin
+                for (int i = 0; i < XLEN/8; i++) begin
+                    if (d_wstrb[i]) mem_b[d_boff + i] <= d_wdata[i*8 +: 8];
+                end
+            end else if (d_req) begin
+                for (int i = 0; i < XLEN/8; i++) begin
+                    d_rdata_r[i*8 +: 8] <= mem_b[d_boff + i];
+                end
+            end
+        end
+    end
+
+    assign d_rdata = d_rdata_r;
+    assign d_ready = d_ready_r;
 
 endmodule
 
 `default_nettype wire
-

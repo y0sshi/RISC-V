@@ -51,9 +51,11 @@ module rv_mmu
 
     // ---- Translation control (from rv_core / rv_csr) ------------------------
     input  wire  [XLEN-1:0]  satp,           // SATP CSR
-    input  priv_level_t      priv_level,     // current privilege level
+    input  priv_level_t      priv_level,     // current privilege level (IF)
     input  wire              mstatus_sum,    // mstatus.SUM
     input  wire              mstatus_mxr,    // mstatus.MXR
+    input  wire              mstatus_mprv,   // mstatus.MPRV
+    input  wire  [1:0]       mstatus_mpp,    // mstatus.MPP (used with MPRV)
     input  wire              tlb_flush,      // SFENCE.VMA → invalidate all TLB
 
     // ---- IF port (instruction fetch) ----------------------------------------
@@ -72,8 +74,9 @@ module rv_mmu
     output logic             mem_we_out,     // forwarded we → dmem
     output logic             mem_fault,      // load/store page fault
 
-    // ---- Stall output -------------------------------------------------------
-    output logic             mmu_stall,      // 1 = PTW in progress or fault
+    // ---- Stall outputs ------------------------------------------------------
+    output logic             mmu_stall,      // 1 = IF or MEM translation pending (stalls IF/ID)
+    output logic             mem_stall,      // 1 = MEM-port translation pending (also stalls EX/MEM)
 
     // ---- PTW physical-memory port (rv_soc muxes with dmem) -----------------
     output logic [XLEN-1:0]  ptw_paddr,
@@ -99,11 +102,16 @@ module rv_mmu
     // Translation-mode detection
     // =========================================================================
     // Sv32: SATP[31]=MODE, Sv39: SATP[63:60]=4'h8
-    // M-mode always uses physical addresses (no vm).
+    // M-mode always uses physical addresses for IF.
+    // For data accesses: MPRV=1 uses MPP as effective privilege instead.
     wire [63:0] satp64      = {{(64-XLEN){1'b0}}, satp};
-    wire        vm_enabled  = (XLEN == 32)
-                              ? (satp64[31] && (priv_level != PRIV_M))
-                              : ((satp64[63:60] == 4'h8) && (priv_level != PRIV_M));
+    wire        vm_active   = (XLEN == 32) ? satp64[31]
+                                           : (satp64[63:60] == 4'h8);
+    wire        vm_enabled  = vm_active && (priv_level != PRIV_M);
+    // Effective privilege for data accesses (MPRV: use MPP when in M-mode)
+    wire [1:0]  priv_data   = (mstatus_mprv && (priv_level == PRIV_M))
+                              ? mstatus_mpp : priv_level;
+    wire        vm_data     = vm_active && (priv_data != PRIV_M);
 
     // Root-page-table PPN from SATP (44-bit internal)
     wire [PPN_INT_W-1:0] satp_ppn44 = (XLEN == 32)
@@ -190,8 +198,9 @@ module rv_mmu
             // Load: need R, or (MXR && X)
             mem_perm_ok = mem_tlb_r || (mstatus_mxr && mem_tlb_x);
 
-        if      (priv_level == PRIV_U) mem_perm_ok = mem_perm_ok &&  mem_tlb_u;
-        else if (priv_level == PRIV_S) mem_perm_ok = mem_perm_ok && (!mem_tlb_u || mstatus_sum);
+        // Use priv_data (MPRV-adjusted) for U/S privilege check on data accesses
+        if      (priv_data == PRIV_U) mem_perm_ok = mem_perm_ok &&  mem_tlb_u;
+        else if (priv_data == PRIV_S) mem_perm_ok = mem_perm_ok && (!mem_tlb_u || mstatus_sum);
     end
 
     // =========================================================================
@@ -298,7 +307,7 @@ module rv_mmu
                         ptw_for_if <= 1'b1;
                         ptw_vpn    <= if_vpn;
                         ptw_state  <= (XLEN == 64) ? PTW_L2 : PTW_L1;
-                    end else if (vm_enabled && mem_req && !mem_tlb_hit) begin
+                    end else if (vm_data && mem_req && !mem_tlb_hit) begin
                         ptw_for_if <= 1'b0;
                         ptw_vpn    <= mem_vpn;
                         ptw_state  <= (XLEN == 64) ? PTW_L2 : PTW_L1;
@@ -306,20 +315,30 @@ module rv_mmu
                 end
 
                 PTW_L2: begin   // Sv39 only
-                    // ptw_wait skips 1 cycle when entering from L2→L1 would
-                    // also be needed, but IDLE→L2 is safe (ptw_req=0 in IDLE).
                     if (ptw_wait) begin
                         ptw_wait <= 1'b0;
                     end else if (ptw_ready) begin
-                        if (!pte_v || (!pte_r && pte_w) || pte_leaf) begin
-                            // Invalid PTE or unexpected leaf (gigapage not supported)
+                        if (!pte_v || (!pte_r && pte_w)) begin
                             ptw_fault_r <= 1'b1;
                             ptw_state   <= PTW_FAULT;
+                        end else if (pte_leaf) begin
+                            // Sv39 gigapage (1 GB): PPN[17:0] must be 0
+                            if (pte_ppn44[17:0] != 18'b0 || !pte_a) begin
+                                ptw_fault_r <= 1'b1;
+                                ptw_state   <= PTW_FAULT;
+                            end else begin
+                                // Effective PPN: upper PPN bits + VPN[1:0] from VA
+                                ptw_res_ppn <= {pte_ppn44[43:18], ptw_vpn[17:0]};
+                                ptw_res_r   <= pte_r; ptw_res_w <= pte_w;
+                                ptw_res_x   <= pte_x; ptw_res_u <= pte_u;
+                                ptw_res_d   <= pte_d;
+                                ptw_fault_r <= 1'b0;
+                                ptw_state   <= PTW_DONE;
+                            end
                         end else begin
+                            // Non-leaf: proceed to L1
                             ptw_ppn_cur <= pte_ppn44;
                             ptw_state   <= PTW_L1;
-                            // ptw_wait: memory latched OLD address this cycle;
-                            // skip next cycle so memory re-samples ptw_l1_addr.
                             ptw_wait    <= 1'b1;
                         end
                     end
@@ -329,14 +348,34 @@ module rv_mmu
                     if (ptw_wait) begin
                         ptw_wait <= 1'b0;
                     end else if (ptw_ready) begin
-                        if (!pte_v || (!pte_r && pte_w) || pte_leaf) begin
-                            // Invalid PTE or megapage (not supported)
+                        if (!pte_v || (!pte_r && pte_w)) begin
                             ptw_fault_r <= 1'b1;
                             ptw_state   <= PTW_FAULT;
+                        end else if (pte_leaf) begin
+                            // Sv39 megapage (2 MB): PPN[8:0] must be 0
+                            // Sv32 megapage (4 MB): PPN[9:0] must be 0
+                            logic [17:0] align_mask;
+                            logic        misaligned;
+                            align_mask  = (XLEN == 64) ? 18'h1ff : 18'h3ff;
+                            misaligned  = |(pte_ppn44[17:0] & align_mask);
+                            if (misaligned || !pte_a) begin
+                                ptw_fault_r <= 1'b1;
+                                ptw_state   <= PTW_FAULT;
+                            end else begin
+                                // Effective PPN: upper bits + VPN[0] from VA
+                                ptw_res_ppn <= (XLEN == 64)
+                                    ? {pte_ppn44[43:9], ptw_vpn[8:0]}
+                                    : {pte_ppn44[43:10], ptw_vpn[9:0]};
+                                ptw_res_r   <= pte_r; ptw_res_w <= pte_w;
+                                ptw_res_x   <= pte_x; ptw_res_u <= pte_u;
+                                ptw_res_d   <= pte_d;
+                                ptw_fault_r <= 1'b0;
+                                ptw_state   <= PTW_DONE;
+                            end
                         end else begin
+                            // Non-leaf: proceed to L0
                             ptw_ppn_cur <= pte_ppn44;
                             ptw_state   <= PTW_L0;
-                            // Same reason: skip 1 cycle for memory to latch ptw_l0_addr.
                             ptw_wait    <= 1'b1;
                         end
                     end
@@ -399,11 +438,25 @@ module rv_mmu
     end
 
     // =========================================================================
-    // Stall output
+    // Stall outputs
     // =========================================================================
-    assign mmu_stall = (ptw_state != PTW_IDLE)
-                       && (ptw_state != PTW_DONE)
-                       && (ptw_state != PTW_FAULT);
+    // mem_stall: the MEM-stage load/store cannot complete because its data
+    // translation is still pending (TLB miss being walked, or just-detected).
+    // This is purely combinational so it covers the whole window from miss
+    // detection through TLB fill, and drops as soon as the TLB hits (access
+    // proceeds) or the access faults (trap is taken).  It freezes EX/MEM so the
+    // access stays in MEM and re-issues once the translation is ready.
+    wire mem_xlate_pending = vm_data && mem_req && !mem_tlb_hit && !mem_fault;
+    assign mem_stall = mem_xlate_pending;
+
+    // mmu_stall: stall IF/ID whenever any PTW is walking (IF or MEM) or a MEM
+    // translation is pending.  PTW_FAULT does NOT stall (the fault is taken as
+    // a trap immediately).  IF-port PTW does not freeze EX/MEM (that path keeps
+    // running, matching the original pipeline behavior).
+    wire ptw_walking = (ptw_state == PTW_L2)
+                       || (ptw_state == PTW_L1)
+                       || (ptw_state == PTW_L0);
+    assign mmu_stall = ptw_walking || mem_xlate_pending;
 
     // Pre-truncated physical addresses (avoids parametric selects in always_comb)
     wire [XLEN-1:0] if_pa_xlat  = if_pa64 [XLEN-1:0];
@@ -438,7 +491,8 @@ module rv_mmu
     // MEM port output (combinational)
     // =========================================================================
     always_comb begin
-        if (!vm_enabled) begin
+        if (!vm_data) begin
+            // VM disabled for data accesses (bare mode or MPRV→M-mode)
             mem_pa      = mem_va;
             mem_req_out = mem_req;
             mem_we_out  = mem_we;
