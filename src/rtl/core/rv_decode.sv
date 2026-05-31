@@ -46,7 +46,8 @@ module rv_decode
     output reg_addr_t         rs3_addr,   // FP rs3 for FMADD family (inst[31:27])
     output reg_addr_t         rd_addr,
     output logic              rs1_used,   // instruction actually reads rs1
-    output logic              rs2_used    // instruction actually reads rs2
+    output logic              rs2_used,   // instruction actually reads rs2
+    output logic              illegal     // 1 = undecodable / reserved encoding
 );
 
     // =========================================================================
@@ -55,6 +56,18 @@ module rv_decode
     wire [6:0] opcode = inst[6:0];
     wire [2:0] funct3 = inst[14:12];
     wire [6:0] funct7 = inst[31:25];
+
+    // Shift-immediate amount validity (XLEN-dependent).
+    // RV32: shamt is 5 bits, inst[31:25] must be 0000000 (logical) / 0100000 (arith only f3=101).
+    // RV64: shamt is 6 bits, inst[31:26] must be 000000 / 010000.
+    localparam bit DEC_RV64 = (XLEN == 64);
+    wire shll_illegal = DEC_RV64 ? (inst[31:26] != 6'b000000)
+                                 : (inst[31:25] != 7'b0000000);
+    wire shrl_illegal = DEC_RV64 ? (inst[31:26] != 6'b000000 && inst[31:26] != 6'b010000)
+                                 : (inst[31:25] != 7'b0000000 && inst[31:25] != 7'b0100000);
+    // W-form shifts (RV64 only) always use a 5-bit shamt: inst[25] must be 0.
+    wire shllw_illegal = (inst[31:25] != 7'b0000000);
+    wire shrlw_illegal = (inst[31:25] != 7'b0000000 && inst[31:25] != 7'b0100000);
 
     assign rs1_addr = inst[19:15];
     assign rs2_addr = inst[24:20];
@@ -106,6 +119,7 @@ module rv_decode
         ctrl     = '0;
         rs1_used = 1'b0;
         rs2_used = 1'b0;
+        illegal  = 1'b0;
 
         case (opcode)
             OP_LUI: begin
@@ -171,11 +185,12 @@ module rv_decode
                 // Decode ALU operation from funct3 + funct7
                 case (funct3)
                     F3_ADD_SUB: ctrl.alu_op = ALU_ADD;   // ADDI (no SUB for immediate)
-                    F3_SLL:     ctrl.alu_op = ALU_SLL;
+                    F3_SLL:   begin ctrl.alu_op = ALU_SLL;  if (shll_illegal) illegal = 1'b1; end // SLLI
                     F3_SLT:     ctrl.alu_op = ALU_SLT;
                     F3_SLTU:    ctrl.alu_op = ALU_SLTU;
                     F3_XOR:     ctrl.alu_op = ALU_XOR;
-                    F3_SRL_SRA: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SRA : ALU_SRL);
+                    F3_SRL_SRA: begin ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SRA : ALU_SRL);
+                                      if (shrl_illegal) illegal = 1'b1; end                       // SRLI/SRAI
                     F3_OR:      ctrl.alu_op = ALU_OR;
                     F3_AND:     ctrl.alu_op = ALU_AND;
                     default:    ctrl.alu_op = ALU_ADD;
@@ -224,13 +239,16 @@ module rv_decode
                 ctrl.alu_src2  = ALU_SRC2_IMM;
                 ctrl.wb_src    = WB_SRC_ALU;
                 rs1_used       = 1'b1;
+                if (!DEC_RV64) illegal = 1'b1;   // W-type ops do not exist on RV32
                 case (funct3)
                     F3_ADD_SUB: ctrl.alu_op = ALU_ADDW;               // ADDIW
-                    F3_SLL:     ctrl.alu_op = ALU_SLLW;               // SLLIW
-                    F3_SRL_SRA: ctrl.alu_op = alu_op_t'(inst[30]
+                    F3_SLL:   begin ctrl.alu_op = ALU_SLLW;           // SLLIW
+                                    if (shllw_illegal) illegal = 1'b1; end
+                    F3_SRL_SRA: begin ctrl.alu_op = alu_op_t'(inst[30]
                                                 ? ALU_SRAW            // SRAIW
                                                 : ALU_SRLW);          // SRLIW
-                    default:    ctrl.alu_op = ALU_ADDW;
+                                      if (shrlw_illegal) illegal = 1'b1; end
+                    default:    illegal = 1'b1;   // ADDIW only valid base f3=000
                 endcase
             end
 
@@ -242,6 +260,7 @@ module rv_decode
                 ctrl.wb_src    = WB_SRC_ALU;
                 rs1_used       = 1'b1;
                 rs2_used       = 1'b1;
+                if (!DEC_RV64) illegal = 1'b1;   // W-type ops do not exist on RV32
                 if (funct7 == 7'b0000001) begin
                     // RV64M: W-type multiply-divide
                     ctrl.is_muldiv = 1'b1;
@@ -599,7 +618,8 @@ module rv_decode
             end
 
             default: begin
-                // Illegal instruction - keep default (NOP)
+                // Unknown opcode -> illegal instruction
+                illegal = 1'b1;
             end
         endcase
     end

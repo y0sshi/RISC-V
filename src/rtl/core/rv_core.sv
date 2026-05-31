@@ -291,7 +291,8 @@ module rv_core
 
     wire             id_is_compressed = (if_id_inst[1:0] != 2'b11);
     logic [31:0]     id_cexpanded;     // 32-bit expansion of a compressed insn
-    logic            id_cillegal;      // reserved compressed encoding (unused for now)
+    logic            id_cillegal;      // reserved compressed encoding
+    logic            id_decode_illegal;// rv_decode: undecodable 32-bit encoding
     logic [31:0]     decode_inst;      // instruction actually fed to rv_decode
 
     rv_cdecode #(.XLEN(XLEN)) u_cdecode (
@@ -312,13 +313,17 @@ module rv_core
         .rs3_addr   (id_rs3_addr),
         .rd_addr    (id_rd_addr),
         .rs1_used   (id_rs1_used),
-        .rs2_used   (id_rs2_used)
+        .rs2_used   (id_rs2_used),
+        .illegal    (id_decode_illegal)
     );
 
-    // Tag the control bundle with the compressed flag (used for PC+2 link / mepc).
+    // Tag the control bundle with the compressed flag (used for PC+2 link / mepc)
+    // and the illegal-instruction flag.  For compressed insns the illegality comes
+    // from rv_cdecode (rv_decode sees the expanded/NOP form); otherwise from rv_decode.
     always_comb begin
         id_ctrl               = id_ctrl_raw;
         id_ctrl.is_compressed = id_is_compressed;
+        id_ctrl.is_illegal    = id_is_compressed ? id_cillegal : id_decode_illegal;
     end
 
     // WB-stage signals (declared here; driven by always_comb after MEM/WB register).
@@ -372,6 +377,7 @@ module rv_core
     logic [XLEN-1:0] id_ex_pc;
     logic [2:0]      id_ex_funct3;
     logic [11:0]     id_ex_csr_addr;   // inst[31:20] — CSR address for Zicsr
+    logic [31:0]     id_ex_inst;       // raw fetched word (for illegal-instruction mtval)
     logic            id_ex_valid;
     // FP operands registered from fregfile (64-bit for F+D extensions)
     logic [63:0]     id_ex_frs1_data, id_ex_frs2_data, id_ex_frs3_data;
@@ -389,6 +395,7 @@ module rv_core
             id_ex_pc        <= '0;
             id_ex_funct3    <= '0;
             id_ex_csr_addr  <= '0;
+            id_ex_inst      <= '0;
             id_ex_valid     <= 1'b0;
             id_ex_frs1_data <= '0;
             id_ex_frs2_data <= '0;
@@ -407,6 +414,7 @@ module rv_core
             // compressed instructions too (decode_inst == if_id_inst when not RVC).
             id_ex_funct3    <= decode_inst[14:12];
             id_ex_csr_addr  <= decode_inst[31:20];
+            id_ex_inst      <= if_id_inst;   // raw word for illegal-instruction mtval
             id_ex_valid     <= if_id_valid;
             id_ex_frs1_data <= id_frs1_data;
             id_ex_frs2_data <= id_frs2_data;
@@ -787,7 +795,14 @@ module rv_core
         ex_trap_val   = '0;
 
         if (id_ex_valid) begin
-            if (id_ex_ctrl.is_ecall) begin
+            if (id_ex_ctrl.is_illegal) begin
+                // Illegal-instruction exception (synchronous; highest priority here).
+                // mtval = the faulting instruction (16-bit zero-extended if compressed).
+                ex_trap_enter = 1'b1;
+                ex_trap_cause = xlen_t'(EXC_ILLEGAL_INST);
+                ex_trap_val   = id_ex_ctrl.is_compressed ? xlen_t'(id_ex_inst[15:0])
+                                                         : xlen_t'(id_ex_inst);
+            end else if (id_ex_ctrl.is_ecall) begin
                 ex_trap_enter = 1'b1;
                 // Cause depends on current privilege level
                 unique case (priv_level)

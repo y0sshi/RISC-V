@@ -274,6 +274,8 @@ package rv_pkg;
         logic       is_sret;        // SRET (supervisor trap return, reserved for S-mode)
         // C extension
         logic       is_compressed;  // 1 = 16-bit compressed instruction (PC += 2, link = PC+2)
+        // Illegal-instruction detection
+        logic       is_illegal;     // 1 = undecodable / reserved encoding -> illegal-instruction trap
         // M extension
         logic       is_muldiv;      // Multiply/divide instruction (M extension)
         muldiv_op_t muldiv_op;      // M-extension operation selector
