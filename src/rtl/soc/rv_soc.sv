@@ -13,7 +13,7 @@ module rv_soc
 #(
     parameter int XLEN = rv_pkg::XLEN,
 `ifdef ACT_MODE
-    parameter int UMEM_DEPTH = 65536, // 256KB
+    parameter int UMEM_DEPTH = 524288, // 2 MB (arch-test jal tests place tohost/sig ~1.2 MB)
     parameter logic [63:0] RST_ADDR = 64'h8000_0000, // ACT entry point
     parameter INIT_FILE = "",
 `else
