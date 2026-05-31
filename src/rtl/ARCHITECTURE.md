@@ -31,8 +31,11 @@ digraph module_hierarchy {
     regfile [label="rv_regfile\n(Register File)", fillcolor="#FFCCCC"];
     
     // CPU Extensions
+    cdecode [label="rv_cdecode\n(C Extension)", fillcolor="#FFD9B3"];
     muldiv [label="rv_muldiv\n(M Extension)", fillcolor="#FFD9B3"];
     amo [label="rv_amo\n(A Extension)", fillcolor="#FFD9B3"];
+    fpu [label="rv_fpu (+_d)\n(F/D Extension)", fillcolor="#FFD9B3"];
+    fregfile [label="rv_fregfile\n(FP Registers)", fillcolor="#FFCCCC"];
     csr [label="rv_csr\n(Zicsr + CSRs)", fillcolor="#FFD9B3"];
     mmu [label="rv_mmu\n(MMU + TLB)", fillcolor="#FFD9B3"];
     
@@ -58,10 +61,13 @@ digraph module_hierarchy {
     rv_core -> hazard;
     rv_core -> branch;
     rv_core -> regfile;
+    rv_core -> cdecode;
     rv_core -> muldiv;
     rv_core -> amo;
+    rv_core -> fpu;
+    rv_core -> fregfile;
     rv_core -> csr;
-    rv_core -> mmu;
+    rv_soc  -> mmu;
     
     rv_core -> imem;
     rv_core -> dmem;
@@ -203,12 +209,18 @@ digraph isa_extensions {
     
     M [label="M Extension\nMUL/DIV/REM\n(13 instructions)", fillcolor="#FFD9B3"];
     A [label="A Extension\nLR/SC/AMO\n(11 instructions)", fillcolor="#FFD9B3"];
+    F [label="F Extension\nSingle-precision FP\n(rv_fpu)", fillcolor="#FFD9B3"];
+    D [label="D Extension\nDouble-precision FP\n(rv_fpu_*_d)", fillcolor="#FFD9B3"];
+    C [label="C Extension\nCompressed 16-bit\n(rv_cdecode)", fillcolor="#FFD9B3"];
     Zicsr [label="Zicsr Extension\nCSR access\n(6 instructions)", fillcolor="#FFD9B3"];
     
     S [label="S-mode Support\nVirtual Memory\nInterrupts", fillcolor="#B3FFB3"];
     
     RV32I -> M;
     RV32I -> A;
+    RV32I -> F;
+    F -> D;
+    RV32I -> C;
     RV32I -> Zicsr;
     RV32I -> S;
     RV32I -> RV64I;
@@ -218,6 +230,10 @@ digraph isa_extensions {
     Zicsr -> S;
 }
 @enddot
+
+@note ISA coverage (2026-05-31): RV32GC / RV64GC = I, M, A, F, D, C, Zicsr + S-mode
+(Sv32/Sv39). Compliance: RV64 117/117, RV32 88/88. Not implemented: illegal-instruction
+trap, PMP, V. The canonical, always-current status is in `CLAUDE.md`.
 
 @section module_dependencies Module Dependency Details
 

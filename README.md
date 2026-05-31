@@ -2,31 +2,39 @@
 
 A SystemVerilog RISC-V processor core designed for learning and FPGA implementation.
 
+## Status
+
+**RV32GC / RV64GC** implemented and passing riscv-tests compliance:
+**RV64 117/117**, **RV32 88/88** (p-variants). Builds with iverilog **v12 and v13** and Vivado.
+See [CLAUDE.md](CLAUDE.md) for the always-current detailed status and the Linux roadmap.
+
 ## Goals
 
-- RV32I / RV64I base integer instruction set
-- Standard extensions: M (Multiply/Divide), A (Atomic), C (Compressed), Zicsr
-- Privilege architecture (M/S/U modes) with MMU for Linux support
+- RV32I / RV64I base integer instruction set (parameterized `XLEN`)
+- Standard extensions: **M** (Multiply/Divide), **A** (Atomic), **F/D** (Floating-point),
+  **C** (Compressed), **Zicsr**
+- Privilege architecture (M/S/U) with **Sv32/Sv39 MMU** (toward Linux support)
 - Compatible with **Vivado** (synthesis) and **iverilog** (simulation)
 
 ## Target Boards
 
-| Board | FPGA | Status |
-|-------|------|--------|
-| Zybo Z7-20 | Zynq-7020 | In progress |
-| KV260 | Zynq UltraScale+ K26 | Planned |
+| Board | FPGA | On-board DRAM | Status |
+|-------|------|---------------|--------|
+| Zybo Z7-20 | Zynq-7000 (XC7Z020) | 1 GB DDR3 (PS) | Board top instantiates SoC on BRAM; PS-DDR via AXI planned |
+| KV260 | Zynq UltraScale+ (XCK26, K26 SOM) | 4 GB DDR4 | Same; PS-DDR via AXI planned |
 
 ## Directory Structure
 
 ```
 src/
 ├── rtl/
-│   ├── include/        # Shared packages (rv_pkg.sv)
-│   ├── core/           # CPU core (pipeline, decoder, regfile, branch)
+│   ├── include/        # Shared package (rv_pkg.sv)
+│   ├── core/           # CPU core: pipeline, decode, cdecode(C), regfile/fregfile,
+│   │                   #   branch, csr(Zicsr/priv), muldiv(M), amo(A), mmu, forward, hazard
 │   ├── alu/            # Arithmetic Logic Unit
-│   ├── ext/            # ISA extensions (M, A, C, Zicsr)
-│   ├── memory/         # Instruction & data memory
-│   ├── bus/            # Bus infrastructure
+│   ├── fpu/            # F/D extension (rv_fpu, rv_fpu_*[_d])
+│   ├── memory/         # Instruction & data memory (BRAM) + unified mem (ACT mode)
+│   ├── bus/            # Bus infrastructure (reserved for AXI4 bridge)
 │   ├── peripherals/    # UART, GPIO, CLINT, PLIC
 │   └── soc/            # SoC top-level integration
 ├── boards/
@@ -44,7 +52,8 @@ scripts/
 
 docs/
 ├── architecture.md     # Architecture overview
-└── isa_progress.md     # ISA implementation tracking
+├── isa_implemented.md  # Per-instruction ISA status
+└── ROADMAP.md          # Linux-port roadmap (detail in CLAUDE.md)
 ```
 
 ## Quick Start
@@ -76,14 +85,25 @@ vivado -mode batch -source program.tcl -tclargs zybo_z720
 
 ## Development Roadmap
 
-1. **Phase 1**: RV32I base instruction set (single-cycle → pipeline)
-2. **Phase 2**: Zicsr + Machine-mode trap handling
-3. **Phase 3**: M extension (multiply/divide)
-4. **Phase 4**: A extension (atomics)
-5. **Phase 5**: C extension (compressed instructions)
-6. **Phase 6**: RV64I support (parameterized XLEN)
-7. **Phase 7**: Supervisor mode + MMU (Sv32/Sv39)
-8. **Phase 8**: Peripherals (UART, CLINT, PLIC) + Linux boot
+Done ✅: RV32I/RV64I base · Zicsr + M-mode traps · M · A · **F/D** · **C** · RV64
+(parameterized XLEN) · Supervisor mode + MMU (Sv32/Sv39) · Peripherals (UART, CLINT,
+PLIC, GPIO).
+
+Next (toward Linux) — detail in [CLAUDE.md](CLAUDE.md) "Linux 対応ロードマップ":
+
+1. **Memory**: replace on-chip BRAM with board DDR via an AXI4 master bridge (biggest blocker)
+2. Illegal-instruction trap, `mcounteren`/`scounteren` + `time` CSR (for `rdtime`)
+3. SBI firmware (OpenSBI) + device tree + Zynq PS integration (Vivado block design)
+4. Optional I/D cache, then Linux boot
+
+### Compliance / test commands
+```bash
+cd tests/compliance
+make riscv-tests-build      # build RV64 test ELFs (Docker)
+make riscv-tests-run        # RV64 117/117
+make riscv-tests-build32    # build RV32 test ELFs
+make riscv-tests-run32      # RV32 88/88
+```
 
 ## License
 

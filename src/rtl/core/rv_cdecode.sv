@@ -143,7 +143,7 @@ module rv_cdecode
     function automatic [31:0] enc_jal(input [20:0] off,   // off[0] ignored (=0)
                                       input [4:0]  rd);
         // inst[31]=off[20], inst[30:21]=off[10:1], inst[20]=off[11], inst[19:12]=off[19:12]
-        enc_jal = {off[20], off[10:1], off[11], off[19:12], rd, 7'b1101111};
+        enc_jal = {off[20], off[10:1], off[11], off[19:12], rd, OP_JAL};
     endfunction
 
     // B-type (branch): 13-bit signed offset (off[0]=0)
@@ -151,7 +151,7 @@ module rv_cdecode
                                     input [4:0]  rs2,
                                     input [4:0]  rs1,
                                     input [2:0]  f3);
-        enc_b = {off[12], off[10:5], rs2, rs1, f3, off[4:1], off[11], 7'b1100011};
+        enc_b = {off[12], off[10:5], rs2, rs1, f3, off[4:1], off[11], OP_BRANCH};
     endfunction
 
     // Opcodes for the shift-immediate group (uses the full 6-bit shamt; for RV32
@@ -164,7 +164,7 @@ module rv_cdecode
                                         input [4:0] rd,
                                         input [2:0] f3,
                                         input       arith);  // 1 = SRAI
-        enc_shift = {1'b0, arith, 4'b0000, shamt, rs1, f3, rd, 7'b0010011};
+        enc_shift = {1'b0, arith, 4'b0000, shamt, rs1, f3, rd, OP_IMM};
     endfunction
 
     // -------------------------------------------------------------------------

@@ -1,6 +1,12 @@
 # RISC-V Linux移植ロードマップ
 
-**プロジェクト全体進捗: 65% (Phase 0完了、Phase 1完了)**
+**Phase 0 (CPU/MMU/ISA) ・ Phase 1 (SoC統合・ボード雛形) 完了。Phase 2 以降 (DDR/SBI/ブート) 未着手。**
+
+> 2026-05-31 更新: I/M/A/**F/D/C**/Zicsr/S-mode/Sv32/Sv39 実装完了。
+> コンプライアンス RV64 117/117・RV32 88/88。
+> **Linux 起動に向けた精緻なギャップ分析と優先度は `CLAUDE.md`「Linux 対応ロードマップ」**
+> **およびメモリ `linux-boot-roadmap` を参照**(最大ブロッカーはメモリ容量=BRAM 16KB→ボード DDR の
+> AXI4 接続、次いで SBI/DTB・不正命令例外・mcounteren/time CSR)。本ファイルは段階の全体像。
 
 ---
 
@@ -13,7 +19,8 @@ CPU、メモリ管理、基本的な割り込みシステムの実装。
 | **RV32I/RV64I基本命令セット** | ✅ 100% | 5段パイプラインで完全実装 |
 | **M拡張（乗算・除算）** | ✅ 100% | rv_muldiv.sv、MUL/DIV/REM対応 |
 | **A拡張（アトミック操作）** | ✅ 100% | rv_amo.sv、LR/SC/AMO* 実装 |
-| **C拡張（圧縮命令）** | ⏸ 0% | 未実装（RV32C/RV64Cの展開デコーダ） |
+| **F/D拡張（浮動小数）** | ✅ 100% | rv_fpu*.sv、RV32/RV64 とも実装（RV32D は 64-bit FLD/FSD を 2-word 化） |
+| **C拡張（圧縮命令）** | ✅ 100% | rv_cdecode.sv（RVC→RVI 展開）+ rv_core 可変長フェッチ、RV32C/RV64C |
 | **Zicsr拡張（CSR命令）** | ✅ 100% | rv_csr.sv で Machine/Supervisor CSR 完全実装 |
 | **MMU (Sv32/Sv39)** | ✅ 100% | rv_mmu.sv、TLB(16entry)、ページングフル対応 |
 | **M-mode トラップハンドリング** | ✅ 100% | mtvec/mepc/mcause/mstatus 実装 |

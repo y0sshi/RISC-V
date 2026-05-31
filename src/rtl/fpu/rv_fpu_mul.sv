@@ -91,9 +91,8 @@ module rv_fpu_mul (
     // 24-bit significand carries leading zeros and the product's leading 1 can
     // fall well below bit 46.  That demands a multi-bit left shift.
     //
-    // The leading-zero count is computed with an explicit if-else priority
-    // encoder (NOT casez: iverilog mishandles casez on wide part-selects, see
-    // rv_fpu_add_d.sv).  After shifting, the leading 1 is at bit 47:
+    // The leading-zero count is a loop-based priority encoder (scan LSB->MSB so
+    // the last/highest set bit wins).  After shifting, the leading 1 is at bit 47:
     //   prod_norm[47]   = hidden leading 1
     //   prod_norm[46:24]= fraction[22:0]
     //   prod_norm[23]   = G, [22] = R, [21:0] = sticky
@@ -102,54 +101,9 @@ module rv_fpu_mul (
     // -------------------------------------------------------------------------
     logic [5:0] prod_lzc;   // leading-zero count of prod[47:0] (0..47)
     always_comb begin
-        if      (prod[47]) prod_lzc = 6'd0;
-        else if (prod[46]) prod_lzc = 6'd1;
-        else if (prod[45]) prod_lzc = 6'd2;
-        else if (prod[44]) prod_lzc = 6'd3;
-        else if (prod[43]) prod_lzc = 6'd4;
-        else if (prod[42]) prod_lzc = 6'd5;
-        else if (prod[41]) prod_lzc = 6'd6;
-        else if (prod[40]) prod_lzc = 6'd7;
-        else if (prod[39]) prod_lzc = 6'd8;
-        else if (prod[38]) prod_lzc = 6'd9;
-        else if (prod[37]) prod_lzc = 6'd10;
-        else if (prod[36]) prod_lzc = 6'd11;
-        else if (prod[35]) prod_lzc = 6'd12;
-        else if (prod[34]) prod_lzc = 6'd13;
-        else if (prod[33]) prod_lzc = 6'd14;
-        else if (prod[32]) prod_lzc = 6'd15;
-        else if (prod[31]) prod_lzc = 6'd16;
-        else if (prod[30]) prod_lzc = 6'd17;
-        else if (prod[29]) prod_lzc = 6'd18;
-        else if (prod[28]) prod_lzc = 6'd19;
-        else if (prod[27]) prod_lzc = 6'd20;
-        else if (prod[26]) prod_lzc = 6'd21;
-        else if (prod[25]) prod_lzc = 6'd22;
-        else if (prod[24]) prod_lzc = 6'd23;
-        else if (prod[23]) prod_lzc = 6'd24;
-        else if (prod[22]) prod_lzc = 6'd25;
-        else if (prod[21]) prod_lzc = 6'd26;
-        else if (prod[20]) prod_lzc = 6'd27;
-        else if (prod[19]) prod_lzc = 6'd28;
-        else if (prod[18]) prod_lzc = 6'd29;
-        else if (prod[17]) prod_lzc = 6'd30;
-        else if (prod[16]) prod_lzc = 6'd31;
-        else if (prod[15]) prod_lzc = 6'd32;
-        else if (prod[14]) prod_lzc = 6'd33;
-        else if (prod[13]) prod_lzc = 6'd34;
-        else if (prod[12]) prod_lzc = 6'd35;
-        else if (prod[11]) prod_lzc = 6'd36;
-        else if (prod[10]) prod_lzc = 6'd37;
-        else if (prod[9])  prod_lzc = 6'd38;
-        else if (prod[8])  prod_lzc = 6'd39;
-        else if (prod[7])  prod_lzc = 6'd40;
-        else if (prod[6])  prod_lzc = 6'd41;
-        else if (prod[5])  prod_lzc = 6'd42;
-        else if (prod[4])  prod_lzc = 6'd43;
-        else if (prod[3])  prod_lzc = 6'd44;
-        else if (prod[2])  prod_lzc = 6'd45;
-        else if (prod[1])  prod_lzc = 6'd46;
-        else               prod_lzc = 6'd47;  // prod[0] or prod==0 (unreachable here)
+        prod_lzc = 6'd47;
+        for (int i = 0; i <= 47; i++)
+            if (prod[i]) prod_lzc = 6'(47 - i);   // prod[47]->0 ... prod[0]->47
     end
 
     logic [47:0] prod_norm;

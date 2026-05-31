@@ -423,6 +423,10 @@ module rv_core
     ctrl_signals_t   ex_mem_ctrl;
     logic [XLEN-1:0] ex_mem_alu_result;
     logic [XLEN-1:0] ex_mem_rs2_data;
+    // Full 64-bit FP store data (FSD).  On RV64 the normal XLEN-wide ex_mem_rs2_data
+    // already carries the whole double; on RV32 the 32-bit bus cannot, so FSD uses
+    // this to write the low word in phase 0 and the high word in phase 1.
+    logic [63:0]     ex_mem_fp_sdata;
     reg_addr_t       ex_mem_rd_addr;
     logic [XLEN-1:0] ex_mem_pc;    // PC of instruction in MEM stage (for fault mepc)
     logic [XLEN-1:0] ex_mem_pc4;
@@ -927,6 +931,7 @@ module rv_core
             ex_mem_ctrl              <= '0;
             ex_mem_alu_result        <= '0;
             ex_mem_rs2_data          <= '0;
+            ex_mem_fp_sdata          <= '0;
             ex_mem_rd_addr           <= '0;
             ex_mem_pc                <= '0;
             ex_mem_pc4               <= '0;
@@ -945,6 +950,8 @@ module rv_core
                                  : id_ex_ctrl.fp_store
                                    ? {(XLEN/32){fwd_frs2_data[31:0]}}
                                    : fwd_rs2_data;
+            // Full 64-bit FSD store data (used by the RV32 two-word store path)
+            ex_mem_fp_sdata   <= fwd_frs2_data;
             ex_mem_rd_addr    <= id_ex_rd_addr;
             ex_mem_pc         <= id_ex_pc;
             // Link / return address: PC+2 for compressed (C.JAL/C.JALR), else PC+4.
@@ -1035,15 +1042,27 @@ module rv_core
                 // Phase 0: first aligned word
                 dmem_addr = ex_mem_alu_result & WORD_MASK;
                 if (ex_mem_ctrl.mem_write) begin
-                    dmem_wstrb = mal_wstrb_wide[XLEN/8-1:0];
-                    dmem_wdata = ex_mem_rs2_data << mal_shl;
+                    if ((XLEN == 32) && ex_mem_ctrl.fp_store && ex_mem_ctrl.fp_double) begin
+                        // RV32 FSD: write the low 32-bit word of the double
+                        dmem_wstrb = {(XLEN/8){1'b1}};
+                        dmem_wdata = ex_mem_fp_sdata[XLEN-1:0];
+                    end else begin
+                        dmem_wstrb = mal_wstrb_wide[XLEN/8-1:0];
+                        dmem_wdata = ex_mem_rs2_data << mal_shl;
+                    end
                 end
             end else begin
                 // Phase 1: second aligned word
                 dmem_addr = (ex_mem_alu_result & WORD_MASK) + (XLEN)'(XLEN/8);
                 if (ex_mem_ctrl.mem_write) begin
-                    dmem_wstrb = {(XLEN/8)'(0), mal_wstrb_wide[2*(XLEN/8)-1:XLEN/8]};
-                    dmem_wdata = ex_mem_rs2_data >> mal_shr;
+                    if ((XLEN == 32) && ex_mem_ctrl.fp_store && ex_mem_ctrl.fp_double) begin
+                        // RV32 FSD: write the high 32-bit word of the double
+                        dmem_wstrb = {(XLEN/8){1'b1}};
+                        dmem_wdata = ex_mem_fp_sdata[63:32];
+                    end else begin
+                        dmem_wstrb = {(XLEN/8)'(0), mal_wstrb_wide[2*(XLEN/8)-1:XLEN/8]};
+                        dmem_wdata = ex_mem_rs2_data >> mal_shr;
+                    end
                 end
             end
         end
@@ -1087,8 +1106,18 @@ module rv_core
             mem_wb_fpu_result_f   <= ex_mem_fpu_result_f;
             mem_wb_fpu_result_i   <= ex_mem_fpu_result_i_fwd;
             mal_active_wb         <= mal_cross;
+        end else begin
+            // AMO read phase / misaligned (incl. RV32 64-bit FLD/FSD) phase 0:
+            // insert a BUBBLE rather than holding the previous WB instruction.
+            // Holding would re-write the just-retired instruction's destination a
+            // second time using the now-stale live dmem_rdata (which has changed to
+            // the new phase-0 read), corrupting it — and would double-count retire.
+            // The in-progress AMO/mal instruction is still held in EX/MEM and is
+            // captured normally when the stall drops (phase 1 / write phase).
+            mem_wb_ctrl   <= '0;
+            mem_wb_valid  <= 1'b0;
+            mal_active_wb <= 1'b0;
         end
-        // else: amo_stall or mal_stall — hold MEM/WB
     end
 
     // =========================================================================
@@ -1168,7 +1197,10 @@ module rv_core
         wb_frd_addr   = mem_wb_rd_addr;
         if (mem_wb_ctrl.fp_load) begin
             if (mem_wb_ctrl.fp_double)
-                wb_freg_data = dmem_shifted[63:0];              // FLD: 64-bit
+                // FLD: 64-bit.  RV64 gets the whole double in one access (dmem_shifted).
+                // RV32 (and any boundary-crossing case) assembles it from the two
+                // word reads combined in mal_wide[63:0] (phase-0 low | phase-1 high).
+                wb_freg_data = mal_active_wb ? mal_wide[63:0] : dmem_shifted[63:0];
             else
                 wb_freg_data = {32'hFFFFFFFF, dmem_shifted[31:0]};  // FLW: NaN-boxed
         end else begin

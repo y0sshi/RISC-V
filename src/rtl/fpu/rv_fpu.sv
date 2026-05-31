@@ -109,14 +109,10 @@ module rv_fpu
     logic [31:0] fma_add_result;
     logic [4:0]  fma_add_fflags;
 
-    // fpu_op as plain logic to avoid iverilog enum sensitivity bugs in always_comb/port exprs
-    logic [4:0] fpu_op_bits;
-    assign fpu_op_bits = fpu_op;
-
-    // Explicit is_sub signals to ensure sensitivity tracking (iverilog port expr limitation)
+    // Named is_sub wires for the add sub-units (FADD vs FSUB select)
     logic add_is_sub, add_d_is_sub;
-    assign add_is_sub   = (fpu_op_bits == 5'd1);  // FPU_SUB
-    assign add_d_is_sub = (fpu_op_bits == 5'd1);
+    assign add_is_sub   = (fpu_op == FPU_SUB);
+    assign add_d_is_sub = (fpu_op == FPU_SUB);
 
     rv_fpu_add u_add (
         .a      (fa_s),
@@ -136,12 +132,12 @@ module rv_fpu
     );
 
     always @(*) begin
-        case (fpu_op_bits)
-            5'd13: begin fma_add_a = mul_result;                               fma_add_b = fc_s; fma_add_is_sub = 1'b0; end  // FPU_MADD
-            5'd14: begin fma_add_a = mul_result;                               fma_add_b = fc_s; fma_add_is_sub = 1'b1; end  // FPU_MSUB
-            5'd15: begin fma_add_a = {!mul_result[31], mul_result[30:0]};      fma_add_b = fc_s; fma_add_is_sub = 1'b0; end  // FPU_NMSUB
-            5'd16: begin fma_add_a = {!mul_result[31], mul_result[30:0]};      fma_add_b = fc_s; fma_add_is_sub = 1'b1; end  // FPU_NMADD
-            default: begin fma_add_a = mul_result; fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
+        case (fpu_op)
+            FPU_MADD:  begin fma_add_a = mul_result;                          fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
+            FPU_MSUB:  begin fma_add_a = mul_result;                          fma_add_b = fc_s; fma_add_is_sub = 1'b1; end
+            FPU_NMSUB: begin fma_add_a = {!mul_result[31], mul_result[30:0]}; fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
+            FPU_NMADD: begin fma_add_a = {!mul_result[31], mul_result[30:0]}; fma_add_b = fc_s; fma_add_is_sub = 1'b1; end
+            default:   begin fma_add_a = mul_result;                          fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
         endcase
     end
 
@@ -160,7 +156,7 @@ module rv_fpu
         .a            (fa_s),
         .b            (fb_s),
         .rm           (rm),
-        .valid_in     (valid_in && !fp_double && (fpu_op_bits == 5'd3)),  // FPU_DIV
+        .valid_in     (valid_in && !fp_double && (fpu_op == FPU_DIV)),
         .result       (div_result),
         .fflags       (div_fflags),
         .result_valid (div_result_valid),
@@ -172,7 +168,7 @@ module rv_fpu
         .rst_n        (rst_n),
         .a            (fa_s),
         .rm           (rm),
-        .valid_in     (valid_in && !fp_double && (fpu_op_bits == 5'd4)),  // FPU_SQRT
+        .valid_in     (valid_in && !fp_double && (fpu_op == FPU_SQRT)),
         .result       (sqrt_result),
         .fflags       (sqrt_fflags),
         .result_valid (sqrt_result_valid),
@@ -246,12 +242,12 @@ module rv_fpu
     );
 
     always @(*) begin
-        case (fpu_op_bits)
-            5'd13: begin fma_d_add_a = mul_d_result;                               fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end  // FPU_MADD
-            5'd14: begin fma_d_add_a = mul_d_result;                               fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end  // FPU_MSUB
-            5'd15: begin fma_d_add_a = {!mul_d_result[63], mul_d_result[62:0]};    fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end  // FPU_NMSUB
-            5'd16: begin fma_d_add_a = {!mul_d_result[63], mul_d_result[62:0]};    fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end  // FPU_NMADD
-            default: begin fma_d_add_a = mul_d_result; fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
+        case (fpu_op)
+            FPU_MADD:  begin fma_d_add_a = mul_d_result;                            fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
+            FPU_MSUB:  begin fma_d_add_a = mul_d_result;                            fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end
+            FPU_NMSUB: begin fma_d_add_a = {!mul_d_result[63], mul_d_result[62:0]}; fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
+            FPU_NMADD: begin fma_d_add_a = {!mul_d_result[63], mul_d_result[62:0]}; fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end
+            default:   begin fma_d_add_a = mul_d_result;                            fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
         endcase
     end
 
@@ -270,7 +266,7 @@ module rv_fpu
         .a            (fa),
         .b            (fb),
         .rm           (rm),
-        .valid_in     (valid_in && fp_double && (fpu_op_bits == 5'd3)),  // FPU_DIV
+        .valid_in     (valid_in && fp_double && (fpu_op == FPU_DIV)),
         .result       (div_d_result),
         .fflags       (div_d_fflags),
         .result_valid (div_d_result_valid),
@@ -282,7 +278,7 @@ module rv_fpu
         .rst_n        (rst_n),
         .a            (fa),
         .rm           (rm),
-        .valid_in     (valid_in && fp_double && (fpu_op_bits == 5'd4)),  // FPU_SQRT
+        .valid_in     (valid_in && fp_double && (fpu_op == FPU_SQRT)),
         .result       (sqrt_d_result),
         .fflags       (sqrt_d_fflags),
         .result_valid (sqrt_d_result_valid),
@@ -307,10 +303,9 @@ module rv_fpu
     assign fpu_busy     = div_busy | sqrt_busy | div_d_busy | sqrt_d_busy;
     assign result_valid = div_result_valid | sqrt_result_valid |
                           div_d_result_valid | sqrt_d_result_valid |
-                          (valid_in && fpu_op_bits != 5'd3 && fpu_op_bits != 5'd4);
+                          (valid_in && fpu_op != FPU_DIV && fpu_op != FPU_SQRT);
 
-    // Module-level intermediates for single-precision path (avoid iverilog
-    // sensitivity-list issues with local variable declarations inside always_comb)
+    // Single-precision result/flags mux
     logic [31:0] sp_result_f;
     logic [4:0]  sp_fflags;
     logic        sp_to_int;  // 1 = result_i output, 0 = result_f output
@@ -320,24 +315,24 @@ module rv_fpu
         sp_fflags   = 5'h0;
         sp_to_int   = 1'b0;
 
-        case (fpu_op_bits)
-            5'd0, 5'd1: begin sp_result_f = add_result;  sp_fflags = add_fflags;  end  // FPU_ADD, FPU_SUB
-            5'd2:        begin sp_result_f = mul_result;  sp_fflags = mul_fflags;  end  // FPU_MUL
-            5'd3:        begin sp_result_f = div_result;  sp_fflags = div_fflags;  end  // FPU_DIV
-            5'd4:        begin sp_result_f = sqrt_result; sp_fflags = sqrt_fflags; end  // FPU_SQRT
-            5'd13, 5'd14, 5'd15, 5'd16: begin                                          // FMADD family
+        case (fpu_op)
+            FPU_ADD, FPU_SUB: begin sp_result_f = add_result;  sp_fflags = add_fflags;  end
+            FPU_MUL:          begin sp_result_f = mul_result;  sp_fflags = mul_fflags;  end
+            FPU_DIV:          begin sp_result_f = div_result;  sp_fflags = div_fflags;  end
+            FPU_SQRT:         begin sp_result_f = sqrt_result; sp_fflags = sqrt_fflags; end
+            FPU_MADD, FPU_MSUB, FPU_NMSUB, FPU_NMADD: begin
                 sp_result_f = fma_add_result;
                 sp_fflags   = mul_fflags | fma_add_fflags;
             end
-            5'd5, 5'd6: begin                                                          // FPU_SGNJ, FPU_MINMAX
+            FPU_SGNJ, FPU_MINMAX: begin
                 sp_result_f = misc_result_f;
                 sp_fflags   = misc_fflags;
             end
-            5'd7, 5'd12, 5'd10, 5'd8: begin                                           // FPU_CMP, CLASS, MVXW, CVTWS
+            FPU_CMP, FPU_CLASS, FPU_MVXW, FPU_CVTWS: begin
                 sp_to_int   = 1'b1;
                 sp_fflags   = misc_fflags;
             end
-            5'd11, 5'd9: begin                                                         // FPU_MVWX, FPU_CVTSW
+            FPU_MVWX, FPU_CVTSW: begin
                 sp_result_f = misc_result_f;
                 sp_fflags   = misc_fflags;
             end
@@ -355,7 +350,7 @@ module rv_fpu
             if (sp_to_int) begin
                 // FMV.X.W transfers the raw low 32 bits (not the NaN-box-checked
                 // fa_s); all other int-producing ops use the misc result.
-                if (fpu_op_bits == 5'd10)  // FPU_MVXW
+                if (fpu_op == FPU_MVXW)
                     result_i = {{(XLEN-32){fa[31]}}, fa[31:0]};
                 else
                     result_i = misc_result_i;
@@ -366,7 +361,7 @@ module rv_fpu
 
         end else begin
             // Double-precision path
-            case (fpu_op_bits)
+            case (fpu_op)
                 FPU_ADD, FPU_SUB: begin
                     result_f = add_d_result;
                     fflags   = add_d_fflags;

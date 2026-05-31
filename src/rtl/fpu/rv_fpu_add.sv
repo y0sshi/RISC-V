@@ -106,7 +106,7 @@ module rv_fpu_add (
     logic [26:0] ms_ext;
     logic [26:0] sig_s_shifted;
     logic        sticky_shift;
-    logic [8:0]  raw_diff;   // module-level (iverilog: no local vars in always_comb)
+    logic [8:0]  raw_diff;   // exponent difference (pre-clamp)
 
     always_comb begin
         raw_diff = el - es;
@@ -152,43 +152,21 @@ module rv_fpu_add (
     // -------------------------------------------------------------------------
     // Normalize
     // -------------------------------------------------------------------------
-    // Leading-zero count of sum[26:3] (24-bit mantissa when no overflow)
+    // Leading-zero count of sum[26:3] (24-bit mantissa when no overflow).
+    // Loop-based priority encoder: scan LSB->MSB so the last (highest) set bit
+    // wins (last-write-wins), giving the leading-zero count; all-zero -> 24.
     logic [4:0] lzc;
     always_comb begin
-        casex (sum[26:3])
-            24'b1???????????????????????: lzc = 5'd0;
-            24'b01??????????????????????: lzc = 5'd1;
-            24'b001?????????????????????: lzc = 5'd2;
-            24'b0001????????????????????: lzc = 5'd3;
-            24'b00001???????????????????: lzc = 5'd4;
-            24'b000001??????????????????: lzc = 5'd5;
-            24'b0000001?????????????????: lzc = 5'd6;
-            24'b00000001????????????????: lzc = 5'd7;
-            24'b000000001???????????????: lzc = 5'd8;
-            24'b0000000001??????????????: lzc = 5'd9;
-            24'b00000000001?????????????: lzc = 5'd10;
-            24'b000000000001????????????: lzc = 5'd11;
-            24'b0000000000001???????????: lzc = 5'd12;
-            24'b00000000000001??????????: lzc = 5'd13;
-            24'b000000000000001?????????: lzc = 5'd14;
-            24'b0000000000000001????????: lzc = 5'd15;
-            24'b00000000000000001???????: lzc = 5'd16;
-            24'b000000000000000001??????: lzc = 5'd17;
-            24'b0000000000000000001?????: lzc = 5'd18;
-            24'b00000000000000000001????: lzc = 5'd19;
-            24'b000000000000000000001???: lzc = 5'd20;
-            24'b0000000000000000000001??: lzc = 5'd21;
-            24'b00000000000000000000001?: lzc = 5'd22;
-            24'b000000000000000000000001: lzc = 5'd23;
-            default:                      lzc = 5'd24;  // all zeros
-        endcase
+        lzc = 5'd24;
+        for (int i = 0; i <= 23; i++)
+            if (sum[3 + i]) lzc = 5'(23 - i);   // sum[26]->0 ... sum[3]->23
     end
 
     // After normalization: norm_sig[26:3]=mantissa, norm_sig[2:0]=GRS
     logic [8:0]  norm_exp;
     logic [26:0] norm_sig;
     logic        is_exact_zero;
-    logic [4:0]  shift_amt;   // module-level (iverilog: no local vars in always_comb)
+    logic [4:0]  shift_amt;   // normalization left-shift amount
 
     always_comb begin
         norm_exp       = el;

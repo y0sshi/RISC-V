@@ -233,7 +233,10 @@ riscv-tests: riscv-tests-build riscv-tests-run
 #   make riscv-tests-run32            # run default RV32 user groups
 #   make riscv-tests-run32 GROUPS32="rv32uc-p"   # run a single group
 # =============================================================================
-GROUPS32 ?= rv32ui-p rv32um-p rv32ua-p rv32uc-p
+# RV32 user-mode groups that are fully implemented and pass.
+# NOT included (known gaps, see CLAUDE.md):
+#   rv32mi  - machine-mode corner cases (illegal-instruction trap, PMP, etc. unimplemented)
+GROUPS32 ?= rv32ui-p rv32um-p rv32ua-p rv32uf-p rv32ud-p rv32uc-p rv32si-p
 
 riscv-tests-build32:
 	$(DOCKER_RUN) bash -c '\

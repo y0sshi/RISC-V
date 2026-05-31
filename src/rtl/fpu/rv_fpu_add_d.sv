@@ -27,8 +27,8 @@ module rv_fpu_add_d (
 
     localparam logic [63:0] CANONICAL_NAN = 64'h7FF8000000000000;
 
-    // All intermediates declared at module level (iverilog: no local decls in
-    // always blocks for some constructs).  Driven inside one always_comb.
+    // All intermediates are driven and consumed inside the single always_comb
+    // below; declared at module level for waveform visibility.
     logic        sa, sb;
     logic [10:0] ea, eb;
     logic [51:0] fra, frb;
@@ -122,64 +122,11 @@ module rv_fpu_add_d (
             sum = {1'b0, sig_l} - {1'b0, sig_s_shifted};
         sum_sign = sl;
 
-        // ---- Leading-zero count of sum[55:3] (priority encoder) ----
-        // Use an explicit priority if-else (not casez) — iverilog miscomputed the
-        // casez result for a 53-bit part-select of a 57-bit reg, returning lzc=0
-        // for inputs whose MSB was 0 (e.g. 2.5-1.0).
-        if      (sum[55]) lzc = 6'd0;
-        else if (sum[54]) lzc = 6'd1;
-        else if (sum[53]) lzc = 6'd2;
-        else if (sum[52]) lzc = 6'd3;
-        else if (sum[51]) lzc = 6'd4;
-        else if (sum[50]) lzc = 6'd5;
-        else if (sum[49]) lzc = 6'd6;
-        else if (sum[48]) lzc = 6'd7;
-        else if (sum[47]) lzc = 6'd8;
-        else if (sum[46]) lzc = 6'd9;
-        else if (sum[45]) lzc = 6'd10;
-        else if (sum[44]) lzc = 6'd11;
-        else if (sum[43]) lzc = 6'd12;
-        else if (sum[42]) lzc = 6'd13;
-        else if (sum[41]) lzc = 6'd14;
-        else if (sum[40]) lzc = 6'd15;
-        else if (sum[39]) lzc = 6'd16;
-        else if (sum[38]) lzc = 6'd17;
-        else if (sum[37]) lzc = 6'd18;
-        else if (sum[36]) lzc = 6'd19;
-        else if (sum[35]) lzc = 6'd20;
-        else if (sum[34]) lzc = 6'd21;
-        else if (sum[33]) lzc = 6'd22;
-        else if (sum[32]) lzc = 6'd23;
-        else if (sum[31]) lzc = 6'd24;
-        else if (sum[30]) lzc = 6'd25;
-        else if (sum[29]) lzc = 6'd26;
-        else if (sum[28]) lzc = 6'd27;
-        else if (sum[27]) lzc = 6'd28;
-        else if (sum[26]) lzc = 6'd29;
-        else if (sum[25]) lzc = 6'd30;
-        else if (sum[24]) lzc = 6'd31;
-        else if (sum[23]) lzc = 6'd32;
-        else if (sum[22]) lzc = 6'd33;
-        else if (sum[21]) lzc = 6'd34;
-        else if (sum[20]) lzc = 6'd35;
-        else if (sum[19]) lzc = 6'd36;
-        else if (sum[18]) lzc = 6'd37;
-        else if (sum[17]) lzc = 6'd38;
-        else if (sum[16]) lzc = 6'd39;
-        else if (sum[15]) lzc = 6'd40;
-        else if (sum[14]) lzc = 6'd41;
-        else if (sum[13]) lzc = 6'd42;
-        else if (sum[12]) lzc = 6'd43;
-        else if (sum[11]) lzc = 6'd44;
-        else if (sum[10]) lzc = 6'd45;
-        else if (sum[9])  lzc = 6'd46;
-        else if (sum[8])  lzc = 6'd47;
-        else if (sum[7])  lzc = 6'd48;
-        else if (sum[6])  lzc = 6'd49;
-        else if (sum[5])  lzc = 6'd50;
-        else if (sum[4])  lzc = 6'd51;
-        else if (sum[3])  lzc = 6'd52;
-        else              lzc = 6'd53;
+        // ---- Leading-zero count of sum[55:3] (loop-based priority encoder) ----
+        // Scan LSB->MSB so the last (highest) set bit wins; all-zero -> 53.
+        lzc = 6'd53;
+        for (int i = 0; i <= 52; i++)
+            if (sum[3 + i]) lzc = 6'(52 - i);   // sum[55]->0 ... sum[3]->52
 
         // ---- Normalize ----
         norm_exp      = el;

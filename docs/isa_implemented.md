@@ -1,8 +1,14 @@
 # ISA Implementation Status
 
-> Last updated: 2026-05-22  
-> Reflects the actual RTL state (rv_decode.sv, rv_alu.sv, rv_core.sv, rv_csr.sv, rv_muldiv.sv, rv_amo.sv, rv_mmu.sv).  
-> The older `isa_progress.md` is superseded by this file.
+> Last updated: 2026-05-31.
+> **Canonical, always-current status is in `CLAUDE.md` (root).** This file keeps the
+> detailed per-instruction tables for the base/M/A/Zicsr/privilege parts.
+>
+> Since 2026-05-22 the following were added and are now fully implemented (see CLAUDE.md
+> for detail): **F / D extensions (RV32 & RV64)** via `rv_fpu*` + `rv_fregfile`, and the
+> **C extension (RV32C / RV64C)** via `rv_cdecode` + variable-length fetch in `rv_core`.
+>
+> Compliance (riscv-tests p-variants): **RV64 117/117**, **RV32 88/88**.
 
 ---
 
@@ -233,13 +239,14 @@ W-type (32-bit) and D-type (XLEN-bit) variants both supported via `funct3` in `r
 
 | Feature | Notes |
 |---------|-------|
-| C extension (compressed) | 16-bit instruction decoding not started |
-| F/D extensions (float) | Not planned |
+| Illegal-instruction trap | Not generated (unknown ops decode as NOP); rv64mi/rv32mi `illegal` FAIL |
+| Physical Memory Protection (PMP) | Not implemented; rv64mi/rv32mi `pmp` FAIL |
 | mtvec vectored mode | Stored but trap always goes to base address |
-| CLINT memory-mapped mtime/mtimecmp | External `timer_irq` input used instead |
-| PLIC integration into core IRQ | Connected at SoC level via `ext_irq` |
-| Physical Memory Protection (PMP) | Not implemented |
+| CLINT memory-mapped mtime/mtimecmp -> `time` CSR (U/S) | `timer_irq` input used; `time`/`mcounteren` not wired (needed for Linux `rdtime`) |
+| V (vector) extension | Not implemented |
 | Debug (JTAG/DMI) | Not implemented |
+
+(C and F/D are now implemented — removed from this list. See header / CLAUDE.md.)
 
 ---
 

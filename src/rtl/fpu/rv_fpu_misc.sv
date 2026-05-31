@@ -119,7 +119,7 @@ module rv_fpu_misc
     // Uses unified 64-bit magnitude path; W/WU zero-extend to 64 bits.
     // biased_exp = 127 + 63 - csw_lz (same formula for both widths since
     // W/WU have zeros in the upper 32 bits, making csw_lz >= 32).
-    // All intermediates at module level (iverilog restriction).
+    // All intermediates at module level (shared across the comb blocks below).
     // -------------------------------------------------------------------------
     logic        cvt_sw_sign;
     logic [64:0] cvt_sw_mag;

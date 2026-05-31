@@ -115,7 +115,7 @@ module rv_fpu_div (
     logic        sr_reg;
     logic [9:0]  exp_result_reg;
 
-    // Temporaries (module-level to avoid iverilog local-decl restrictions)
+    // Combinational temporaries (module-level for waveform visibility)
     logic [9:0]  t_ea_e, t_eb_e;
     logic [10:0] t_er;
     logic [25:0] t_trial;
