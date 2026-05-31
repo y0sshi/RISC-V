@@ -107,9 +107,9 @@ module tb_rv_act;
         rst_n = 1;
     end
 
-    // Simulation timeout
+    // Simulation timeout (generous: arch-test suites run many cases per test)
     initial begin
-        #10_000_000;
+        #200_000_000;
         $display("TIMEOUT");
         $finish;
     end
