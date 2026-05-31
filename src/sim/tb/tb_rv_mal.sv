@@ -104,6 +104,7 @@ module tb_rv_mal;
         .tlb_flush_out   (tlb_flush_out),
         .mmu_stall       (1'b0),
         .mem_stall       (1'b0),
+        .dmem_wait       (1'b0),
         .if_fault        (1'b0),
         .mem_fault       (1'b0),
         .timer_irq       (1'b0),

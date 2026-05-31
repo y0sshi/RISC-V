@@ -13,6 +13,7 @@ build/
 *.str
 *.xpr
 *.runs/
+*.gen/
 *.cache/
 *.hw/
 *.ip_user_files/
@@ -22,6 +23,8 @@ vivado_*.backup*
 *.bit
 *.ltx
 *.dcp
+# Scripted Vivado project output dirs (boards/<board>/vivado/rv_riscv_*)
+boards/**/vivado/rv_riscv_*/
 
 # =============================================================================
 # Simulation

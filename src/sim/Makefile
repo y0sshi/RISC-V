@@ -77,6 +77,7 @@ MEM_DIR   = $(RTL_DIR)/memory
 SOC_DIR   = $(RTL_DIR)/soc
 PERI_DIR  = $(RTL_DIR)/peripherals
 FPU_DIR   = $(RTL_DIR)/fpu
+BUS_DIR   = $(RTL_DIR)/bus
 TB_DIR    = tb
 
 # Output directory
@@ -153,7 +154,7 @@ TIMER_SRC = $(CSR_SRC)
             sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
             sim_uart sim_gpio sim_plic sim_core sim_soc sim_bm \
             sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal \
-            sim_cdecode sim_cdecode64 \
+            sim_cdecode sim_cdecode64 sim_axi sim_axi_core sim_axi_soc \
             wave_alu wave_csr wave_rv64i wave_mext wave_mext64 wave_amo wave_amo64 \
             wave_cdecode \
             wave_mmu wave_mmu64 wave_sv wave_sv64 wave_timer wave_timer64 \
@@ -458,6 +459,57 @@ sim_mal: dirs
 
 wave_mal: sim_mal
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_mal.vcd &
+
+# --- AXI4 bridge unit testbench (simple-bus <-> AXI4 master + slave BFM) ---
+# Validates rv_axi_bridge protocol conversion under variable memory latency.
+AXI_BRIDGE_SRC = $(BUS_DIR)/rv_axi_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv
+
+sim_axi: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_axi_bridge.vvp \
+		$(AXI_BRIDGE_SRC) $(TB_DIR)/tb_rv_axi_bridge.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_axi_bridge.vvp
+
+wave_axi: sim_axi
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_axi_bridge.vcd &
+
+# --- rv_core data port over AXI (variable latency) integration testbench ---
+# Runs the proven pipeline test programs with the DATA port routed through
+# rv_axi_bridge + rv_axi_slave_bfm at randomized latency (IF stays behavioral).
+AXI_CORE_SRC = $(CORE_SRC) $(BUS_DIR)/rv_axi_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv
+
+sim_axi_core: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_axi_core.vvp \
+		$(AXI_CORE_SRC) $(TB_DIR)/tb_rv_axi_core.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_axi_core.vvp
+
+wave_axi_core: sim_axi_core
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_axi_core.vcd &
+
+# --- rv_soc AXI_MODE integration testbench (data path over AXI -> DDR model) ---
+AXI_SOC_SRC = $(CORE_SRC) \
+              $(MEM_DIR)/rv_unified_mem.sv \
+              $(BUS_DIR)/rv_axi_bridge.sv \
+              $(SOC_DIR)/rv_soc.sv \
+              $(TB_DIR)/rv_axi_slave_bfm.sv
+
+sim_axi_soc: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DAXI_MODE -o $(OUT_DIR)/tb_rv_axi_soc.vvp \
+		$(AXI_SOC_SRC) $(TB_DIR)/tb_rv_axi_soc.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_axi_soc.vvp
+
+wave_axi_soc: sim_axi_soc
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_axi_soc.vcd &
+
+# --- rv_core instruction port over AXI (variable latency) integration TB ---
+AXI_IF_SRC = $(CORE_SRC) $(BUS_DIR)/rv_axi_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv
+
+sim_axi_ifetch: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_axi_ifetch.vvp \
+		$(AXI_IF_SRC) $(TB_DIR)/tb_rv_axi_ifetch.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_axi_ifetch.vvp
+
+wave_axi_ifetch: sim_axi_ifetch
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_axi_ifetch.vcd &
 
 # =============================================================================
 # riscv-arch-test / riscv-tests runner target

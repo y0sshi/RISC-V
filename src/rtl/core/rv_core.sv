@@ -68,6 +68,13 @@ module rv_core
     input  wire              mmu_stall,   // IF/ID stall (any translation pending)
     input  wire              mem_stall,   // EX/MEM stall (MEM-port translation pending)
 
+    // Data-memory wait input (from an external variable-latency memory, e.g. the
+    // AXI4 bridge to DDR).  High while a MEM-stage load/store/AMO/PTW-independent
+    // data access is still in flight; drops on the cycle the access completes.
+    // Tie to 1'b0 for the zero-latency BRAM path -- then every term below that
+    // references it reduces to its original form (provably a no-op).
+    input  wire              dmem_wait,
+
     // MMU fault inputs (from rv_mmu, when TLB hit but permission denied)
     input  wire              if_fault,    // instruction page fault
     input  wire              mem_fault,   // load/store page fault
@@ -131,6 +138,7 @@ module rv_core
     logic flush_id;      // clear IF/ID   -> insert bubble into ID
     logic flush_ex;      // clear ID/EX   -> insert bubble into EX
     logic flush_ex_mem;  // clear EX/MEM  -> discard trap-interrupted instruction
+    logic redir_eff;     // effective redirect (immediate|pending); driven in IF stage
 
     // amo_stall: holds the whole pipeline while AMO executes its read phase.
     // Declared here; driven after AMO state logic below.
@@ -170,26 +178,45 @@ module rv_core
 
     // redirect_stall holds IF/ID only (not EX) so the redirecting branch/trap can
     // still complete; it must NOT be added to stall_ex.
-    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall | redirect_stall;
-    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall | redirect_stall;
+    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall | redirect_stall | dmem_wait;
+    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall | redirect_stall | dmem_wait;
     // mem_stall freezes EX/MEM: a load/store in MEM whose data translation is
     // still pending must remain in MEM (re-issuing its access) until the TLB is
     // filled.  Without this the access leaves MEM unwritten.  Note: IF-port PTW
     // (mmu_stall) must NOT freeze EX/MEM, or it would stall a branch/MRET/trap
     // resolving in EX and corrupt control flow.
-    assign stall_ex = amo_stall | fpu_busy_int | mal_stall | mem_stall;
+    //
+    // ~imem_ready (a multi-cycle IF fetch in progress) FREEZES the whole pipeline:
+    // EX/MEM and MEM/WB (below) hold, so a held instruction is not re-committed
+    // (no duplication) and forwarding state is preserved across the fetch.  The
+    // EX-stage redirect is latched (redir_pend) and applied when the fetch
+    // completes.  Unlike mmu_stall, the IF fetch uses its OWN AXI master, so
+    // freezing EX/MEM does not conflict with the data port.  NO-OP for a 1-cycle
+    // IF (imem_ready=1 every cycle): ~imem_ready=0.
+    assign stall_ex = amo_stall | fpu_busy_int | mal_stall | mem_stall | dmem_wait | ~imem_ready;
     // Traps/MRET flush the same stages as branch (instructions after the trap insn).
     // With the variable-length fetch (see IF stage), the redirect target address is
     // presented to IMEM combinationally on the cycle the redirect resolves, so the
     // very next cycle already delivers the correct target instruction.  Only the
     // single in-flight (wrong-path) fetch needs to be discarded, hence a 1-cycle
     // flush_id (no redirect_q needed as in the old fixed-+4 / late-PC design).
-    assign flush_id    = branch_taken_ex | trap_or_mret;
+    // flush_id = effective redirect (immediate OR latched-pending).  Pending keeps
+    // IF/ID flushed so a wrong-path fetch that completes during the pending window
+    // is discarded.  Equals (branch_taken_ex | trap_or_mret) when no pending
+    // (1-cycle IF).  redir_eff is declared in the IF stage below (module-scope
+    // wire forward reference).
+    // Flushes only take effect on a cycle the pipeline actually advances
+    // (imem_ready); during a multi-cycle IF fetch everything is frozen and the
+    // resolution (branch/trap commit + wrong-path kill) is deferred to the
+    // completion cycle.  NO-OP for a 1-cycle IF (imem_ready=1 -> & 1).
+    assign flush_id    = redir_eff & imem_ready;
     // Suppress load-use bubble injection when stall_ex=1: the load can't
     // advance to EX/MEM while the pipeline is frozen, so keep it in ID/EX
     // (stall_id holds it there) rather than flushing it.  The bubble will be
-    // injected naturally on the cycle when stall_ex drops to 0.
-    assign flush_ex    = (load_use_hazard && !stall_ex) | branch_taken_ex | trap_or_mret;
+    // injected naturally on the cycle when stall_ex drops to 0.  redir_eff (vs
+    // raw branch_taken_ex) also bubbles ID/EX through a latched-redirect pending
+    // window so a wrong-path fetch cannot leak into EX.
+    assign flush_ex    = ((load_use_hazard && !stall_ex) | redir_eff) & imem_ready;
     // EX/MEM must NOT be flushed for branch or load-use:
     //   - branch in EX: EX/MEM holds the instruction before the branch (already
     //     committed to EX; it must reach MEM/WB).  JAL's rd writeback also lives
@@ -197,7 +224,7 @@ module rv_core
     //   - load-use in EX: the load itself must proceed to MEM so dmem is accessed.
     // Only flush EX/MEM for traps/MRET to prevent the interrupted instruction
     // from spuriously writing its destination register.
-    assign flush_ex_mem = trap_or_mret;
+    assign flush_ex_mem = trap_or_mret & imem_ready;
 
     // =========================================================================
     // Stage 1: Instruction Fetch (IF) — variable-length (C-extension capable)
@@ -232,24 +259,60 @@ module rv_core
     wire             if_is_compressed = (imem_rdata[1:0] != 2'b11);
     wire [XLEN-1:0]  seq_pc           = fetch_pc + (if_is_compressed ? XLEN'(2) : XLEN'(4));
 
-    // Next IMEM address (combinational).  Priority:
-    //   trap / page-fault > MRET > SRET > taken branch (only when not stalled)
-    //   > stall hold (re-present current PC) > sequential next PC.
+    // ---- Redirect request (this cycle), priority order ----------------------
+    logic            redir_req;
+    logic [XLEN-1:0] redir_tgt;
     always_comb begin
-        if (ex_trap_enter || mem_trap_enter)      imem_addr = trap_vector;   // taken even during stall_if
-        else if (ex_mret_en)                      imem_addr = mepc_out;
-        else if (ex_sret_en)                      imem_addr = sepc_out;
-        else if (branch_taken_ex && !stall_if)    imem_addr = branch_target_ex;
-        else if (stall_if)                        imem_addr = fetch_pc;      // hold / re-fetch
-        else                                      imem_addr = seq_pc;
+        redir_req = 1'b1;
+        if      (ex_trap_enter || mem_trap_enter) redir_tgt = trap_vector;
+        else if (ex_mret_en)                      redir_tgt = mepc_out;
+        else if (ex_sret_en)                      redir_tgt = sepc_out;
+        else if (branch_taken_ex)                 redir_tgt = branch_target_ex;
+        else begin redir_req = 1'b0; redir_tgt = '0; end
     end
 
-    // fetch_pc tracks whatever address we present to IMEM (1-cycle read latency).
-    // Stall holding is already encoded in imem_addr (= fetch_pc), so this is an
-    // unconditional capture.
+    // ---- Latched pending redirect -------------------------------------------
+    // A redirect resolved in EX must change the fetch stream, but with a
+    // multi-cycle IF (AXI/DDR) the fetch slot may be busy (~imem_ready) on the
+    // cycle the branch/trap resolves -- and the branch is flushed out of EX the
+    // next edge (flush_ex), so its redirect would be lost.  Latch the target and
+    // apply it at the next fetch boundary (imem_ready).  For a 1-cycle IF
+    // (imem_ready every cycle) the pending bit never sets, so behaviour is
+    // unchanged: the redirect is applied immediately, exactly as before.
+    logic            redir_pend_q;
+    logic [XLEN-1:0] redir_pend_tgt_q;
+    assign           redir_eff     = redir_req | redir_pend_q;  // (declared above)
+    wire [XLEN-1:0]  redir_eff_tgt = redir_req ? redir_tgt : redir_pend_tgt_q;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            redir_pend_q     <= 1'b0;
+            redir_pend_tgt_q <= '0;
+        end else begin
+            if (redir_req) redir_pend_tgt_q <= redir_tgt;     // remember newest target
+            if (imem_ready && redir_eff) redir_pend_q <= 1'b0; // consumed (fetch_pc<=target)
+            else if (redir_req)          redir_pend_q <= 1'b1; // pending until consumed
+        end
+    end
+
+    // Next IMEM address (combinational).  An effective redirect (immediate or
+    // pending) is presented first; otherwise hold the in-flight PC while a fetch
+    // is outstanding (stall_if); otherwise the sequential next PC.
+    always_comb begin
+        if      (redir_eff)  imem_addr = redir_eff_tgt;
+        else if (stall_if)   imem_addr = fetch_pc;   // hold / re-fetch in-flight PC
+        else                 imem_addr = seq_pc;
+    end
+
+    // fetch_pc = PC of the in-flight fetch (held stable during the transaction so
+    // the AXI bridge fetches a consistent address and if_id_pc tags it correctly).
+    // It advances only at a fetch boundary (imem_ready), to the redirect target,
+    // the next sequential PC, or holds when the front end can't accept yet.
+    // For a 1-cycle IF (imem_ready=1 every cycle) this reduces to the original
+    // "fetch_pc <= imem_addr" capture.
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) fetch_pc <= RST_ADDR[XLEN-1:0];
-        else        fetch_pc <= imem_addr;
+        else if (imem_ready) fetch_pc <= imem_addr;
     end
 
     assign imem_req = 1'b1;
@@ -650,7 +713,9 @@ module rv_core
             amo_state         <= 1'b0;
             reservation_valid <= 1'b0;
             reservation_addr  <= '0;
-        end else begin
+        end else if (!dmem_wait) begin
+            // dmem_wait holds the AMO FSM so a phase advances only once its
+            // data access has actually completed (no-op when dmem_wait==0).
             // AMO 2-phase: toggle state on active AMO
             if (amo_active && !amo_state)
                 amo_state <= 1'b1;   // phase 0 → phase 1
@@ -695,18 +760,35 @@ module rv_core
                          && (mal_last_byte >= 4'(XLEN/8));
     assign mal_stall = mal_cross && !mal_state;
 
+    // mal_phase1_start: first cycle of phase 1 (mal_state just went 0->1).  On
+    // this cycle dmem_rdata holds the PHASE-0 (first word) read result -- for a
+    // 1-cycle memory it is valid the cycle after the phase-0 issue (== now), and
+    // for the AXI bridge rdata_q holds it until the phase-1 read completes.  The
+    // phase-0 result is captured here, OUTSIDE the dmem_wait guard, so the AXI
+    // case (dmem_wait high during the in-flight phase-1 read) still latches it.
+    // NO-OP timing-equivalent for a 1-cycle memory (phase 1 is a single cycle).
+    logic mal_state_prev;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) mal_state_prev <= 1'b0;
+        else        mal_state_prev <= mal_state;
+    end
+    wire mal_phase1_start = mal_state && !mal_state_prev;
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush_ex_mem) begin
             mal_state      <= 1'b0;
             mal_first_data <= '0;
         end else begin
-            if (mal_cross && !mal_state)
-                mal_state <= 1'b1;   // phase 0 -> phase 1
-            else
-                mal_state <= 1'b0;   // phase 1 -> idle
-
-            // Save first read result when advancing out of phase 1
-            if (mal_cross && mal_state && ex_mem_ctrl.mem_read)
+            // State advances only when the current phase's data access has
+            // completed (held by dmem_wait under variable latency; no-op when 0).
+            if (!dmem_wait) begin
+                if (mal_cross && !mal_state)
+                    mal_state <= 1'b1;   // phase 0 -> phase 1
+                else
+                    mal_state <= 1'b0;   // phase 1 -> idle
+            end
+            // Capture the phase-0 word at the first cycle of phase 1 (ungated).
+            if (mal_phase1_start && ex_mem_ctrl.mem_read)
                 mal_first_data <= dmem_rdata;
         end
     end
@@ -1108,7 +1190,13 @@ module rv_core
             mem_wb_fpu_result_f   <= '0;
             mem_wb_fpu_result_i   <= '0;
             mal_active_wb         <= 1'b0;
-        end else if (!amo_stall && !mal_stall) begin
+        end else if (!amo_stall && !mal_stall && !dmem_wait && imem_ready) begin
+            // Also bubble while a data access is in flight (dmem_wait): the load
+            // must not retire to WB before its data has returned.  No-op when
+            // dmem_wait==0 (the BRAM path).
+            // imem_ready freezes MEM/WB during a multi-cycle IF fetch (full
+            // pipeline freeze) so the held MEM instruction is not retired twice.
+            // No-op for a 1-cycle IF (imem_ready=1).
             // Hold MEM/WB during AMO read phase or misaligned phase 0
             mem_wb_ctrl           <= ex_mem_ctrl;
             mem_wb_alu_result     <= ex_mem_ctrl.is_sc ? sc_result : ex_mem_alu_result;
