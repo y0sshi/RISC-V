@@ -144,6 +144,28 @@ module rv_csr
 
     assign frm_out = frm_reg;
 
+    // =========================================================================
+    // PMP (Physical Memory Protection) CSRs — 16 entries
+    // pmpcfg byte = {L[7], 2'b00, A[4:3], X[2], W[1], R[0]} (bits 6:5 are WARL 0).
+    // A: 0=OFF, 1=TOR, 2=NA4, 3=NAPOT.  Locked entries (L=1) ignore cfg/addr writes.
+    // pmpaddr holds PA[55:2] (RV64 -> bits[53:0]) / PA[33:2] (RV32 -> all 32 bits).
+    // NOTE: only the architectural CSR state + WARL is implemented here; address
+    // matching / access enforcement is deferred (see CLAUDE.md PMP notes).
+    // =========================================================================
+    localparam int PMP_ENTRIES = 16;
+    logic [7:0]  pmpcfg  [0:PMP_ENTRIES-1];
+    xlen_t       pmpaddr [0:PMP_ENTRIES-1];
+
+    // pmpaddr implemented-width mask: RV64 = PA 56-bit -> addr bits [53:0]; RV32 = 32 bits.
+    localparam xlen_t PMP_ADDR_MASK = (XLEN == 64) ? xlen_t'(64'h003F_FFFF_FFFF_FFFF)
+                                                   : xlen_t'(64'hFFFF_FFFF);
+
+    // Packed views for CSR reads (8 cfg bytes per 64-bit word)
+    wire [63:0] pmpcfg_lo = {pmpcfg[7], pmpcfg[6], pmpcfg[5], pmpcfg[4],
+                             pmpcfg[3], pmpcfg[2], pmpcfg[1], pmpcfg[0]};
+    wire [63:0] pmpcfg_hi = {pmpcfg[15], pmpcfg[14], pmpcfg[13], pmpcfg[12],
+                             pmpcfg[11], pmpcfg[10], pmpcfg[9],  pmpcfg[8]};
+
     priv_level_t    cur_priv;
     assign priv_level = cur_priv;
 
@@ -357,6 +379,25 @@ module rv_csr
             12'hB82:      csr_rdata = (XLEN == 32) ? xlen_t'(minstret_cnt[63:32]) : '0;
             default:      csr_rdata = '0;
         endcase
+
+        // PMP CSR reads (override default for 0x3A0-0x3A3 / 0x3B0-0x3BF)
+        if (csr_addr[11:4] == 8'h3B) begin            // pmpaddr0..15
+            csr_rdata = pmpaddr[csr_addr[3:0]];
+        end else if (XLEN == 32) begin
+            unique case (csr_addr)
+                12'h3A0: csr_rdata = xlen_t'(pmpcfg_lo[31:0]);
+                12'h3A1: csr_rdata = xlen_t'(pmpcfg_lo[63:32]);
+                12'h3A2: csr_rdata = xlen_t'(pmpcfg_hi[31:0]);
+                12'h3A3: csr_rdata = xlen_t'(pmpcfg_hi[63:32]);
+                default: ;
+            endcase
+        end else begin                                 // XLEN == 64 (even pmpcfg only)
+            unique case (csr_addr)
+                12'h3A0: csr_rdata = xlen_t'(pmpcfg_lo);
+                12'h3A2: csr_rdata = xlen_t'(pmpcfg_hi);
+                default: ;
+            endcase
+        end
     end
 
     // =========================================================================
@@ -413,6 +454,11 @@ module rv_csr
             // F-extension CSRs
             fflags_reg    <= 5'h0;
             frm_reg       <= 3'h0;
+            // PMP CSRs
+            for (int pi = 0; pi < PMP_ENTRIES; pi++) begin
+                pmpcfg[pi]  <= 8'h0;
+                pmpaddr[pi] <= '0;
+            end
 
         end else begin
             // Free-running cycle counter
@@ -520,6 +566,29 @@ module rv_csr
                     // misa, mip, mcycle, minstret, mhartid: read-only
                     default: ;
                 endcase
+
+                // ---- PMP CSR writes (WARL; locked entries L=1 ignore writes) -
+                if (csr_addr[11:4] == 8'h3B) begin
+                    // pmpaddr0..15 (0x3B0..0x3BF)
+                    if (!pmpcfg[csr_addr[3:0]][7])
+                        pmpaddr[csr_addr[3:0]] <= csr_new_val & PMP_ADDR_MASK;
+                end else if (XLEN == 64) begin
+                    // RV64: pmpcfg0 (0..7) at 0x3A0, pmpcfg2 (8..15) at 0x3A2
+                    if (csr_addr == 12'h3A0 || csr_addr == 12'h3A2) begin
+                        for (int j = 0; j < 8; j++)
+                            if (!pmpcfg[(csr_addr == 12'h3A2 ? 8 : 0) + j][7])
+                                pmpcfg[(csr_addr == 12'h3A2 ? 8 : 0) + j]
+                                    <= {csr_new_val[j*8+7], 2'b00, csr_new_val[j*8+4 -: 5]};
+                    end
+                end else begin
+                    // RV32: pmpcfg0..3 at 0x3A0..0x3A3, 4 entries each
+                    if (csr_addr >= 12'h3A0 && csr_addr <= 12'h3A3) begin
+                        for (int j = 0; j < 4; j++)
+                            if (!pmpcfg[{csr_addr[1:0], 2'b00} + j[3:0]][7])
+                                pmpcfg[{csr_addr[1:0], 2'b00} + j[3:0]]
+                                    <= {csr_new_val[j*8+7], 2'b00, csr_new_val[j*8+4 -: 5]};
+                    end
+                end
             end
         end
     end

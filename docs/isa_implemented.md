@@ -239,8 +239,8 @@ W-type (32-bit) and D-type (XLEN-bit) variants both supported via `funct3` in `r
 
 | Feature | Notes |
 |---------|-------|
-| Illegal-instruction trap | Not generated (unknown ops decode as NOP); rv64mi/rv32mi `illegal` FAIL |
-| Physical Memory Protection (PMP) | Not implemented; rv64mi/rv32mi `pmp` FAIL |
+| Illegal-instruction trap | ✅ Implemented (unknown opcode / bad shamt / RV32 W-form / illegal RVC -> cause=2, mtval=instr). rv32mi `shamt` passes; rv*mi `illegal` still needs vectored mtvec + TSR/TVM/TW |
+| Physical Memory Protection (PMP) | ⚠️ CSRs only (pmpcfg/pmpaddr 16 entries, WARL); rv*mi `pmpaddr` passes. Access enforcement deferred to the arch-test phase |
 | mtvec vectored mode | Stored but trap always goes to base address |
 | CLINT memory-mapped mtime/mtimecmp -> `time` CSR (U/S) | `timer_irq` input used; `time`/`mcounteren` not wired (needed for Linux `rdtime`) |
 | V (vector) extension | Not implemented |
