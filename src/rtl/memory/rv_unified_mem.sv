@@ -1,10 +1,10 @@
 // =============================================================================
 /// @file rv_unified_mem.sv
-/// @brief Unified Instruction/Data Memory for ACT_MODE simulation (256 KB)
+/// @brief Unified Instruction/Data Memory for the rv_soc_act (compliance) configuration (256 KB)
 ///
 /// Single SRAM block shared by instruction fetch (Port A, 32-bit read) and
 /// data access (Port B, XLEN-bit read/write with byte-enable).
-/// Used exclusively in rv_soc ACT_MODE; not instantiated in production.
+/// Used exclusively in rv_soc_act; not instantiated elsewhere.
 ///
 /// @param XLEN        Data path width (32 or 64).
 /// @param DEPTH       Memory size in 32-bit words (default 65536 = 256 KB).

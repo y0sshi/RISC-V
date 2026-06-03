@@ -1,7 +1,7 @@
 // =============================================================================
-// tb_rv_axi_soc.sv - rv_soc AXI_MODE integration (instructions AND data in DDR)
+// tb_rv_axi_soc.sv - rv_soc (AXI/DDR) integration (instructions AND data in DDR)
 // =============================================================================
-// Drives rv_soc built in AXI_MODE with BOTH masters exercised:
+// Drives rv_soc (AXI/DDR) built with BOTH masters exercised:
 //   - instruction fetch  -> m_axi_if_* (read-only, 32-bit) -> IF DDR model
 //   - data + PTW          -> m_axi_*    (read/write, XLEN)   -> data DDR model
 // Both AXI slaves run at randomized latency.  (On hardware the two masters fan
@@ -50,11 +50,13 @@ module tb_rv_axi_soc;
     logic [IDW-1:0]  i_rid;   logic [31:0] i_rdata; logic [1:0] i_rresp;
     logic            i_rlast, i_rvalid, i_rready;
 
+    logic [3:0] gpio_out_w;
+
     rv_soc #(
-        .XLEN (XLEN), .RST_ADDR (MEM_BASE), .INIT_FILE (""), .AXI_ID_WIDTH (IDW)
+        .XLEN (XLEN), .RST_ADDR (MEM_BASE), .AXI_ID_WIDTH (IDW)
     ) u_soc (
         .clk (clk), .rst_n (rst_n),
-        .gpio_in (4'b0), .gpio_out (), .uart_rx (1'b1), .uart_tx (),
+        .gpio_in (4'b0), .gpio_out (gpio_out_w), .uart_rx (1'b1), .uart_tx (),
         // data master
         .m_axi_awid (awid), .m_axi_awaddr (awaddr), .m_axi_awlen (awlen),
         .m_axi_awsize (awsize), .m_axi_awburst (awburst),
@@ -170,18 +172,32 @@ module tb_rv_axi_soc;
         imem_set( 6, jal_i(5'd0, -21'sd12));                     // jal x0,-12 -> idx3
         imem_set( 7, lui_instr(5'd4, 20'h80000));                // lui x4,0x80000
         imem_set( 8, i_instr(7'h13, 5'd4, 3'd0, 5'd4, 12'h100)); // addi x4,x4,0x100
-        imem_set( 9, s_instr(5'd1, 5'd4, 12'd0, 3'b010));        // sw x1,0(x4)
-        imem_set(10, jal_i(5'd0, 21'sd0));                       // spin
+        imem_set( 9, s_instr(5'd1, 5'd4, 12'd0, 3'b010));        // sw x1,0(x4)  -> DDR
+        // Peripheral access over AXI-mode SoC: drive GPIO (0xC002_0000).
+        imem_set(10, lui_instr(5'd9, 20'hC0020));                // x9 = 0xC0020000 (GPIO)
+        imem_set(11, i_instr(7'h13, 5'd10, 3'd0, 5'd0, 12'hF));  // x10 = 0xF (DIR mask)
+        imem_set(12, s_instr(5'd10, 5'd9, 12'd8, 3'b010));       // sw x10,8(x9)  DIR=0xF (periph)
+        imem_set(13, i_instr(7'h13, 5'd11, 3'd0, 5'd0, 12'd5));  // x11 = 5 (OUT value)
+        imem_set(14, s_instr(5'd11, 5'd9, 12'd0, 3'b010));       // sw x11,0(x9)  OUT=5 (periph)
+        imem_set(15, jal_i(5'd0, 21'sd0));                       // spin
 
         repeat (4) @(posedge clk);
         rst_n = 1;
-        repeat (1500) @(posedge clk);
+        repeat (5000) @(posedge clk);
 
         if (bfm_word(32'h100) === 32'd55) begin
-            $display("  PASS: DDR[0x8000_0100] = %0d (sum 1..10, code+data over AXI)", bfm_word(32'h100));
+            $display("  PASS: DDR[0x8000_0100] = %0d (sum 1..10 over AXI)", bfm_word(32'h100));
             pass_cnt++;
         end else begin
             $display("  FAIL: DDR[0x8000_0100] = 0x%08h (exp 55)", bfm_word(32'h100));
+            fail_cnt++;
+        end
+
+        if (gpio_out_w === 4'h5) begin
+            $display("  PASS: GPIO out = 0x%0h (peripheral write over AXI-mode SoC)", gpio_out_w);
+            pass_cnt++;
+        end else begin
+            $display("  FAIL: GPIO out = 0x%0h (exp 5)", gpio_out_w);
             fail_cnt++;
         end
 

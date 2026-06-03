@@ -33,7 +33,7 @@ module kv260_top (
     // =========================================================================
     logic [3:0] gpio_out;
 
-    rv_soc #(
+    rv_soc_bram #(
         .IMEM_DEPTH (4096),
         .DMEM_DEPTH (4096),
         .IMEM_FILE  (""),

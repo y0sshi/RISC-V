@@ -142,6 +142,13 @@ module tb_rv_axi_ifetch;
         logic [12:0] m; m=off; return {m[12],m[10:5],rs2,rs1,f3,m[4:1],m[11],7'h63}; endfunction
     function automatic logic [31:0] ld_i(input [4:0] rd,input [4:0] rs1,input [11:0] imm,input [2:0] f3);
         return {imm, rs1, f3, rd, 7'h03}; endfunction
+    function automatic logic [31:0] store_i(input [4:0] rs2,input [4:0] rs1,input [11:0] imm,input [2:0] f3);
+        return {imm[11:5], rs2, rs1, f3, imm[4:0], 7'h23}; endfunction
+    // CSR / system: {csr[11:0], rs1-or-uimm, funct3, rd, 7'h73}
+    function automatic logic [31:0] csr_i(input [11:0] csr,input [4:0] rs1u,input [2:0] f3,input [4:0] rd);
+        return {csr, rs1u, f3, rd, 7'h73}; endfunction
+    localparam logic [31:0] ECALL = 32'h0000_0073;
+    localparam logic [31:0] MRET  = 32'h3020_0073;
 
     // Write instruction word into IF BFM (byte LE, base 0)
     task automatic iset(input int idx, input logic [31:0] w);
@@ -242,6 +249,42 @@ module tb_rv_axi_ifetch;
             do_reset(); repeat(900) @(posedge clk);
             check_x("F x3=0x42 (LBU)", reg_val(3), XLEN'(32'h42));
             check_x("F x4=77 (fall-through)", reg_val(4), XLEN'(77));
+
+            // [H] 2-back forward to a STORE base register (repro of AXI-soc GPIO bug):
+            //   addi x9,x0,0x40 ; addi x10,x0,0xAB ; sw x10,0(x9) ; lw x11,0(x9)
+            //   x9 is forwarded 2-back (MEM/WB) into the store base.  Expect the
+            //   store to land at 0x40 and the load to read 0xAB back.
+            iclear();
+            iset(0, imm_i(7'h13,5'd9, 3'd0,5'd0,12'h40));   // addi x9,x0,0x40
+            iset(1, imm_i(7'h13,5'd10,3'd0,5'd0,12'hAB));   // addi x10,x0,0xAB
+            iset(2, store_i(5'd10,5'd9,12'd0,3'b010));      // sw x10,0(x9)  -> 0x40
+            iset(3, ld_i(5'd11,5'd9,12'd0,3'b010));         // lw x11,0(x9)
+            iset(4, SPIN);
+            do_reset(); repeat(250) @(posedge clk);
+            check_x("H sw base 2-back fwd (dmem[0x40])", XLEN'(dmem_bram[16]), XLEN'(32'hAB));
+            check_x("H x11 lw readback",                 reg_val(11), XLEN'(32'hAB));
+
+            // [G] TRAP + MRET under IF latency: verify mstatus.MIE is preserved
+            //   across ECALL (push MPIE<-MIE) and MRET (pop MIE<-MPIE).  Under the
+            //   IF freeze the ECALL/MRET sit in EX for several cycles; without the
+            //   imem_ready gate the CSR push/pop would fire repeatedly and corrupt
+            //   MPIE (-> MIE=0 after MRET).  Expect MIE (mstatus bit 3) = 1.
+            //   mstatus=0x300, mtvec=0x305, mepc=0x341. Handler at idx6 (byte 0x18).
+            iclear();
+            iset( 0, csr_i(12'h300, 5'd8, 3'b110, 5'd0));     // csrrsi x0,mstatus,8 (set MIE)
+            iset( 1, imm_i(7'h13, 5'd5, 3'd0, 5'd0, 12'h18)); // addi x5,x0,0x18 (handler)
+            iset( 2, csr_i(12'h305, 5'd5, 3'b001, 5'd0));     // csrrw x0,mtvec,x5
+            iset( 3, ECALL);                                   // -> trap to 0x18 (idx6)
+            iset( 4, csr_i(12'h300, 5'd0, 3'b010, 5'd11));    // csrrs x11,mstatus,x0 (read back)
+            iset( 5, SPIN);
+            iset( 6, imm_i(7'h13, 5'd6, 3'd0, 5'd6, 12'd1));  // handler: addi x6,x6,1 (trap count)
+            iset( 7, csr_i(12'h341, 5'd0, 3'b010, 5'd7));     // csrrs x7,mepc,x0
+            iset( 8, imm_i(7'h13, 5'd7, 3'd0, 5'd7, 12'd4));  // addi x7,x7,4 (return past ecall)
+            iset( 9, csr_i(12'h341, 5'd7, 3'b001, 5'd0));     // csrrw x0,mepc,x7
+            iset(10, MRET);                                    // -> return to idx4
+            do_reset(); repeat(400) @(posedge clk);
+            check_x("G x6=1 (trapped once)",  reg_val(6), XLEN'(1));
+            check_x("G MIE restored (bit3)",  reg_val(11) & XLEN'(8), XLEN'(8));
         end
     endtask
 

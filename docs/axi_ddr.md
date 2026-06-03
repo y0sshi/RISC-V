@@ -113,20 +113,37 @@ input wire dmem_wait;   // high while a MEM-stage data access is in flight
   **Result: 11/11 PASS on v12.0 and v13.0** -- the `dmem_wait` data path yields
   identical architectural results under variable latency.
 
-- `rv_soc` **`AXI_MODE`** (third build mode, `ifdef AXI_MODE`): data + PTW go out
-  an exposed AXI4 master (`m_axi_*`); instruction fetch uses an internal
-  always-ready `rv_unified_mem` (INIT_FILE). PTW is arbitrated onto the same
-  master with priority; `core_dmem_wait` is driven by the bridge `s_wait`
-  (suppressed during a PTW transaction -- the pending data access is held by the
-  MMU's `mem_stall`). Existing ACT/production modes are unchanged
-  (`core_dmem_wait = 0`).
-- `src/sim/tb/tb_rv_axi_soc.sv` - SoC-level integration: `rv_soc` (AXI_MODE) +
-  `rv_axi_slave_bfm`. Runs a loop (sum 1..10, branch-heavy) from internal IF
-  memory and stores the result to the DDR model over AXI at randomized latency.
-  **Result: PASS on v12.0 and v13.0.**
+- **`rv_soc.sv`** (the DEFAULT SoC after the file split -- see "SoC build
+  configurations" below): `rv_cpu` + TWO AXI4 masters (instruction fetch
+  read-only 32-bit `m_axi_if_*`; data + PTW read/write XLEN `m_axi_*`) + the
+  `rv_periph` peripheral subsystem.  Peripheral region (0xC0xx) is served
+  locally; everything else (DDR) goes out the data master.  PTW is arbitrated
+  onto the data master with priority; `core_dmem_wait` = bridge `s_wait`
+  (suppressed during PTW; the pending data access is held by `mem_stall`).
+- `src/sim/tb/tb_rv_axi_soc.sv` - SoC-level integration: `rv_soc` + two
+  `rv_axi_slave_bfm` (IF + data).  Runs a branch-heavy loop (sum 1..10) fetched
+  over the IF master, stores the result to DDR over the data master, and drives
+  the GPIO peripheral -- all at randomized latency.
+  **Result: 2/2 PASS on v12.0 and v13.0.**
 
 Run: `cd src/sim && make sim_axi` (bridge unit) / `make sim_axi_core` (core data
-path) / `make sim_axi_soc` (SoC AXI_MODE)
+path) / `make sim_axi_ifetch` (core IF over AXI) / `make sim_axi_soc` (SoC)
+
+## SoC build configurations (file split; module-selected, no ifdef)
+
+`rv_soc.sv`'s old `ifdef` modes were split into a shared CPU/peripheral block
+plus per-use wrappers, selected by **module name** (not a `+define`):
+
+| Module | Memory | Peripherals | Use |
+|--------|--------|-------------|-----|
+| `rv_cpu.sv` | (shared) | - | rv_core + rv_mmu + glue; physical-address mem I/F |
+| `rv_periph.sv` | (shared) | CLINT/UART/PLIC/GPIO + decode | shared by rv_soc / rv_soc_bram |
+| **`rv_soc.sv`** | external DDR (AXI4 x2) | yes | **default / real hardware** |
+| `rv_soc_bram.sv` | on-chip BRAM (Harvard) | yes | PS-less FPGA; board tops, sim_soc/core/bm |
+| `rv_soc_act.sv` | unified memory | no | compliance (riscv-tests/RISCOF, tb_rv_act) |
+
+`-DACT_MODE` / `-DAXI_MODE` removed (only `-DRV_XLEN_64` remains).  Testbenches
+that reach into core internals now use `u_soc.u_cpu.u_core.*` (one level deeper).
 
 ## Verification status
 
@@ -134,8 +151,9 @@ path) / `make sim_axi_soc` (SoC AXI_MODE)
 - `make sim_axi_core` : 14/14 PASS (v12 + v13) -- **data port over AXI at
   randomized latency, real pipeline programs (incl. boundary-crossing LW and
   crossing SW->LW), results match the BRAM path.**
-- `make sim_axi_ifetch` : 22/22 PASS (v12 + v13) -- **instruction fetch over AXI
-  at variable latency: sequential, JAL, BEQ, JALR, backward loop, load-use+branch.**
+- `make sim_axi_ifetch` : 26/26 PASS (v12 + v13) -- **instruction fetch over AXI
+  at variable latency: sequential, JAL, BEQ, JALR, backward loop, load-use+branch,
+  and ECALL->handler->MRET (trap once + mstatus.MIE preserved).**
 - `make sim_axi_soc` : PASS (v12 + v13) -- **rv_soc AXI_MODE with BOTH masters:
   branch-heavy loop fetched over the IF AXI master AND data stored over the data
   AXI master (instructions AND data in the DDR model).**
@@ -175,17 +193,32 @@ cycle `s_req` appears and drops on the completion cycle. Caught by `tb_rv_axi_co
 - ✅ **Misaligned 2-phase data capture over AXI** -- `mal_first_data` now latched
   at the FIRST cycle of phase 1 (see below), proven by `tb_rv_axi_core` crossing
   LW / crossing SW->LW at variable latency.
-1. **PTW-over-AXI** + **traps under IF latency** soak: the EX-stage trap/MRET CSR
-   update is not yet gated by imem_ready, so a trap that resolves while the IF
-   fetch is mid-flight could double-update mstatus under non-zero IF latency.
-   Harmless today (no traps in the AXI sims; compliance runs at imem_ready=1),
-   but gate `trap_enter/mret_en/sret_en/retire_en` by the advance cycle before
-   trap-heavy IF-AXI workloads.
+- ✅ **Traps / MRET / CSR writes under IF latency** -- the EX-stage CSR
+  state-update inputs (`trap_enter/mret_en/sret_en/csr_we/retire_en`) and
+  `tlb_flush_out` are gated by `imem_ready` so each fires exactly once on the
+  commit cycle (no mstatus double push/pop, no minstret over-count) under the IF
+  freeze. Proven by `tb_rv_axi_ifetch` test G (ECALL->handler->MRET over AXI:
+  trap once, mstatus.MIE preserved). No-op when imem_ready=1.
+1. **PTW-over-AXI** soak (the AXI sims run bare mode so far).
 2. **Shared-memory dual-port AXI BFM** + run a full riscv-test hex over AXI
    (single shared DDR image) and compare signature to the ACT result.
 3. **Full arch-test (RISCOF I/M/A/C)** re-confirm on v12+v13.
 4. Board bring-up: bitstream, DDR preload, boot.
 5. (later) I/D caches for throughput; bursts in the bridge.
+
+## Traps / CSR updates under variable IF latency
+
+The full pipeline freeze (`~imem_ready`) holds EX/MEM/WB across a multi-cycle IF
+fetch. The EX-stage trap/MRET/SRET/CSR-write signals are combinational, so under
+the freeze they would stay asserted for several cycles and update CSR state
+repeatedly: a second `mstatus` push corrupts MPIE (-> MIE lost after MRET), a
+second MRET pop corrupts the stack, and `minstret` over-counts. Fix: gate the
+*state-changing* CSR inputs (`csr_we`, `trap_enter`, `mret_en`, `sret_en`,
+`retire_en`) and `tlb_flush_out` by `csr_commit = imem_ready` so each fires
+exactly once -- on the advancing (commit) cycle. The redirect itself stays
+latched (IF stage), and `fpu_fflags_we` is left ungated (a multi-cycle FP
+`result_valid` pulse need not coincide with imem_ready, and fflags accumulation
+is idempotent). NO-OP when imem_ready=1 every cycle (all BRAM/unified-mem paths).
 
 ## Misaligned 2-phase capture under variable latency
 
@@ -235,6 +268,16 @@ so the change is a NO-OP when `imem_ready=1` every cycle (all existing paths):
    sequential code, since it wiped the EX/MEM forward source mid-stall.) Unlike
    `mmu_stall`, the IF fetch uses its own AXI master, so freezing EX/MEM does not
    conflict with the data port.
+4. **MEM/WB hold vs bubble (forwarding source loss).** A first cut of fix 3 added
+   `imem_ready` to the MEM/WB *advance* condition, which routed the freeze to the
+   register's `else` BUBBLE branch (originally for AMO/mal phase-0). That wiped
+   the 2-back (MEM/WB) forwarding source during the freeze, so a value produced 2
+   instructions earlier was lost to a consumer -- e.g. `lui x9; addi x10; sw
+   x10,off(x9)` stored with x9=0 (surfaced as the GPIO DIR write in the AXI SoC).
+   Fix: make MEM/WB three-way -- `amo_stall|mal_stall|dmem_wait` -> bubble;
+   `imem_ready` -> advance; **else (IF freeze) -> HOLD** (keep current, preserving
+   the forwarder). retire is `imem_ready`-gated so holding never double-counts.
+   No-op when imem_ready=1. Caught by `tb_rv_axi_ifetch` test H.
 
 ## Vivado Block Design (board integration, Phase 3)
 
@@ -246,13 +289,13 @@ flow lives at `boards/kv260/vivado/build_kv260.tcl` (PS8) and
 vivado -mode batch -source boards/kv260/vivado/build_kv260.tcl -tclargs bit
 ```
 
-Each script creates the project, adds the `rv_soc` (AXI_MODE) sources with the
-`AXI_MODE` (+ `RV_XLEN_64`) defines, builds a block design (PS + AXI
-SmartConnect + S_AXI_HP), connects `rv_soc.m_axi` (AXI master inferred from the
-`m_axi_*` ports) to the HP port, wires clock/reset, assigns addresses, makes the
-wrapper, and (optionally) runs synth/bitstream. **Address-map caveat**: in
-AXI_MODE the program's data addresses must target PS DDR (not the repo default
-`0x8000_0000`); see the README.
+Each script creates the project, adds the `rv_soc` (the AXI/DDR SoC -- selected
+by module name; only `RV_XLEN_64` is defined for RV64), builds a block design
+(PS + AXI SmartConnect[2 SI] + S_AXI_HP), connects `rv_soc.m_axi` and
+`rv_soc.m_axi_if` (AXI masters inferred from the `m_axi_*` / `m_axi_if_*` ports)
+to the HP port, wires clock/reset, assigns addresses, makes the wrapper, and
+(optionally) runs synth/bitstream. **Address-map caveat**: the program's data
+addresses must target PS DDR (not the repo default `0x8000_0000`); see the README.
 
 Target: connect the PL RISC-V (as AXI master) to PS DDR via S_AXI_HP.
 

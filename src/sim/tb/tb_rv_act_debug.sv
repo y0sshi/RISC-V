@@ -18,10 +18,10 @@ module tb_rv_act_debug;
     logic rst_n = 0;
     always #5 clk = ~clk;
 
-    // DUT: rv_soc in ACT_MODE (includes rv_core + rv_mmu + rv_unified_mem).
+    // DUT: rv_soc_act (includes rv_core + rv_mmu + rv_unified_mem).
     // INIT_FILE propagates to rv_unified_mem's INIT_FILE for internal $readmemh.
     // XLEN follows rv_pkg::XLEN (32 by default, 64 with -DRV_XLEN_64).
-    rv_soc #(
+    rv_soc_act #(
         .XLEN      (XLEN),
         .RST_ADDR  (MEM_BASE),
         .INIT_FILE (`HEX_FILE)
@@ -77,15 +77,15 @@ module tb_rv_act_debug;
     // FPU trace
     always @(posedge clk) begin
         if (rst_n) begin
-            if (u_soc.u_core.fpu_busy_int || u_soc.u_core.fpu_result_valid)
+            if (u_soc.u_cpu.u_core.fpu_busy_int || u_soc.u_cpu.u_core.fpu_result_valid)
                 $display("[cyc %0d] FPU busy=%b valid=%b ex_mem_valid=%b f10=%h f11=%h f13=%h a0=%h a3=%h",
-                         cycle_cnt, u_soc.u_core.fpu_busy_int, u_soc.u_core.fpu_result_valid,
-                         u_soc.u_core.ex_mem_valid,
-                         u_soc.u_core.u_fregfile.regs[10],
-                         u_soc.u_core.u_fregfile.regs[11],
-                         u_soc.u_core.u_fregfile.regs[13],
-                         u_soc.u_core.u_regfile.regs[10],
-                         u_soc.u_core.u_regfile.regs[13]);
+                         cycle_cnt, u_soc.u_cpu.u_core.fpu_busy_int, u_soc.u_cpu.u_core.fpu_result_valid,
+                         u_soc.u_cpu.u_core.ex_mem_valid,
+                         u_soc.u_cpu.u_core.u_fregfile.regs[10],
+                         u_soc.u_cpu.u_core.u_fregfile.regs[11],
+                         u_soc.u_cpu.u_core.u_fregfile.regs[13],
+                         u_soc.u_cpu.u_core.u_regfile.regs[10],
+                         u_soc.u_cpu.u_core.u_regfile.regs[13]);
         end
     end
 

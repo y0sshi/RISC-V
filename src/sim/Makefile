@@ -72,7 +72,7 @@ GTKWAVE   = gtkwave
 RTL_DIR   = ../rtl
 INC_DIR   = $(RTL_DIR)/include
 CORE_DIR  = $(RTL_DIR)/core
-ALU_DIR   = $(RTL_DIR)/alu
+EXEC_DIR  = $(RTL_DIR)/exec
 MEM_DIR   = $(RTL_DIR)/memory
 SOC_DIR   = $(RTL_DIR)/soc
 PERI_DIR  = $(RTL_DIR)/peripherals
@@ -113,16 +113,17 @@ CORE_SRC  = $(PKG_SRC) \
             $(CORE_DIR)/rv_fregfile.sv \
             $(CORE_DIR)/rv_cdecode.sv \
             $(CORE_DIR)/rv_decode.sv \
-            $(CORE_DIR)/rv_branch.sv \
-            $(ALU_DIR)/rv_alu.sv \
-            $(CORE_DIR)/rv_muldiv.sv \
-            $(CORE_DIR)/rv_amo.sv \
+            $(EXEC_DIR)/rv_branch.sv \
+            $(EXEC_DIR)/rv_alu.sv \
+            $(EXEC_DIR)/rv_muldiv.sv \
+            $(EXEC_DIR)/rv_amo.sv \
             $(CORE_DIR)/rv_forward.sv \
             $(CORE_DIR)/rv_csr.sv \
             $(CORE_DIR)/rv_hazard.sv \
             $(CORE_DIR)/rv_mmu.sv \
             $(FPU_SRC) \
-            $(CORE_DIR)/rv_core.sv
+            $(CORE_DIR)/rv_core.sv \
+            $(CORE_DIR)/rv_cpu.sv
 
 SOC_SRC   = $(CORE_SRC) \
             $(MEM_DIR)/rv_imem.sv \
@@ -131,12 +132,13 @@ SOC_SRC   = $(CORE_SRC) \
             $(PERI_DIR)/uart/rv_uart.sv \
             $(PERI_DIR)/gpio/rv_gpio.sv \
             $(PERI_DIR)/plic/rv_plic.sv \
-            $(SOC_DIR)/rv_soc.sv
+            $(PERI_DIR)/rv_periph.sv \
+            $(SOC_DIR)/rv_soc_bram.sv
 
-# ACT compliance: rv_soc in ACT_MODE (rv_unified_mem + MMU, no peripherals)
+# ACT compliance: rv_soc_act (rv_unified_mem + rv_cpu, no peripherals)
 ACT_SRC   = $(CORE_SRC) \
             $(MEM_DIR)/rv_unified_mem.sv \
-            $(SOC_DIR)/rv_soc.sv
+            $(SOC_DIR)/rv_soc_act.sv
 
 # Peripheral-only source lists (for individual testbenches)
 PLIC_SRC  = $(PKG_SRC) $(PERI_DIR)/plic/rv_plic.sv
@@ -179,7 +181,7 @@ image:
 # --- ALU testbench ---
 sim_alu: dirs
 	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_alu.vvp \
-		$(PKG_SRC) $(ALU_DIR)/rv_alu.sv $(TB_DIR)/tb_rv_alu.sv
+		$(PKG_SRC) $(EXEC_DIR)/rv_alu.sv $(TB_DIR)/tb_rv_alu.sv
 	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_alu.vvp
 
 wave_alu: sim_alu
@@ -215,17 +217,17 @@ wave_csr: sim_csr
 # --- RV64I W-type ALU testbench (compiled with XLEN=64) ---
 sim_rv64i: dirs
 	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv64i.vvp \
-		$(PKG_SRC) $(ALU_DIR)/rv_alu.sv $(TB_DIR)/tb_rv64i.sv
+		$(PKG_SRC) $(EXEC_DIR)/rv_alu.sv $(TB_DIR)/tb_rv64i.sv
 	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv64i.vvp
 
 wave_rv64i: sim_rv64i
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv64i.vcd &
 
 # --- M-extension testbench (XLEN=32: RV32M, XLEN=64: includes W-type) ---
-MEXT_SRC  = $(PKG_SRC) $(CORE_DIR)/rv_muldiv.sv
+MEXT_SRC  = $(PKG_SRC) $(EXEC_DIR)/rv_muldiv.sv
 
 # --- A-extension AMO compute unit testbench ---
-AMO_SRC   = $(PKG_SRC) $(CORE_DIR)/rv_amo.sv
+AMO_SRC   = $(PKG_SRC) $(EXEC_DIR)/rv_amo.sv
 
 # --- MMU testbench ---
 MMU_SRC   = $(PKG_SRC) $(CORE_DIR)/rv_mmu.sv
@@ -487,13 +489,17 @@ wave_axi_core: sim_axi_core
 
 # --- rv_soc AXI_MODE integration testbench (data path over AXI -> DDR model) ---
 AXI_SOC_SRC = $(CORE_SRC) \
-              $(MEM_DIR)/rv_unified_mem.sv \
               $(BUS_DIR)/rv_axi_bridge.sv \
+              $(PERI_DIR)/clint/rv_timer.sv \
+              $(PERI_DIR)/uart/rv_uart.sv \
+              $(PERI_DIR)/gpio/rv_gpio.sv \
+              $(PERI_DIR)/plic/rv_plic.sv \
+              $(PERI_DIR)/rv_periph.sv \
               $(SOC_DIR)/rv_soc.sv \
               $(TB_DIR)/rv_axi_slave_bfm.sv
 
 sim_axi_soc: dirs
-	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DAXI_MODE -o $(OUT_DIR)/tb_rv_axi_soc.vvp \
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_axi_soc.vvp \
 		$(AXI_SOC_SRC) $(TB_DIR)/tb_rv_axi_soc.sv
 	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_axi_soc.vvp
 
@@ -547,7 +553,7 @@ sim_act_internal:
 	@if [ -z "$(HEX_FILE)" ] || [ -z "$(SIG_FILE)" ]; then \
 		echo "ERROR: HEX and SIG must be specified"; exit 1; \
 	fi
-	$(IVERILOG) $(IVFLAGS) $(XLEN_DEF) -DACT_MODE \
+	$(IVERILOG) $(IVFLAGS) $(XLEN_DEF) \
 		-DHEX_FILE=\"$(HEX_FILE)\"       \
 		-DSIG_FILE=\"$(SIG_FILE)\"       \
 		-DBEGIN_SIG=\"$(BEGIN_SIG)\"     \
@@ -558,7 +564,7 @@ sim_act_internal:
 	$(VVP) $(OUT_DIR)/tb_rv_act.vvp
 
 sim_act_debug_internal:
-	$(IVERILOG) $(IVFLAGS) $(XLEN_DEF) -DACT_MODE \
+	$(IVERILOG) $(IVFLAGS) $(XLEN_DEF) \
 		-DHEX_FILE=\"$(HEX_FILE)\"       \
 		-DTOHOST_ADDR=\"$(TOHOST_ADDR)\" \
 		-o $(OUT_DIR)/tb_rv_act_debug.vvp \

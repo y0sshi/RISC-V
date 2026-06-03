@@ -951,6 +951,18 @@ module rv_core
         end
     end
 
+    // CSR state-update gate.  Under a multi-cycle IF fetch the EX/MEM/WB stages
+    // are frozen (full pipeline freeze, ~imem_ready), so the combinational
+    // trap/MRET/SRET/CSR-write/retire signals would stay asserted for several
+    // cycles and update CSR state repeatedly (mstatus push/pop, mepc, minstret).
+    // Gate the *state-changing* CSR inputs by imem_ready so each fires exactly
+    // once -- on the advancing (commit) cycle.  NO-OP when imem_ready=1 every
+    // cycle (all BRAM/unified-mem paths -> identical to before).  The redirect
+    // itself is handled separately (latched, see IF stage), and fflags writes
+    // are left ungated (multi-cycle FP's result_valid pulse need not coincide
+    // with imem_ready, and fflags accumulation is idempotent).
+    wire csr_commit = imem_ready;
+
     rv_csr #(
         .XLEN   (XLEN),
         .HARTID (0)
@@ -960,21 +972,21 @@ module rv_core
         .csr_addr   (id_ex_csr_addr),
         .csr_wdata  (ex_csr_wdata),
         .csr_op     (id_ex_funct3),
-        .csr_we     (id_ex_ctrl.csr_write & id_ex_valid),
+        .csr_we     (id_ex_ctrl.csr_write & id_ex_valid & csr_commit),
         .csr_rdata  (csr_rdata_ex),
-        .trap_enter (csr_trap_enter),
+        .trap_enter (csr_trap_enter & csr_commit),
         .trap_cause (csr_trap_cause),
         .trap_val   (csr_trap_val),
         .trap_epc   (csr_trap_epc),
-        .mret_en    (ex_mret_en),
-        .sret_en    (ex_sret_en),
+        .mret_en    (ex_mret_en & csr_commit),
+        .sret_en    (ex_sret_en & csr_commit),
         .trap_vector(trap_vector),
         .mepc_out   (mepc_out),
         .sepc_out   (sepc_out),
         .priv_level (priv_level),
         .irq_pending(irq_pending),
         .irq_cause  (irq_cause),
-        .retire_en  (mem_wb_valid),
+        .retire_en  (mem_wb_valid & csr_commit),
         .timer_val  (64'h0),
         .timer_irq  (timer_irq),
         .sw_irq     (sw_irq),
@@ -998,8 +1010,9 @@ module rv_core
     assign mstatus_mprv_out = mstatus_mprv_int;
     assign mstatus_mpp_out  = mstatus_mpp_int;
 
-    // SFENCE.VMA in EX stage → TLB flush pulse (1-cycle)
-    assign tlb_flush_out   = id_ex_valid && id_ex_ctrl.is_sfence_vma;
+    // SFENCE.VMA in EX stage → TLB flush pulse (1-cycle).  Gated by csr_commit so
+    // a frozen SFENCE under IF latency flushes once (no-op when imem_ready=1).
+    assign tlb_flush_out   = id_ex_valid && id_ex_ctrl.is_sfence_vma && csr_commit;
 
     // --- Branch / Jump resolution ---
     // Forwarded rs1/rs2 are used for branch comparisons.
@@ -1190,14 +1203,19 @@ module rv_core
             mem_wb_fpu_result_f   <= '0;
             mem_wb_fpu_result_i   <= '0;
             mal_active_wb         <= 1'b0;
-        end else if (!amo_stall && !mal_stall && !dmem_wait && imem_ready) begin
-            // Also bubble while a data access is in flight (dmem_wait): the load
-            // must not retire to WB before its data has returned.  No-op when
-            // dmem_wait==0 (the BRAM path).
-            // imem_ready freezes MEM/WB during a multi-cycle IF fetch (full
-            // pipeline freeze) so the held MEM instruction is not retired twice.
-            // No-op for a 1-cycle IF (imem_ready=1).
-            // Hold MEM/WB during AMO read phase or misaligned phase 0
+        end else if (amo_stall || mal_stall || dmem_wait) begin
+            // AMO read phase / misaligned (incl. RV32 64-bit FLD/FSD) phase 0 /
+            // data access in flight (dmem_wait): insert a BUBBLE rather than
+            // holding the previous WB instruction.  Holding would re-write the
+            // just-retired instruction's destination a second time using the now-
+            // stale live dmem_rdata, corrupting it — and double-count retire.  The
+            // in-progress AMO/mal/data instruction is still held in EX/MEM and is
+            // captured normally when the stall drops (phase 1 / write / data-ready).
+            mem_wb_ctrl   <= '0;
+            mem_wb_valid  <= 1'b0;
+            mal_active_wb <= 1'b0;
+        end else if (imem_ready) begin
+            // Normal advance.
             mem_wb_ctrl           <= ex_mem_ctrl;
             mem_wb_alu_result     <= ex_mem_ctrl.is_sc ? sc_result : ex_mem_alu_result;
             mem_wb_rd_addr        <= ex_mem_rd_addr;
@@ -1209,18 +1227,12 @@ module rv_core
             mem_wb_fpu_result_f   <= ex_mem_fpu_result_f;
             mem_wb_fpu_result_i   <= ex_mem_fpu_result_i_fwd;
             mal_active_wb         <= mal_cross;
-        end else begin
-            // AMO read phase / misaligned (incl. RV32 64-bit FLD/FSD) phase 0:
-            // insert a BUBBLE rather than holding the previous WB instruction.
-            // Holding would re-write the just-retired instruction's destination a
-            // second time using the now-stale live dmem_rdata (which has changed to
-            // the new phase-0 read), corrupting it — and would double-count retire.
-            // The in-progress AMO/mal instruction is still held in EX/MEM and is
-            // captured normally when the stall drops (phase 1 / write phase).
-            mem_wb_ctrl   <= '0;
-            mem_wb_valid  <= 1'b0;
-            mal_active_wb <= 1'b0;
         end
+        // else (~imem_ready, IF fetch in flight): HOLD MEM/WB.  The full pipeline
+        // freezes during a multi-cycle IF fetch, so MEM/WB must hold (not bubble)
+        // to preserve the MEM/WB forwarding source for a consumer in EX.  retire
+        // is gated by imem_ready (rv_csr), so holding does not double-count.
+        // NO-OP for a 1-cycle IF (imem_ready=1: this branch is never taken).
     end
 
     // =========================================================================

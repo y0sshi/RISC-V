@@ -45,7 +45,7 @@ module tb_rv_bm;
     // =========================================================================
     // DUT インスタンス
     // =========================================================================
-    rv_soc #(
+    rv_soc_bram #(
         .CLK_FREQ  (CLK_FREQ_TB),
         .BAUD_RATE (BAUD_RATE_TB),
         .IMEM_FILE (IMEM_FILE),
@@ -172,17 +172,17 @@ module tb_rv_bm;
     // Trap / MRET monitor (keep for future debugging)
     // =========================================================================
     always @(posedge clk) begin
-        if (rst_n && dut.u_core.ex_trap_enter) begin
+        if (rst_n && dut.u_cpu.u_core.ex_trap_enter) begin
             $display("[TRAP]  @%0t: trap! pc=%08h  cause=%016h  mtvec=%016h",
                      $time,
-                     dut.u_core.id_ex_pc,
-                     dut.u_core.ex_trap_cause,
-                     dut.u_core.trap_vector);
+                     dut.u_cpu.u_core.id_ex_pc,
+                     dut.u_cpu.u_core.ex_trap_cause,
+                     dut.u_cpu.u_core.trap_vector);
         end
-        if (rst_n && dut.u_core.ex_mret_en) begin
+        if (rst_n && dut.u_cpu.u_core.ex_mret_en) begin
             $display("[MRET]  @%0t: mret! mepc=%016h",
                      $time,
-                     dut.u_core.mepc_out);
+                     dut.u_cpu.u_core.mepc_out);
         end
     end
 

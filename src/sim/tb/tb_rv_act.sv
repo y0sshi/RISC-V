@@ -27,12 +27,12 @@ module tb_rv_act;
     logic rst_n = 0;
     always #5 clk = ~clk;
 
-    // DUT: rv_soc in ACT_MODE (includes rv_core + rv_mmu + rv_unified_mem).
+    // DUT: rv_soc_act (includes rv_core + rv_mmu + rv_unified_mem).
     // INIT_FILE propagates to rv_unified_mem's INIT_FILE, which calls $readmemh
     // internally -- no explicit $readmemh needed in this testbench.
     // XLEN follows rv_pkg::XLEN (32 by default, 64 with -DRV_XLEN_64) so the same
     // testbench drives both RV64 and RV32 compliance runs.
-    rv_soc #(
+    rv_soc_act #(
         .XLEN      (XLEN),
         .RST_ADDR  (MEM_BASE),
         .INIT_FILE (`HEX_FILE)
