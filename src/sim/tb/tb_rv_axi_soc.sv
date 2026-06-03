@@ -146,6 +146,9 @@ module tb_rv_axi_soc;
     function automatic logic [31:0] s_instr(input [4:0] rs2, input [4:0] rs1,
                 input [11:0] imm, input [2:0] f3);
         return {imm[11:5], rs2, rs1, f3, imm[4:0], 7'h23}; endfunction
+    function automatic logic [31:0] csr_i(input [11:0] csr, input [4:0] rs1u,
+                input [2:0] f3, input [4:0] rd);
+        return {csr, rs1u, f3, rd, 7'h73}; endfunction
 
     // instruction into IF DDR model (byte LE, base 0x8000_0000)
     task automatic imem_set(input int idx, input logic [31:0] w);
@@ -179,7 +182,12 @@ module tb_rv_axi_soc;
         imem_set(12, s_instr(5'd10, 5'd9, 12'd8, 3'b010));       // sw x10,8(x9)  DIR=0xF (periph)
         imem_set(13, i_instr(7'h13, 5'd11, 3'd0, 5'd0, 12'd5));  // x11 = 5 (OUT value)
         imem_set(14, s_instr(5'd11, 5'd9, 12'd0, 3'b010));       // sw x11,0(x9)  OUT=5 (periph)
-        imem_set(15, jal_i(5'd0, 21'sd0));                       // spin
+        // CSR: counteren WARL + rdtime (CLINT mtime wired into the 'time' CSR)
+        imem_set(15, i_instr(7'h13, 5'd13, 3'd0, 5'd0, 12'd7));  // addi x13,x0,7
+        imem_set(16, csr_i(12'h306, 5'd13, 3'b001, 5'd0));       // csrw mcounteren,x13
+        imem_set(17, csr_i(12'h306, 5'd0,  3'b010, 5'd14));      // csrr x14,mcounteren
+        imem_set(18, csr_i(12'hC01, 5'd0,  3'b010, 5'd12));      // csrr x12,time (rdtime)
+        imem_set(19, jal_i(5'd0, 21'sd0));                       // spin
 
         repeat (4) @(posedge clk);
         rst_n = 1;
@@ -198,6 +206,25 @@ module tb_rv_axi_soc;
             pass_cnt++;
         end else begin
             $display("  FAIL: GPIO out = 0x%0h (exp 5)", gpio_out_w);
+            fail_cnt++;
+        end
+
+        // mcounteren WARL readback (x14 == 7)
+        if (u_soc.u_cpu.u_core.u_regfile.regs[14] === XLEN'(7)) begin
+            $display("  PASS: mcounteren readback = 0x%0h", u_soc.u_cpu.u_core.u_regfile.regs[14]);
+            pass_cnt++;
+        end else begin
+            $display("  FAIL: mcounteren = 0x%0h (exp 7)", u_soc.u_cpu.u_core.u_regfile.regs[14]);
+            fail_cnt++;
+        end
+
+        // rdtime: 'time' CSR must reflect the free-running CLINT mtime (non-zero)
+        if (u_soc.u_cpu.u_core.u_regfile.regs[12] !== '0) begin
+            $display("  PASS: rdtime (time CSR) = %0d (CLINT mtime wired)",
+                     u_soc.u_cpu.u_core.u_regfile.regs[12]);
+            pass_cnt++;
+        end else begin
+            $display("  FAIL: rdtime = 0 (CLINT mtime NOT wired to time CSR)");
             fail_cnt++;
         end
 

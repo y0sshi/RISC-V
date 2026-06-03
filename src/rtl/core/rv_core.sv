@@ -82,7 +82,10 @@ module rv_core
     // External interrupt inputs
     input  wire              timer_irq,   // machine timer interrupt (MTIP/STIP via mideleg)
     input  wire              sw_irq,      // software interrupt
-    input  wire              ext_irq      // external interrupt
+    input  wire              ext_irq,     // external interrupt
+
+    // CLINT mtime value -> 'time' CSR (rdtime).  Tie to 0 if no timer present.
+    input  wire  [63:0]      time_val
 );
 
     // =========================================================================
@@ -987,7 +990,7 @@ module rv_core
         .irq_pending(irq_pending),
         .irq_cause  (irq_cause),
         .retire_en  (mem_wb_valid & csr_commit),
-        .timer_val  (64'h0),
+        .timer_val  (time_val),
         .timer_irq  (timer_irq),
         .sw_irq     (sw_irq),
         .ext_irq    (ext_irq),

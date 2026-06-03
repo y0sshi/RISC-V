@@ -50,7 +50,8 @@ module rv_soc_act
         .dmem_va (core_dmem_va),
         .ptw_paddr (ptw_paddr), .ptw_req (ptw_req),
         .ptw_rdata (ptw_rdata), .ptw_ready (ptw_ready),
-        .timer_irq (1'b0), .sw_irq (1'b0), .ext_irq (1'b0)
+        .timer_irq (1'b0), .sw_irq (1'b0), .ext_irq (1'b0),
+        .time_val  (64'h0)
     );
 
     // ---- Unified memory (PTW has priority over the data port) ---------------

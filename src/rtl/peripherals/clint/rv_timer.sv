@@ -39,11 +39,15 @@ module rv_timer (
     output logic [31:0] rdata,      // read data (combinational)
 
     // Timer interrupt output (level-sensitive, active high)
-    output logic        timer_irq
+    output logic        timer_irq,
+
+    // mtime value (for the core's 'time' CSR / rdtime)
+    output logic [63:0] mtime_o
 );
 
     logic [63:0] mtime;
     logic [63:0] mtimecmp;
+    assign mtime_o = mtime;
 
     // =========================================================================
     // Sequential: mtime free-run, mtimecmp write

@@ -41,6 +41,7 @@ module rv_periph
     // ---- Interrupts ----------------------------------------------------------
     output logic             timer_irq,
     output logic [1:0]       ext_irq,     // PLIC contexts
+    output logic [63:0]      mtime,       // CLINT mtime (for the core's 'time' CSR)
 
     // ---- I/O -----------------------------------------------------------------
     input  wire  [3:0]       gpio_in,
@@ -89,7 +90,8 @@ module rv_periph
         .we   (we  & is_timer_access),
         .wdata (wdata[31:0]),
         .rdata (timer_rdata),
-        .timer_irq (timer_irq)
+        .timer_irq (timer_irq),
+        .mtime_o (mtime)
     );
 
     rv_uart #(

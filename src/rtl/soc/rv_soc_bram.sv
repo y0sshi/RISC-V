@@ -38,6 +38,7 @@ module rv_soc_bram
     logic [31:0]       imem_rdata;   logic imem_ready;
     logic [XLEN-1:0]   dmem_rdata;   logic dmem_ready;
     logic              timer_irq_sig; logic [1:0] plic_ext_irq;
+    logic [63:0]       periph_mtime;
 
     // tb monitoring aliases
     logic core_dmem_req, core_dmem_we;
@@ -55,7 +56,8 @@ module rv_soc_bram
         .dmem_va (core_dmem_va),
         .ptw_paddr (ptw_paddr), .ptw_req (ptw_req),
         .ptw_rdata (ptw_rdata), .ptw_ready (ptw_ready),
-        .timer_irq (timer_irq_sig), .sw_irq (1'b0), .ext_irq (plic_ext_irq[0])
+        .timer_irq (timer_irq_sig), .sw_irq (1'b0), .ext_irq (plic_ext_irq[0]),
+        .time_val  (periph_mtime)
     );
 
     // ---- Instruction BRAM ---------------------------------------------------
@@ -76,7 +78,7 @@ module rv_soc_bram
         .addr (mmu_dmem_pa), .wdata (core_dmem_wdata),
         .req (mmu_dmem_req), .we (mmu_dmem_we),
         .is_periph (periph_is_periph), .rdata (periph_rdata), .rdata_valid (periph_rdata_valid),
-        .timer_irq (timer_irq_sig), .ext_irq (plic_ext_irq),
+        .timer_irq (timer_irq_sig), .ext_irq (plic_ext_irq), .mtime (periph_mtime),
         .gpio_in (gpio_in), .gpio_out (gpio_out),
         .uart_rx (uart_rx), .uart_tx (uart_tx_sig)
     );

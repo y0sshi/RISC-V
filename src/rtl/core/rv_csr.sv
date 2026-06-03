@@ -138,6 +138,15 @@ module rv_csr
     logic [63:0]    mcycle_cnt;
     logic [63:0]    minstret_cnt;
 
+    // Counter-enable registers (bit0=CY, bit1=TM, bit2=IR).  mcounteren gates
+    // S-mode access to cycle/time/instret; scounteren gates U-mode access.
+    // Stored as WARL (only the low 3 bits are meaningful here).  Enforcement
+    // (illegal-instruction on a disabled counter) is not done yet -- the shadows
+    // are always readable (permissive, sufficient for boot); the registers exist
+    // so firmware/Linux can program them.
+    logic [31:0]    mcounteren_reg;
+    logic [31:0]    scounteren_reg;
+
     // F-extension CSRs
     logic [4:0]     fflags_reg;  // fcsr[4:0] : NV|DZ|OF|UF|NX (accumulated)
     logic [2:0]     frm_reg;     // fcsr[7:5] : rounding mode
@@ -374,6 +383,15 @@ module rv_csr
             CSR_MCYCLE:   csr_rdata = xlen_t'(mcycle_cnt[XLEN-1:0]);
             CSR_MINSTRET: csr_rdata = xlen_t'(minstret_cnt[XLEN-1:0]);
             CSR_MHARTID:  csr_rdata = xlen_t'(HARTID);
+            CSR_MCOUNTEREN: csr_rdata = xlen_t'(mcounteren_reg);
+            CSR_SCOUNTEREN: csr_rdata = xlen_t'(scounteren_reg);
+            // User-mode read-only counter shadows (cycle / time / instret).
+            CSR_CYCLE:    csr_rdata = xlen_t'(mcycle_cnt[XLEN-1:0]);
+            CSR_TIME:     csr_rdata = xlen_t'(timer_val[XLEN-1:0]);     // CLINT mtime
+            CSR_INSTRET:  csr_rdata = xlen_t'(minstret_cnt[XLEN-1:0]);
+            CSR_CYCLEH:   csr_rdata = (XLEN == 32) ? xlen_t'(mcycle_cnt[63:32])   : '0;
+            CSR_TIMEH:    csr_rdata = (XLEN == 32) ? xlen_t'(timer_val[63:32])    : '0;
+            CSR_INSTRETH: csr_rdata = (XLEN == 32) ? xlen_t'(minstret_cnt[63:32]) : '0;
             // RV32 upper-half counters
             12'hB80:      csr_rdata = (XLEN == 32) ? xlen_t'(mcycle_cnt[63:32])   : '0;
             12'hB82:      csr_rdata = (XLEN == 32) ? xlen_t'(minstret_cnt[63:32]) : '0;
@@ -451,6 +469,8 @@ module rv_csr
             // Counters
             mcycle_cnt    <= '0;
             minstret_cnt  <= '0;
+            mcounteren_reg <= '0;
+            scounteren_reg <= '0;
             // F-extension CSRs
             fflags_reg    <= 5'h0;
             frm_reg       <= 3'h0;
@@ -563,7 +583,10 @@ module rv_csr
                     CSR_MEPC:     mepc_reg     <= {csr_new_val[XLEN-1:1], 1'b0};
                     CSR_MCAUSE:   mcause_reg   <= csr_new_val;
                     CSR_MTVAL:    mtval_reg    <= csr_new_val;
-                    // misa, mip, mcycle, minstret, mhartid: read-only
+                    // Counter-enable (WARL: keep CY/TM/IR bits [2:0])
+                    CSR_MCOUNTEREN: mcounteren_reg <= {29'b0, csr_new_val[2:0]};
+                    CSR_SCOUNTEREN: scounteren_reg <= {29'b0, csr_new_val[2:0]};
+                    // misa, mip, mcycle, minstret, mhartid, cycle/time/instret: read-only
                     default: ;
                 endcase
 

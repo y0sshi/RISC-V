@@ -331,6 +331,15 @@ package rv_pkg;
     parameter logic [11:0] CSR_MCYCLE     = 12'hB00;
     parameter logic [11:0] CSR_MINSTRET   = 12'hB02;
     parameter logic [11:0] CSR_MHARTID    = 12'hF14;
+    parameter logic [11:0] CSR_MCOUNTEREN = 12'h306;  // M counter-enable (CY/TM/IR for S)
+    // User-mode read-only counter shadows (Linux rdcycle/rdtime/rdinstret).
+    // 'time' (0xC01) shadows the CLINT mtime supplied on the timer_val input.
+    parameter logic [11:0] CSR_CYCLE      = 12'hC00;
+    parameter logic [11:0] CSR_TIME       = 12'hC01;
+    parameter logic [11:0] CSR_INSTRET    = 12'hC02;
+    parameter logic [11:0] CSR_CYCLEH     = 12'hC80;  // RV32 high halves
+    parameter logic [11:0] CSR_TIMEH      = 12'hC81;
+    parameter logic [11:0] CSR_INSTRETH   = 12'hC82;
 
     // Supervisor-level CSRs (for Linux support)
     parameter logic [11:0] CSR_SSTATUS    = 12'h100;
@@ -342,6 +351,7 @@ package rv_pkg;
     parameter logic [11:0] CSR_STVAL      = 12'h143;
     parameter logic [11:0] CSR_SIP        = 12'h144;
     parameter logic [11:0] CSR_SATP       = 12'h180;
+    parameter logic [11:0] CSR_SCOUNTEREN = 12'h106;  // S counter-enable (CY/TM/IR for U)
 
     // =========================================================================
     // Exception Codes (mcause / scause)

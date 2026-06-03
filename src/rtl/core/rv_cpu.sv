@@ -53,7 +53,10 @@ module rv_cpu
     // ---- Interrupts ----------------------------------------------------------
     input  wire              timer_irq,
     input  wire              sw_irq,
-    input  wire              ext_irq
+    input  wire              ext_irq,
+
+    // ---- CLINT mtime -> 'time' CSR (rdtime) ---------------------------------
+    input  wire  [63:0]      time_val
 );
 
     // ---- Core <-> MMU buses (internal) --------------------------------------
@@ -114,7 +117,8 @@ module rv_cpu
         .mem_fault (mem_fault_mmu),
         .timer_irq (timer_irq),
         .sw_irq    (sw_irq),
-        .ext_irq   (ext_irq)
+        .ext_irq   (ext_irq),
+        .time_val  (time_val)
     );
 
     rv_mmu #(

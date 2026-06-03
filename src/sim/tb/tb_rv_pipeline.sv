@@ -64,7 +64,8 @@ module tb_rv_pipeline;
         .mem_fault       (1'b0),
         .timer_irq       (timer_irq),
         .sw_irq          (sw_irq),
-        .ext_irq         (ext_irq)
+        .ext_irq         (ext_irq),
+        .time_val        (64'b0)
     );
 
     // Clock and memory models
