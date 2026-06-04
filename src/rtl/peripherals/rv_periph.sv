@@ -72,10 +72,16 @@ module rv_periph
             periph_rdata_reg <= '0;
             prev_periph_read <= 1'b0;
         end else begin
-            if (is_timer_access)      periph_rdata_reg <= {{(XLEN-32){1'b0}}, timer_rdata};
-            else if (is_uart_access)  periph_rdata_reg <= {{(XLEN-32){1'b0}}, uart_rdata};
-            else if (is_gpio_access)  periph_rdata_reg <= {{(XLEN-32){1'b0}}, gpio_rdata};
-            else if (is_plic_access)  periph_rdata_reg <= {{(XLEN-32){1'b0}}, plic_rdata};
+            // Replicate the 32-bit peripheral register across every 32-bit lane.
+            // On RV64 the core right-shifts a sub-XLEN load by (addr[2:0]*8) to
+            // select the byte lane within a 64-bit word; a 32-bit MMIO register at
+            // a word offset with addr[2]=1 (e.g. UART STAT @ +4) would otherwise be
+            // shifted out (>>32) and read as 0.  Peripherals return data on the low
+            // 32 bits regardless of addr[2], so replicating makes either lane valid.
+            if (is_timer_access)      periph_rdata_reg <= {(XLEN/32){timer_rdata}};
+            else if (is_uart_access)  periph_rdata_reg <= {(XLEN/32){uart_rdata}};
+            else if (is_gpio_access)  periph_rdata_reg <= {(XLEN/32){gpio_rdata}};
+            else if (is_plic_access)  periph_rdata_reg <= {(XLEN/32){plic_rdata}};
             prev_periph_read <= req & ~we & is_periph;
         end
     end

@@ -158,7 +158,7 @@ TIMER_SRC = $(CSR_SRC)
             sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal \
             sim_cdecode sim_cdecode64 sim_axi sim_axi_core sim_axi_soc \
             sim_axi_burst sim_axi_ifetch sim_dcache sim_dcache64 \
-            sim_icache sim_icache64 sim_cache_soc sim_cache_soc64 \
+            sim_icache sim_icache64 sim_cache_soc sim_cache_soc64 sim_boot \
             wave_alu wave_csr wave_rv64i wave_mext wave_mext64 wave_amo wave_amo64 \
             wave_cdecode \
             wave_mmu wave_mmu64 wave_sv wave_sv64 wave_timer wave_timer64 \
@@ -572,6 +572,29 @@ sim_cache_soc64: dirs
 
 wave_cache_soc: sim_cache_soc
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_cache_soc.vcd &
+
+# --- OpenSBI-style boot harness over a SHARED DDR image -------------------
+# Boots a firmware image (mini-SBI stand-in by default, or a real OpenSBI
+# fw_payload hex via BOOT_HEX=) on rv_soc (caches on) with instructions + data
+# + page tables all in one shared DDR (rv_axi_dualport_mem_bfm).
+#   make sim_boot
+#   make sim_boot BOOT_HEX=/abs/path/fw_payload.hex
+BOOT_SRC = $(AXI_SOC_SRC) $(TB_DIR)/rv_axi_dualport_mem_bfm.sv
+
+ifneq ($(BOOT_HEX),)
+BOOT_HEX_FLAG = -DBOOT_HEX=\"$(BOOT_HEX)\"
+else
+BOOT_HEX_FLAG =
+endif
+
+sim_boot: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) \
+		-o $(OUT_DIR)/tb_rv_boot_soc.vvp \
+		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_boot_soc.vvp
+
+wave_boot: sim_boot
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_boot_soc.vcd &
 
 # --- rv_core instruction port over AXI (variable latency) integration TB ---
 AXI_IF_SRC = $(CORE_SRC) $(BUS_DIR)/rv_axi_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv

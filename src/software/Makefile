@@ -119,7 +119,24 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello
+.PHONY: hello sim_hello boot
+
+# ----- mini-SBI boot firmware (OpenSBI stand-in for tb_rv_boot_soc) -----
+# RV64, linked at the DDR base 0x8000_0000, emitted as a base-relative verilog
+# hex (objcopy --adjust-vma) so rv_axi_dualport_mem_bfm can $readmemh it.
+#   make boot   ->  boot/sbi_boot.hex   ;   then:  (cd ../sim && make sim_boot)
+boot: boot/sbi_boot.hex
+
+boot/sbi_boot.elf: boot/sbi_boot.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/sbi_boot.S -o boot/sbi_boot.elf
+
+boot/sbi_boot.hex: boot/sbi_boot.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/sbi_boot.elf boot/sbi_boot.hex
+	@echo "  boot firmware hex: $@"
+
+
 
 # ----- Hello World -----
 hello: hello_imem.hex hello_dmem.hex
