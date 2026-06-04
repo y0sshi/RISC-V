@@ -63,6 +63,7 @@ module rv_core
     output logic             mstatus_mprv_out, // mstatus.MPRV
     output logic [1:0]       mstatus_mpp_out,  // mstatus.MPP
     output logic             tlb_flush_out,    // SFENCE.VMA pulse
+    output logic             fence_i_out,      // FENCE.I pulse (flush I-cache)
 
     // MMU stall inputs (from rv_mmu)
     input  wire              mmu_stall,   // IF/ID stall (any translation pending)
@@ -1016,6 +1017,10 @@ module rv_core
     // SFENCE.VMA in EX stage → TLB flush pulse (1-cycle).  Gated by csr_commit so
     // a frozen SFENCE under IF latency flushes once (no-op when imem_ready=1).
     assign tlb_flush_out   = id_ex_valid && id_ex_ctrl.is_sfence_vma && csr_commit;
+
+    // FENCE.I in EX stage → instruction-cache flush pulse (1-cycle).  Gated by
+    // csr_commit like the TLB flush so it fires exactly once under IF latency.
+    assign fence_i_out     = id_ex_valid && id_ex_ctrl.is_fence_i && csr_commit;
 
     // --- Branch / Jump resolution ---
     // Forwarded rs1/rs2 are used for branch comparisons.

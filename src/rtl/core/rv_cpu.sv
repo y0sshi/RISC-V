@@ -44,6 +44,9 @@ module rv_cpu
     // ---- Data virtual address (monitoring / tohost detection) ---------------
     output logic [XLEN-1:0]  dmem_va,
 
+    // ---- FENCE.I pulse (instruction-cache flush; unused by BRAM/ACT wrappers) -
+    output logic             fence_i_out,
+
     // ---- Page-table-walk port (physical address) ----------------------------
     output logic [XLEN-1:0]  ptw_paddr,
     output logic             ptw_req,
@@ -110,6 +113,7 @@ module rv_cpu
         .mstatus_mprv_out (mstatus_mprv_out),
         .mstatus_mpp_out  (mstatus_mpp_out),
         .tlb_flush_out (tlb_flush_out),
+        .fence_i_out (fence_i_out),
         .mmu_stall (mmu_stall),
         .mem_stall (mem_stall),
         .dmem_wait (dmem_wait),

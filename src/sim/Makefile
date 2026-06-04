@@ -157,6 +157,8 @@ TIMER_SRC = $(CSR_SRC)
             sim_uart sim_gpio sim_plic sim_core sim_soc sim_bm \
             sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal \
             sim_cdecode sim_cdecode64 sim_axi sim_axi_core sim_axi_soc \
+            sim_axi_burst sim_axi_ifetch sim_dcache sim_dcache64 \
+            sim_icache sim_icache64 sim_cache_soc sim_cache_soc64 \
             wave_alu wave_csr wave_rv64i wave_mext wave_mext64 wave_amo wave_amo64 \
             wave_cdecode \
             wave_mmu wave_mmu64 wave_sv wave_sv64 wave_timer wave_timer64 \
@@ -170,7 +172,9 @@ all: image \
      sim_mmu sim_mmu64 sim_sv sim_sv64 sim_timer sim_timer64 \
      sim_uart sim_gpio sim_plic sim_core sim_soc \
      sim_pipeline sim_intr sim_fpu sim_fpu_d sim_fpu_pipe sim_mal \
-     sim_cdecode sim_cdecode64
+     sim_cdecode sim_cdecode64 \
+     sim_axi sim_axi_burst sim_axi_core sim_axi_ifetch sim_axi_soc \
+     sim_dcache sim_dcache64 sim_icache sim_icache64 sim_cache_soc sim_cache_soc64
 
 dirs:
 	mkdir -p $(OUT_DIR) $(WAVE_DIR)
@@ -474,6 +478,50 @@ sim_axi: dirs
 wave_axi: sim_axi
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_axi_bridge.vcd &
 
+# --- AXI4 burst bridge unit testbench (line-fill bursts + single write) ---
+AXI_BURST_SRC = $(BUS_DIR)/rv_axi_burst_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv
+
+sim_axi_burst: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_axi_burst.vvp \
+		$(AXI_BURST_SRC) $(TB_DIR)/tb_rv_axi_burst.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_axi_burst.vvp
+
+wave_axi_burst: sim_axi_burst
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_axi_burst.vcd &
+
+# --- D-cache unit testbench (rv_dcache + burst bridge + slave BFM) ---
+CACHE_DIR = $(RTL_DIR)/cache
+DCACHE_SRC = $(CACHE_DIR)/rv_dcache.sv $(BUS_DIR)/rv_axi_burst_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv
+
+sim_dcache: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_dcache.vvp \
+		$(DCACHE_SRC) $(TB_DIR)/tb_rv_dcache.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_dcache.vvp
+
+sim_dcache64: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_dcache64.vvp \
+		$(DCACHE_SRC) $(TB_DIR)/tb_rv_dcache.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_dcache64.vvp
+
+wave_dcache: sim_dcache
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_dcache.vcd &
+
+# --- I-cache unit testbench (rv_icache + read-only burst bridge + slave BFM) ---
+ICACHE_SRC = $(CACHE_DIR)/rv_icache.sv $(BUS_DIR)/rv_axi_burst_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv
+
+sim_icache: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_icache.vvp \
+		$(ICACHE_SRC) $(TB_DIR)/tb_rv_icache.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_icache.vvp
+
+sim_icache64: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_icache64.vvp \
+		$(ICACHE_SRC) $(TB_DIR)/tb_rv_icache.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_icache64.vvp
+
+wave_icache: sim_icache
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_icache.vcd &
+
 # --- rv_core data port over AXI (variable latency) integration testbench ---
 # Runs the proven pipeline test programs with the DATA port routed through
 # rv_axi_bridge + rv_axi_slave_bfm at randomized latency (IF stays behavioral).
@@ -490,6 +538,9 @@ wave_axi_core: sim_axi_core
 # --- rv_soc AXI_MODE integration testbench (data path over AXI -> DDR model) ---
 AXI_SOC_SRC = $(CORE_SRC) \
               $(BUS_DIR)/rv_axi_bridge.sv \
+              $(BUS_DIR)/rv_axi_burst_bridge.sv \
+              $(CACHE_DIR)/rv_icache.sv \
+              $(CACHE_DIR)/rv_dcache.sv \
               $(PERI_DIR)/clint/rv_timer.sv \
               $(PERI_DIR)/uart/rv_uart.sv \
               $(PERI_DIR)/gpio/rv_gpio.sv \
@@ -505,6 +556,22 @@ sim_axi_soc: dirs
 
 wave_axi_soc: sim_axi_soc
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_axi_soc.vcd &
+
+# --- Cache effectiveness + transparency integration testbench ---
+# Two rv_soc instances (caches on / off) run the same program; verifies identical
+# results and fewer AXI read transactions with caches enabled.
+sim_cache_soc: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_cache_soc.vvp \
+		$(AXI_SOC_SRC) $(TB_DIR)/tb_rv_cache_soc.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_cache_soc.vvp
+
+sim_cache_soc64: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_cache_soc64.vvp \
+		$(AXI_SOC_SRC) $(TB_DIR)/tb_rv_cache_soc.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_cache_soc64.vvp
+
+wave_cache_soc: sim_cache_soc
+	$(GTKWAVE) $(WAVE_DIR)/tb_rv_cache_soc.vcd &
 
 # --- rv_core instruction port over AXI (variable latency) integration TB ---
 AXI_IF_SRC = $(CORE_SRC) $(BUS_DIR)/rv_axi_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv

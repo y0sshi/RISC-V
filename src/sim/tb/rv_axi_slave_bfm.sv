@@ -104,13 +104,25 @@ module rv_axi_slave_bfm #(
     endfunction
 
     // =========================================================================
-    // Read FSM
+    // Read FSM (supports multi-beat INCR bursts: arlen+1 beats)
     // =========================================================================
     typedef enum logic [1:0] { R_IDLE, R_ARWAIT, R_LAT, R_DATA } rstate_t;
     rstate_t             rstate;
     logic [7:0]          rcnt;
     logic [ADDR_WIDTH-1:0] raddr_q;
     logic [ID_WIDTH-1:0] rid_q;
+    logic [7:0]          rlen_q;   // latched ARLEN (beats - 1)
+    logic [7:0]          rbeat;    // current beat index
+
+    // Combinational backing-store read for a given beat of the current burst.
+    function automatic [DATA_WIDTH-1:0] beat_rd(input [7:0] beat);
+        logic [63:0] off;
+        logic [DATA_WIDTH-1:0] d;
+        off = byte_off(raddr_q) + 64'(beat) * NB;
+        for (int i = 0; i < NB; i++)
+            d[i*8 +: 8] = mem_b[off + i];
+        return d;
+    endfunction
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -118,6 +130,8 @@ module rv_axi_slave_bfm #(
             rcnt    <= '0;
             raddr_q <= '0;
             rid_q   <= '0;
+            rlen_q  <= '0;
+            rbeat   <= '0;
             rdata   <= '0;
         end else begin
             case (rstate)
@@ -125,6 +139,7 @@ module rv_axi_slave_bfm #(
                     if (arvalid) begin
                         raddr_q <= araddr;
                         rid_q   <= arid;
+                        rlen_q  <= arlen;
                         rcnt    <= ar_delay;
                         rstate  <= R_ARWAIT;
                     end
@@ -133,6 +148,7 @@ module rv_axi_slave_bfm #(
                     // hold ARVALID for ar_delay cycles, then accept
                     if (rcnt == 0) begin
                         rcnt   <= r_delay;
+                        rbeat  <= '0;
                         rstate <= R_LAT;
                     end else begin
                         rcnt <= rcnt - 8'd1;
@@ -140,16 +156,23 @@ module rv_axi_slave_bfm #(
                 end
                 R_LAT: begin
                     if (rcnt == 0) begin
-                        // latch read data
-                        for (int i = 0; i < NB; i++)
-                            rdata[i*8 +: 8] <= mem_b[byte_off(raddr_q) + i];
+                        // latch first beat
+                        rdata  <= beat_rd(8'd0);
                         rstate <= R_DATA;
                     end else begin
                         rcnt <= rcnt - 8'd1;
                     end
                 end
                 R_DATA: begin
-                    if (rready) rstate <= R_IDLE;
+                    // stream beats back-to-back after the initial read latency
+                    if (rready) begin
+                        if (rbeat == rlen_q) begin
+                            rstate <= R_IDLE;
+                        end else begin
+                            rbeat <= rbeat + 8'd1;
+                            rdata <= beat_rd(rbeat + 8'd1);
+                        end
+                    end
                 end
                 default: rstate <= R_IDLE;
             endcase
@@ -160,7 +183,7 @@ module rv_axi_slave_bfm #(
     assign rvalid  = (rstate == R_DATA);
     assign rid     = rid_q;
     assign rresp   = 2'b00;   // OKAY
-    assign rlast   = 1'b1;
+    assign rlast   = (rstate == R_DATA) && (rbeat == rlen_q);
 
     // =========================================================================
     // Write FSM

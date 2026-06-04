@@ -1,12 +1,20 @@
 // =============================================================================
 // rv_soc.sv - RISC-V SoC (default / real hardware): DDR over AXI4 + peripherals
 // =============================================================================
-// rv_cpu + two AXI4 masters to external memory (instruction fetch read-only
-// 32-bit; data + page-table-walk read/write XLEN) + on-chip peripheral
-// subsystem (rv_periph: CLINT/UART/PLIC/GPIO).  On a Zynq board both masters
-// fan into an AXI SmartConnect -> S_AXI_HP -> PS DDR (see boards/*/vivado).
-// Peripheral region (0xC0xx_xxxx) is served locally; everything else (DDR) goes
-// out the data AXI master.
+// rv_cpu + I/D caches + two AXI4 masters to external memory (instruction fetch
+// read-only 32-bit; data + page-table-walk read/write XLEN) + on-chip peripheral
+// subsystem (rv_periph: CLINT/UART/PLIC/GPIO).  On a Zynq board both masters fan
+// into an AXI SmartConnect -> S_AXI_HP -> PS DDR (see boards/*/vivado).
+//
+// Caches (see src/rtl/cache, docs/cache.md):
+//   - rv_icache: read-only, direct-mapped, line fill over a burst AXI read.
+//                Flushed by FENCE.I (cpu_fence_i).
+//   - rv_dcache: write-through, write-no-allocate, direct-mapped; line fill on a
+//                load miss, single-beat write-through on a store.
+//   Peripheral (0xC0xx) accesses are UNCACHED (served by rv_periph) and PTW reads
+//   BYPASS the D-cache (single-beat AXI read, arbitrated onto the data master).
+//   Set ICACHE_EN / DCACHE_EN = 0 to bypass a cache (direct single-beat AXI) for
+//   debugging; behaviour is then identical to the pre-cache SoC.
 //
 // Other build configurations:
 //   rv_soc_bram.sv - on-chip BRAM (Harvard) + peripherals (PS-less bring-up)
@@ -21,7 +29,14 @@ module rv_soc
     parameter logic [63:0] RST_ADDR     = 64'h8000_0000,
     parameter int          AXI_ID_WIDTH = 4,
     parameter int          CLK_FREQ     = 125_000_000,
-    parameter int          BAUD_RATE    = 115_200
+    parameter int          BAUD_RATE    = 115_200,
+    // ---- Cache configuration ----
+    parameter bit          ICACHE_EN    = 1'b1,
+    parameter int          ICACHE_LINE  = 32,
+    parameter int          ICACHE_SETS  = 64,
+    parameter bit          DCACHE_EN    = 1'b1,
+    parameter int          DCACHE_LINE  = 32,
+    parameter int          DCACHE_SETS  = 64
 )(
     input  wire        clk,
     input  wire        rst_n,
@@ -104,6 +119,7 @@ module rv_soc
     logic [31:0]       imem_rdata;   logic imem_ready;
     logic [XLEN-1:0]   dmem_rdata;   logic dmem_ready;
     logic              core_dmem_wait;
+    logic              cpu_fence_i;
     logic              timer_irq_sig; logic [1:0] plic_ext_irq;
     logic [63:0]       periph_mtime;
 
@@ -121,40 +137,90 @@ module rv_soc
         .dmem_rdata (dmem_rdata), .dmem_ready (dmem_ready),
         .dmem_wait (core_dmem_wait),
         .dmem_va (core_dmem_va),
+        .fence_i_out (cpu_fence_i),
         .ptw_paddr (ptw_paddr), .ptw_req (ptw_req),
         .ptw_rdata (ptw_rdata), .ptw_ready (ptw_ready),
         .timer_irq (timer_irq_sig), .sw_irq (1'b0), .ext_irq (plic_ext_irq[0]),
         .time_val  (periph_mtime)
     );
 
-    // ---- Instruction fetch AXI master (read-only, 32-bit) -------------------
-    logic if_axi_busy, if_axi_wait;
-    rv_axi_bridge #(.ADDR_WIDTH (XLEN), .DATA_WIDTH (32),
-                    .ID_WIDTH (AXI_ID_WIDTH), .READ_ONLY (1'b1)) u_axi_if (
-        .clk (clk), .rst_n (rst_n),
-        .s_req (mmu_imem_req), .s_we (1'b0), .s_addr (mmu_imem_pa),
-        .s_wdata (32'b0), .s_wstrb (4'b0),
-        .s_rdata (imem_rdata), .s_ready (imem_ready),
-        .s_busy (if_axi_busy), .s_wait (if_axi_wait),
-        .m_axi_awid (m_axi_if_awid), .m_axi_awaddr (m_axi_if_awaddr),
-        .m_axi_awlen (m_axi_if_awlen), .m_axi_awsize (m_axi_if_awsize),
-        .m_axi_awburst (m_axi_if_awburst), .m_axi_awvalid (m_axi_if_awvalid),
-        .m_axi_awready (m_axi_if_awready),
-        .m_axi_wdata (m_axi_if_wdata), .m_axi_wstrb (m_axi_if_wstrb),
-        .m_axi_wlast (m_axi_if_wlast), .m_axi_wvalid (m_axi_if_wvalid),
-        .m_axi_wready (m_axi_if_wready),
-        .m_axi_bid (m_axi_if_bid), .m_axi_bresp (m_axi_if_bresp),
-        .m_axi_bvalid (m_axi_if_bvalid), .m_axi_bready (m_axi_if_bready),
-        .m_axi_arid (m_axi_if_arid), .m_axi_araddr (m_axi_if_araddr),
-        .m_axi_arlen (m_axi_if_arlen), .m_axi_arsize (m_axi_if_arsize),
-        .m_axi_arburst (m_axi_if_arburst), .m_axi_arvalid (m_axi_if_arvalid),
-        .m_axi_arready (m_axi_if_arready),
-        .m_axi_rid (m_axi_if_rid), .m_axi_rdata (m_axi_if_rdata),
-        .m_axi_rresp (m_axi_if_rresp), .m_axi_rlast (m_axi_if_rlast),
-        .m_axi_rvalid (m_axi_if_rvalid), .m_axi_rready (m_axi_if_rready)
-    );
+    // =========================================================================
+    // Instruction fetch path: I-cache -> read-only burst AXI master
+    // =========================================================================
+    generate
+    if (ICACHE_EN) begin : gen_icache
+        logic            ic_m_req;
+        logic [XLEN-1:0] ic_m_addr;
+        logic [7:0]      ic_m_len;
+        logic [31:0]     ic_m_rdata;
+        logic            ic_m_rvalid, ic_m_rlast, ic_m_done, ic_m_busy;
+        logic [7:0]      ic_m_rbeat;
 
-    // ---- Peripheral subsystem (served locally) ------------------------------
+        rv_icache #(.XLEN (XLEN), .LINE_BYTES (ICACHE_LINE), .SETS (ICACHE_SETS)) u_ic (
+            .clk (clk), .rst_n (rst_n), .flush (cpu_fence_i),
+            .c_req (mmu_imem_req), .c_addr (mmu_imem_pa),
+            .c_rdata (imem_rdata), .c_ready (imem_ready),
+            .hit_cnt (), .miss_cnt (),
+            .m_req (ic_m_req), .m_addr (ic_m_addr), .m_len (ic_m_len),
+            .m_rdata (ic_m_rdata), .m_rvalid (ic_m_rvalid), .m_rbeat (ic_m_rbeat),
+            .m_rlast (ic_m_rlast), .m_done (ic_m_done), .m_busy (ic_m_busy)
+        );
+
+        rv_axi_burst_bridge #(.ADDR_WIDTH (XLEN), .DATA_WIDTH (32),
+                              .ID_WIDTH (AXI_ID_WIDTH), .READ_ONLY (1'b1)) u_axi_if (
+            .clk (clk), .rst_n (rst_n),
+            .s_req (ic_m_req), .s_we (1'b0), .s_addr (ic_m_addr), .s_len (ic_m_len),
+            .s_wdata (32'b0), .s_wstrb (4'b0),
+            .s_rdata (ic_m_rdata), .s_rvalid (ic_m_rvalid), .s_rbeat (ic_m_rbeat),
+            .s_rlast (ic_m_rlast), .s_done (ic_m_done), .s_busy (ic_m_busy),
+            .m_axi_awid (m_axi_if_awid), .m_axi_awaddr (m_axi_if_awaddr),
+            .m_axi_awlen (m_axi_if_awlen), .m_axi_awsize (m_axi_if_awsize),
+            .m_axi_awburst (m_axi_if_awburst), .m_axi_awvalid (m_axi_if_awvalid),
+            .m_axi_awready (m_axi_if_awready),
+            .m_axi_wdata (m_axi_if_wdata), .m_axi_wstrb (m_axi_if_wstrb),
+            .m_axi_wlast (m_axi_if_wlast), .m_axi_wvalid (m_axi_if_wvalid),
+            .m_axi_wready (m_axi_if_wready),
+            .m_axi_bid (m_axi_if_bid), .m_axi_bresp (m_axi_if_bresp),
+            .m_axi_bvalid (m_axi_if_bvalid), .m_axi_bready (m_axi_if_bready),
+            .m_axi_arid (m_axi_if_arid), .m_axi_araddr (m_axi_if_araddr),
+            .m_axi_arlen (m_axi_if_arlen), .m_axi_arsize (m_axi_if_arsize),
+            .m_axi_arburst (m_axi_if_arburst), .m_axi_arvalid (m_axi_if_arvalid),
+            .m_axi_arready (m_axi_if_arready),
+            .m_axi_rid (m_axi_if_rid), .m_axi_rdata (m_axi_if_rdata),
+            .m_axi_rresp (m_axi_if_rresp), .m_axi_rlast (m_axi_if_rlast),
+            .m_axi_rvalid (m_axi_if_rvalid), .m_axi_rready (m_axi_if_rready)
+        );
+    end else begin : gen_no_icache
+        // Bypass: direct single-beat read (identical to the pre-cache SoC).
+        logic if_busy, if_wait;
+        rv_axi_bridge #(.ADDR_WIDTH (XLEN), .DATA_WIDTH (32),
+                        .ID_WIDTH (AXI_ID_WIDTH), .READ_ONLY (1'b1)) u_axi_if (
+            .clk (clk), .rst_n (rst_n),
+            .s_req (mmu_imem_req), .s_we (1'b0), .s_addr (mmu_imem_pa),
+            .s_wdata (32'b0), .s_wstrb (4'b0),
+            .s_rdata (imem_rdata), .s_ready (imem_ready),
+            .s_busy (if_busy), .s_wait (if_wait),
+            .m_axi_awid (m_axi_if_awid), .m_axi_awaddr (m_axi_if_awaddr),
+            .m_axi_awlen (m_axi_if_awlen), .m_axi_awsize (m_axi_if_awsize),
+            .m_axi_awburst (m_axi_if_awburst), .m_axi_awvalid (m_axi_if_awvalid),
+            .m_axi_awready (m_axi_if_awready),
+            .m_axi_wdata (m_axi_if_wdata), .m_axi_wstrb (m_axi_if_wstrb),
+            .m_axi_wlast (m_axi_if_wlast), .m_axi_wvalid (m_axi_if_wvalid),
+            .m_axi_wready (m_axi_if_wready),
+            .m_axi_bid (m_axi_if_bid), .m_axi_bresp (m_axi_if_bresp),
+            .m_axi_bvalid (m_axi_if_bvalid), .m_axi_bready (m_axi_if_bready),
+            .m_axi_arid (m_axi_if_arid), .m_axi_araddr (m_axi_if_araddr),
+            .m_axi_arlen (m_axi_if_arlen), .m_axi_arsize (m_axi_if_arsize),
+            .m_axi_arburst (m_axi_if_arburst), .m_axi_arvalid (m_axi_if_arvalid),
+            .m_axi_arready (m_axi_if_arready),
+            .m_axi_rid (m_axi_if_rid), .m_axi_rdata (m_axi_if_rdata),
+            .m_axi_rresp (m_axi_if_rresp), .m_axi_rlast (m_axi_if_rlast),
+            .m_axi_rvalid (m_axi_if_rvalid), .m_axi_rready (m_axi_if_rready)
+        );
+    end
+    endgenerate
+
+    // ---- Peripheral subsystem (served locally; uncached) --------------------
     logic            periph_is_periph;
     logic [XLEN-1:0] periph_rdata;
     logic            periph_rdata_valid;
@@ -171,30 +237,75 @@ module rv_soc
     );
     assign uart_tx = uart_tx_sig;
 
-    // ---- Data + PTW arbitration to the DDR AXI master (PTW priority;
-    //      peripheral accesses are served locally and excluded) ---------------
-    logic [XLEN-1:0]   axi_d_addr, axi_d_wdata;
-    logic [XLEN/8-1:0] axi_d_wstrb;
-    logic              axi_d_req, axi_d_we;
+    // =========================================================================
+    // Data path: D-cache (DDR) | peripheral (uncached) | PTW (bypass).
+    // The D-cache memory side and the PTW share one read/write burst AXI master,
+    // arbitrated with PTW priority (they never overlap: a held data access freezes
+    // the pipeline, so no new translation/PTW can start while the D$ services it).
+    // =========================================================================
+    logic              dc_c_wait;
+    logic [XLEN-1:0]   dc_c_rdata;
+    // D-cache memory side
+    logic              dc_m_req, dc_m_we;
+    logic [XLEN-1:0]   dc_m_addr, dc_m_wdata;
+    logic [7:0]        dc_m_len;
+    logic [XLEN/8-1:0] dc_m_wstrb;
+    // Shared data burst-bridge consumer side
+    logic              br_req, br_we;
+    logic [XLEN-1:0]   br_addr, br_wdata;
+    logic [7:0]        br_len;
+    logic [XLEN/8-1:0] br_wstrb;
+    logic [XLEN-1:0]   br_rdata;
+    logic              br_rvalid, br_rlast, br_done, br_busy;
+    logic [7:0]        br_rbeat;
+
+    // Cacheable data request: not a peripheral access
+    wire dc_c_req = mmu_dmem_req & ~periph_is_periph;
+
+    generate
+    if (DCACHE_EN) begin : gen_dcache
+        rv_dcache #(.XLEN (XLEN), .LINE_BYTES (DCACHE_LINE), .SETS (DCACHE_SETS)) u_dc (
+            .clk (clk), .rst_n (rst_n),
+            .c_req (dc_c_req), .c_we (mmu_dmem_we), .c_addr (mmu_dmem_pa),
+            .c_wdata (core_dmem_wdata), .c_wstrb (core_dmem_wstrb),
+            .c_rdata (dc_c_rdata), .c_wait (dc_c_wait),
+            .hit_cnt (), .miss_cnt (),
+            .m_req (dc_m_req), .m_we (dc_m_we), .m_addr (dc_m_addr), .m_len (dc_m_len),
+            .m_wdata (dc_m_wdata), .m_wstrb (dc_m_wstrb),
+            .m_rdata (br_rdata), .m_rvalid (br_rvalid), .m_rbeat (br_rbeat),
+            .m_rlast (br_rlast), .m_done (br_done), .m_busy (br_busy)
+        );
+    end else begin : gen_no_dcache
+        // Bypass: every cacheable access is a single-beat AXI transaction.
+        assign dc_c_rdata = br_rdata;
+        assign dc_c_wait  = (dc_c_req | dc_m_req) & ~br_done;  // mirror original s_wait
+        assign dc_m_req   = dc_c_req;
+        assign dc_m_we    = mmu_dmem_we;
+        assign dc_m_addr  = mmu_dmem_pa;
+        assign dc_m_len   = 8'd0;
+        assign dc_m_wdata = core_dmem_wdata;
+        assign dc_m_wstrb = core_dmem_wstrb;
+    end
+    endgenerate
+
+    // ---- PTW (priority) vs D-cache memory side -> shared burst bridge --------
     always_comb begin
         if (ptw_req) begin
-            axi_d_addr = ptw_paddr; axi_d_wdata = '0; axi_d_wstrb = '0;
-            axi_d_req  = 1'b1;      axi_d_we    = 1'b0;
+            br_req = 1'b1; br_we = 1'b0; br_addr = ptw_paddr; br_len = 8'd0;
+            br_wdata = '0; br_wstrb = '0;
         end else begin
-            axi_d_addr = mmu_dmem_pa; axi_d_wdata = core_dmem_wdata; axi_d_wstrb = core_dmem_wstrb;
-            axi_d_req  = mmu_dmem_req & ~periph_is_periph;
-            axi_d_we   = mmu_dmem_we  & ~periph_is_periph;
+            br_req = dc_m_req; br_we = dc_m_we; br_addr = dc_m_addr; br_len = dc_m_len;
+            br_wdata = dc_m_wdata; br_wstrb = dc_m_wstrb;
         end
     end
 
-    logic [XLEN-1:0] axi_s_rdata; logic axi_s_ready, axi_s_busy, axi_s_wait;
-    rv_axi_bridge #(.ADDR_WIDTH (XLEN), .DATA_WIDTH (XLEN),
-                    .ID_WIDTH (AXI_ID_WIDTH), .READ_ONLY (1'b0)) u_axi_data (
+    rv_axi_burst_bridge #(.ADDR_WIDTH (XLEN), .DATA_WIDTH (XLEN),
+                          .ID_WIDTH (AXI_ID_WIDTH), .READ_ONLY (1'b0)) u_axi_data (
         .clk (clk), .rst_n (rst_n),
-        .s_req (axi_d_req), .s_we (axi_d_we), .s_addr (axi_d_addr),
-        .s_wdata (axi_d_wdata), .s_wstrb (axi_d_wstrb),
-        .s_rdata (axi_s_rdata), .s_ready (axi_s_ready),
-        .s_busy (axi_s_busy), .s_wait (axi_s_wait),
+        .s_req (br_req), .s_we (br_we), .s_addr (br_addr), .s_len (br_len),
+        .s_wdata (br_wdata), .s_wstrb (br_wstrb),
+        .s_rdata (br_rdata), .s_rvalid (br_rvalid), .s_rbeat (br_rbeat),
+        .s_rlast (br_rlast), .s_done (br_done), .s_busy (br_busy),
         .m_axi_awid (m_axi_awid), .m_axi_awaddr (m_axi_awaddr),
         .m_axi_awlen (m_axi_awlen), .m_axi_awsize (m_axi_awsize),
         .m_axi_awburst (m_axi_awburst), .m_axi_awvalid (m_axi_awvalid),
@@ -214,20 +325,21 @@ module rv_soc
     );
 
     // ---- Return paths -------------------------------------------------------
-    // PTW + DDR data go through the AXI master.  A peripheral access keeps the
-    // AXI bridge idle (axi_d_req=0 -> axi_s_wait=0) so the core does not stall
-    // and the peripheral 1-cycle registered read is selected next cycle.
-    assign core_dmem_wait = ptw_req ? 1'b0 : axi_s_wait;
-    assign ptw_rdata      = axi_s_rdata;
-    assign ptw_ready      = ptw_req ? axi_s_ready : 1'b0;
+    // PTW reads come straight off the burst bridge (combinational on the beat,
+    // which the PTW FSM samples on ptw_ready).  Peripheral accesses keep the data
+    // master idle so the core does not stall and the 1-cycle registered peripheral
+    // read is selected next cycle.
+    assign core_dmem_wait = ptw_req ? 1'b0 : dc_c_wait;
+    assign ptw_rdata      = br_rdata;
+    assign ptw_ready      = ptw_req ? br_done : 1'b0;
 
     always_comb begin
         if (periph_rdata_valid) begin
             dmem_rdata = periph_rdata;
             dmem_ready = 1'b1;
         end else begin
-            dmem_rdata = axi_s_rdata;
-            dmem_ready = ptw_req ? 1'b0 : axi_s_ready;
+            dmem_rdata = dc_c_rdata;
+            dmem_ready = ptw_req ? 1'b0 : ~dc_c_wait;
         end
     end
 

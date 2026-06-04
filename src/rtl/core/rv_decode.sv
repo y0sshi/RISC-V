@@ -585,7 +585,11 @@ module rv_decode
             end
 
             OP_FENCE: begin
-                // NOP for now; fence is a hint in simple implementations
+                // FENCE (funct3=000) is a NOP in this simple implementation.
+                // FENCE.I (funct3=001, Zifencei) flushes the instruction cache so
+                // self-modified / newly loaded code is re-fetched from memory.
+                if (funct3 == 3'b001)
+                    ctrl.is_fence_i = 1'b1;
             end
 
             OP_SYSTEM: begin

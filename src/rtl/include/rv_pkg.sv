@@ -286,6 +286,7 @@ package rv_pkg;
         amo_op_t    amo_op;         // AMO operation selector
         // Zicsr / privileged
         logic       is_sfence_vma;  // SFENCE.VMA — flush TLB
+        logic       is_fence_i;     // FENCE.I — flush instruction cache (Zifencei)
         // F/D extension floating-point
         logic       is_fp;        // FP instruction (not FLW/FSW but any FPU op)
         logic       fp_load;      // FLW/FLD: DMEM -> f-regfile
