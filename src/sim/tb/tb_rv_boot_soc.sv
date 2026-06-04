@@ -29,10 +29,11 @@ module tb_rv_boot_soc;
     localparam int IDW  = 4;
     localparam logic [63:0] MEM_BASE = 64'h8000_0000;
 
-    // UART divisor: rv_soc CLK_FREQ/BAUD-1.  Keep small for fast sim.
-    localparam int CLKF   = 1_152_000;
+    // NS16550 16x oversampling: bit period = 16 * divisor.  Pick CLK so the
+    // default divisor = CLK/(16*BAUD) = 1 -> 16 clocks/bit (small, fast sim).
+    localparam int CLKF   = 1_843_200;              // = 16 * 115200
     localparam int BAUD   = 115_200;
-    localparam int BITCLK = CLKF / BAUD;            // clocks per bit (= div+1 = 10)
+    localparam int BITCLK = CLKF / BAUD;            // clocks per bit (= 16)
 
     localparam int TOHOST_OFF = 32'h2000;           // TOHOST - MEM_BASE
     localparam logic [31:0] DONE_MAGIC = 32'h00C0_FFEE;

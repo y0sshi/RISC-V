@@ -11,7 +11,9 @@
 //   - UART RX ドライバー: uart_rx に文字列を注入可能
 //   - タイムアウト後に自動終了
 //
-// UART 速度: CLK_FREQ=10 MHz, BAUD_RATE=1 MHz → 10 cycles/bit
+// UART 速度: CLK_FREQ=16 MHz, BAUD_RATE=1 MHz → 16 cycles/bit
+//   (NS16550 は 16x オーバーサンプリングのため CLK >= 16*BAUD が必須。
+//    divisor = CLK/(16*BAUD) = 1 → bit period = 16*1 = 16 cycles = CLK/BAUD)
 //
 // Author: Naofumi Yoshinaga
 // =============================================================================
@@ -27,9 +29,9 @@ module tb_rv_bm;
     parameter  DMEM_FILE = "";        // -PDMEM_FILE=\"path/to/dmem.hex\"
 
     localparam int CLK_PERIOD   = 10;           // 10 ns
-    localparam int CLK_FREQ_TB  = 10_000_000;   // 10 cycles/bit @ BAUD=1Mbps
+    localparam int CLK_FREQ_TB  = 16_000_000;   // 16 cycles/bit @ BAUD=1Mbps (16x)
     localparam int BAUD_RATE_TB = 1_000_000;
-    localparam int BIT_CYCLES   = CLK_FREQ_TB / BAUD_RATE_TB;  // = 10
+    localparam int BIT_CYCLES   = CLK_FREQ_TB / BAUD_RATE_TB;  // = 16
     localparam int TIMEOUT      = 200_000;      // 全体タイムアウト [cycles]
 
     // =========================================================================

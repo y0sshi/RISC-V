@@ -61,16 +61,17 @@
             riscv,ndev = <8>;
         };
 
-        /* NOTE: rv_uart is a custom register layout with no upstream driver.
-         * For OpenSBI/Linux console support make it 16550-compatible and set
-         * compatible = "ns16550a" with reg-shift/reg-io-width, or write a driver.
-         * See docs/opensbi_sim.md "Console caveat". */
+        /* rv_uart is NS16550-compatible (reg-shift=2, reg-io-width=4), so the
+         * stock OpenSBI uart8250 and Linux 8250/ns16550 drivers work. */
         serial@c0010000 {
-            compatible = "rvcore,rv-uart";
+            compatible = "ns16550a";
             reg = <0x0 0xc0010000  0x0 0x1000>;
+            reg-shift = <2>;
+            reg-io-width = <4>;
             interrupt-parent = <&plic0>;
             interrupts = <1>;
-            clock-frequency = <1152000>;
+            clock-frequency = <1843200>;   /* match the PL clock to rv_uart */
+            current-speed = <115200>;
         };
 
         gpio@c0020000 {

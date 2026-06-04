@@ -84,19 +84,28 @@ cd src/sim && make sim_boot BOOT_HEX=/abs/path/fw_payload.hex
 to match, and place the payload/DTB so the linked addresses land in the shared
 DDR image (the BFM is base-relative to `0x8000_0000`).
 
-### Console caveat (the one real blocker for a banner)
+### Console: NS16550-compatible (resolved)
 
-OpenSBI generic prints through a **DTB-described, driver-supported UART**
-(`ns16550`/`uart8250`, `sifive,uart0`, etc.).  This SoC's `rv_uart` is a custom
-register layout with **no OpenSBI driver**, so generic OpenSBI will not find a
-console.  Two options:
-1. **Make `rv_uart` 16550-register-compatible** (THR/LSR offsets + LSR.THRE bit),
-   then the stock `uart8250` driver and the Linux `8250` driver both work.  (Recommended.)
-2. Write a tiny OpenSBI platform/console driver for `rv_uart` (custom platform).
+`rv_uart` is now **NS16550 register-compatible** (reg-shift=2, reg-io-width=4,
+16x oversampling baud), so the stock OpenSBI `uart8250` driver and the Linux
+`8250`/`ns16550` driver work unmodified -- no custom platform needed.  In the DTB
+use:
 
-Until then, the mini-SBI stand-in above validates the entire *hardware* path
-(shared DDR, caches, M/S, traps, SBI ecall console, PMP); the remaining OpenSBI
-work is firmware-side (DTB + UART driver), de-risked by this harness.
+```dts
+serial@c0010000 {
+    compatible = "ns16550a";
+    reg = <0x0 0xc0010000 0x0 0x1000>;
+    reg-shift = <2>;
+    reg-io-width = <4>;
+    clock-frequency = <CLK_HZ>;   /* the PL clock feeding rv_uart */
+    current-speed = <115200>;
+};
+```
+
+The driver writes DLL/DLM = `clock-frequency/(16*baud)`; with the 16x baud
+generator that yields the correct line rate.  Set `clock-frequency` to the actual
+PL clock.  The mini-SBI stand-in and the bare-metal C driver (`startup/uart.c`)
+both already use the 16550 register map (THR@0, LSR@0x14).
 
 ## Sample device tree
 
@@ -108,7 +117,7 @@ per the console caveat.
 
 ## Next steps toward Linux
 
-1. UART 16550 compatibility (unblocks both OpenSBI and Linux console).
+1. ✅ UART 16550 compatibility (OpenSBI/Linux console driver works -- done).
 2. Real OpenSBI `fw_payload` boots to its banner in `sim_boot` (this harness).
 3. Payload = Linux `Image`; `earlycon=sbi` first, then the 8250 console via DTB.
 4. Move to FPGA: PS DDR via S_AXI_HP (`boards/*/vivado`), DTB matching the map.

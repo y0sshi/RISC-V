@@ -105,7 +105,7 @@ module rv_periph
         .BAUD_RATE (BAUD_RATE)
     ) u_uart (
         .clk (clk), .rst_n (rst_n),
-        .addr (addr[3:0]),
+        .addr (addr[4:0]),
         .req  (req & is_uart_access),
         .we   (we  & is_uart_access),
         .wdata (wdata[31:0]),

@@ -22,15 +22,18 @@
 // UART 初期化
 // ============================================================
 void uart_init(void) {
-    UART_CTRL = UART_TXEN | UART_RXEN;
+    UART_LCR = LCR_8N1;        // 8N1
+    UART_FCR = FCR_ENABLE;     // enable + clear FIFOs
+    UART_MCR = MCR_DTR_RTS;
+    UART_IER = 0;              // polled console
 }
 
 // ============================================================
 // 1 文字送信
 // ============================================================
 void uart_putc(char c) {
-    while (!(UART_STAT & UART_TXRDY));  // TX 完了待ち
-    UART_DATA = (uint32_t)(unsigned char)c;
+    while (!(UART_LSR & LSR_THRE));     // wait for TX holding empty
+    UART_THR = (uint32_t)(unsigned char)c;
 }
 
 // ============================================================
@@ -47,8 +50,8 @@ void uart_puts(const char *s) {
 // 1 文字受信 (ブロッキング)
 // ============================================================
 char uart_getc(void) {
-    while (!(UART_STAT & UART_RXRDY));
-    return (char)(UART_DATA & 0xFF);
+    while (!(UART_LSR & LSR_DR));
+    return (char)(UART_RBR & 0xFF);
 }
 
 // ============================================================

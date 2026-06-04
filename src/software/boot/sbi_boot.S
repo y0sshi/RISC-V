@@ -20,7 +20,9 @@
 #       sbi_boot.elf sbi_boot.hex
 # =============================================================================
 
-    .equ UART_BASE,   0xC0010000      # DATA=+0, STAT=+4 (bit0=TXRDY)
+    .equ UART_BASE,   0xC0010000      # NS16550: THR=+0, LSR=+0x14
+    .equ UART_LSR,    0x14            # line status register offset
+    .equ LSR_THRE,    0x20            # TX holding empty (bit5)
     .equ TOHOST,      0x80002000      # completion sentinel word
     .equ DONE_MAGIC,  0x00C0FFEE
     .equ SBI_PUTCHAR, 1
@@ -44,10 +46,10 @@ _start:
 1:  lbu     a0, 0(a1)
     beqz    a0, 2f
     li      t3, UART_BASE
-3:  lw      t4, 4(t3)                 # STAT
-    andi    t4, t4, 1                 # TXRDY
+3:  lw      t4, UART_LSR(t3)          # LSR
+    andi    t4, t4, LSR_THRE          # THR empty?
     beqz    t4, 3b
-    sw      a0, 0(t3)                 # DATA <- char
+    sw      a0, 0(t3)                 # THR <- char
     addi    a1, a1, 1
     j       1b
 2:
@@ -80,10 +82,10 @@ mtrap:
 
 do_putchar:
     li      t3, UART_BASE
-4:  lw      t4, 4(t3)
-    andi    t4, t4, 1
+4:  lw      t4, UART_LSR(t3)
+    andi    t4, t4, LSR_THRE
     beqz    t4, 4b
-    sw      a0, 0(t3)                 # putchar(a0)
+    sw      a0, 0(t3)                 # putchar(a0) -> THR
     j       mret_skip
 
 do_done:
