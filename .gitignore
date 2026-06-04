@@ -64,3 +64,6 @@ tests/results/
 Thumbs.db
 .nvim
 
+
+# OpenSBI build area (cloned + build artifacts)
+tests/opensbi/work/

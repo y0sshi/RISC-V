@@ -120,7 +120,7 @@ module rv_soc
     logic [XLEN-1:0]   dmem_rdata;   logic dmem_ready;
     logic              core_dmem_wait;
     logic              cpu_fence_i;
-    logic              timer_irq_sig; logic [1:0] plic_ext_irq;
+    logic              timer_irq_sig; logic sw_irq_sig; logic [1:0] plic_ext_irq;
     logic [63:0]       periph_mtime;
 
     // tb monitoring aliases
@@ -140,7 +140,7 @@ module rv_soc
         .fence_i_out (cpu_fence_i),
         .ptw_paddr (ptw_paddr), .ptw_req (ptw_req),
         .ptw_rdata (ptw_rdata), .ptw_ready (ptw_ready),
-        .timer_irq (timer_irq_sig), .sw_irq (1'b0), .ext_irq (plic_ext_irq[0]),
+        .timer_irq (timer_irq_sig), .sw_irq (sw_irq_sig), .ext_irq (plic_ext_irq[0]),
         .time_val  (periph_mtime)
     );
 
@@ -156,7 +156,8 @@ module rv_soc
         logic            ic_m_rvalid, ic_m_rlast, ic_m_done, ic_m_busy;
         logic [7:0]      ic_m_rbeat;
 
-        rv_icache #(.XLEN (XLEN), .LINE_BYTES (ICACHE_LINE), .SETS (ICACHE_SETS)) u_ic (
+        rv_icache #(.XLEN (XLEN), .LINE_BYTES (ICACHE_LINE), .SETS (ICACHE_SETS),
+                    .RST_ADDR (RST_ADDR)) u_ic (
             .clk (clk), .rst_n (rst_n), .flush (cpu_fence_i),
             .c_req (mmu_imem_req), .c_addr (mmu_imem_pa),
             .c_rdata (imem_rdata), .c_ready (imem_ready),
@@ -231,7 +232,7 @@ module rv_soc
         .addr (mmu_dmem_pa), .wdata (core_dmem_wdata),
         .req (mmu_dmem_req), .we (mmu_dmem_we),
         .is_periph (periph_is_periph), .rdata (periph_rdata), .rdata_valid (periph_rdata_valid),
-        .timer_irq (timer_irq_sig), .ext_irq (plic_ext_irq), .mtime (periph_mtime),
+        .timer_irq (timer_irq_sig), .sw_irq (sw_irq_sig), .ext_irq (plic_ext_irq), .mtime (periph_mtime),
         .gpio_in (gpio_in), .gpio_out (gpio_out),
         .uart_rx (uart_rx), .uart_tx (uart_tx_sig)
     );

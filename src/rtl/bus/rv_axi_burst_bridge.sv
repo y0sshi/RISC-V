@@ -117,6 +117,7 @@ module rv_axi_burst_bridge #(
     logic [DATA_WIDTH-1:0]   wdata_q;
     logic [DATA_WIDTH/8-1:0] wstrb_q;
     logic [7:0]              beat_q;    // current read beat index
+    logic [DATA_WIDTH-1:0]   rdata_hold; // last read-beat data, held after completion
 
     wire read_beat  = (state == ST_R) && m_axi_rvalid && m_axi_rready;
     wire read_last  = read_beat && m_axi_rlast;
@@ -126,7 +127,10 @@ module rv_axi_burst_bridge #(
         s_rvalid = read_beat;
         s_rbeat  = beat_q;
         s_rlast  = read_beat && m_axi_rlast;
-        s_rdata  = m_axi_rdata;
+        // On a beat present the AXI data combinationally (cache fills / PTW sample
+        // it that cycle); otherwise hold the last beat so a consumer that samples
+        // one cycle LATE (the cache-bypass data port reads in WB) still sees it.
+        s_rdata  = read_beat ? m_axi_rdata : rdata_hold;
         s_done   = read_last | write_done;
         s_busy   = (state != ST_IDLE);
     end
@@ -139,7 +143,9 @@ module rv_axi_burst_bridge #(
             wdata_q <= '0;
             wstrb_q <= '0;
             beat_q  <= '0;
+            rdata_hold <= '0;
         end else begin
+            if (read_beat) rdata_hold <= m_axi_rdata;   // hold each beat for late readers
             case (state)
                 ST_IDLE: begin
                     if (s_req) begin

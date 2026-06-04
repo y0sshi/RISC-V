@@ -58,7 +58,8 @@ module tb_rv_icache;
     logic [IDW-1:0]  rid;    logic [31:0]     rdata;   logic [1:0] rresp;
     logic            rlast, rvalid, rready;
 
-    rv_icache #(.XLEN (XLEN), .LINE_BYTES (LINE_BYTES), .SETS (SETS)) u_ic (
+    rv_icache #(.XLEN (XLEN), .LINE_BYTES (LINE_BYTES), .SETS (SETS),
+                .RST_ADDR (BASE)) u_ic (
         .clk (clk), .rst_n (rst_n), .flush (flush),
         .c_req (c_req), .c_addr (c_addr), .c_rdata (c_rdata), .c_ready (c_ready),
         .hit_cnt (hit_cnt), .miss_cnt (miss_cnt),
@@ -134,14 +135,20 @@ module tb_rv_icache;
         end
     endtask
 
-    // Fetch the 32-bit window at byte address A (BRAM-style 1-cycle pipeline)
+    // Fetch the 32-bit window at byte address A.  The I$ advances its internal
+    // addr_q with the same enable the core uses for fetch_pc (on c_ready), so we
+    // hold c_addr=A and read c_rdata on the cycle the I$ is actually serving A
+    // (addr_q == A && c_ready) -- the pipelined-fetch contract.
     task automatic fetch(input [XLEN-1:0] a, output [31:0] d);
+        logic done;
         begin
+            done = 1'b0;
             @(negedge clk);
             c_req = 1; c_addr = a;
-            @(negedge clk); #1;            // addr_q now registered = a
-            while (!c_ready) begin @(negedge clk); #1; end
-            d = c_rdata;
+            while (!done) begin
+                @(negedge clk); #1;
+                if (c_ready && (u_ic.addr_q == a)) begin d = c_rdata; done = 1'b1; end
+            end
         end
     endtask
 

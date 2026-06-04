@@ -36,9 +36,10 @@
 `default_nettype none
 
 module rv_icache #(
-    parameter int XLEN       = 32,
-    parameter int LINE_BYTES = 32,
-    parameter int SETS       = 64
+    parameter int          XLEN       = 32,
+    parameter int          LINE_BYTES = 32,
+    parameter int          SETS       = 64,
+    parameter logic [63:0] RST_ADDR   = 64'h0  // initial fetch address (= core reset PC)
 ) (
     input  wire                clk,
     input  wire                rst_n,
@@ -135,15 +136,20 @@ module rv_icache #(
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state    <= S_LOOKUP;
-            addr_q   <= '0;
+            addr_q   <= RST_ADDR[XLEN-1:0];
             req_q    <= 1'b0;
             hit_cnt  <= '0;
             miss_cnt <= '0;
             fill_idx <= '0; fill_tag <= '0; fill_base <= '0;
             for (i = 0; i < SETS; i = i + 1) valid[i] <= 1'b0;
         end else begin
-            // Track the fetch address one cycle (synchronous-read pipeline).
-            addr_q <= c_addr;
+            // Track the fetch address with the SAME enable the core uses for
+            // fetch_pc (advance only when this fetch completes, c_ready).  This
+            // keeps addr_q == fetch_pc even when imem_addr transiently changes
+            // (a branch/trap redirect) while the I$ holds c_ready=0 during a miss
+            // fill -- otherwise addr_q would latch the redirect target and the I$
+            // would return its window mis-tagged as the held fetch_pc.
+            if (c_ready) addr_q <= c_addr;
             req_q  <= c_req;
 
             // FENCE.I invalidate (cheap: clear all valid bits).

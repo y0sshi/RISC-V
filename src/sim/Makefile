@@ -587,13 +587,68 @@ else
 BOOT_HEX_FLAG =
 endif
 
+# Optional: override the run length, e.g. make sim_boot BOOT_MAX=8000000
+ifneq ($(BOOT_MAX),)
+BOOT_MAX_FLAG = -DBOOT_MAX_CYCLES=$(BOOT_MAX)
+else
+BOOT_MAX_FLAG =
+endif
+
+# Optional: -DBOOT_TRACE early divergence trace (make sim_boot BOOT_TRACE=1)
+ifneq ($(BOOT_TRACE),)
+BOOT_TRACE_FLAG = -DBOOT_TRACE
+ifneq ($(BOOT_CYCTRACE),)
+BOOT_TRACE_FLAG += -DBOOT_CYCTRACE
+endif
+ifneq ($(BOOT_EXEC),)
+BOOT_TRACE_FLAG += -DBOOT_EXEC
+endif
+ifneq ($(BOOT_WIN),)
+BOOT_TRACE_FLAG += -DBOOT_WIN=$(BOOT_WIN)
+endif
+# BOOT_HANG_PC: pass a DECIMAL fetch_pc value (a single quote in 64'h.. breaks the
+# docker sh -c recipe).  e.g. 0x800004e0 -> BOOT_HANG_PC=2147485408
+ifneq ($(BOOT_HANG_PC),)
+BOOT_TRACE_FLAG += -DBOOT_HANG_PC=$(BOOT_HANG_PC)
+endif
+ifneq ($(BOOT_DUMP_AT),)
+BOOT_TRACE_FLAG += -DBOOT_DUMP_AT=$(BOOT_DUMP_AT)
+endif
+ifneq ($(BOOT_EXEC_LO),)
+BOOT_TRACE_FLAG += -DBOOT_EXEC_LO=$(BOOT_EXEC_LO)
+endif
+else
+BOOT_TRACE_FLAG =
+endif
+
+# Optional cache bypass for debug: make sim_boot BOOT_NO_DCACHE=1 / BOOT_NO_ICACHE=1
+BOOT_DBG_FLAG =
+ifneq ($(BOOT_NO_DCACHE),)
+BOOT_DBG_FLAG += -DBOOT_NO_DCACHE
+endif
+ifneq ($(BOOT_NO_ICACHE),)
+BOOT_DBG_FLAG += -DBOOT_NO_ICACHE
+endif
+ifneq ($(BOOT_ICACHE_SETS),)
+BOOT_DBG_FLAG += -DBOOT_ICACHE_SETS=$(BOOT_ICACHE_SETS)
+endif
+ifneq ($(BOOT_DCACHE_SETS),)
+BOOT_DBG_FLAG += -DBOOT_DCACHE_SETS=$(BOOT_DCACHE_SETS)
+endif
+# Opt-in VCD dump (off by default: the 64 MiB shared-DDR array makes the VCD
+# huge and the run much slower).  wave_boot sets this automatically.
+ifneq ($(BOOT_VCD),)
+BOOT_DBG_FLAG += -DBOOT_VCD
+endif
+
 sim_boot: dirs
-	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) \
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
 		-o $(OUT_DIR)/tb_rv_boot_soc.vvp \
 		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
 	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_boot_soc.vvp
 
-wave_boot: sim_boot
+wave_boot:
+	$(MAKE) sim_boot BOOT_VCD=1
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_boot_soc.vcd &
 
 # --- rv_core instruction port over AXI (variable latency) integration TB ---

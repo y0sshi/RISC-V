@@ -40,6 +40,7 @@ module rv_periph
 
     // ---- Interrupts ----------------------------------------------------------
     output logic             timer_irq,
+    output logic             sw_irq,      // CLINT msip software interrupt
     output logic [1:0]       ext_irq,     // PLIC contexts
     output logic [63:0]      mtime,       // CLINT mtime (for the core's 'time' CSR)
 
@@ -91,12 +92,13 @@ module rv_periph
     // ---- Peripherals ---------------------------------------------------------
     rv_timer u_timer (
         .clk (clk), .rst_n (rst_n),
-        .addr (addr[3:0]),
+        .addr (addr[15:0]),
         .req  (req & is_timer_access),
         .we   (we  & is_timer_access),
         .wdata (wdata[31:0]),
         .rdata (timer_rdata),
         .timer_irq (timer_irq),
+        .sw_irq (sw_irq),
         .mtime_o (mtime)
     );
 

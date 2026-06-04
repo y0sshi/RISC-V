@@ -198,6 +198,41 @@ module tb_rv_dcache;
         do_load (BASE + 'h40, rd); check(rd, 'hABCD_0001, "post-evict value ok");
         check_i(miss_cnt - m0, 1, "evicted -> miss");
 
+        // 5b) store-then-load to an UNCACHED line at a non-zero word index
+        //     (function prologue/epilogue: sd ra,24(sp) ; ld ra,24(sp)).  The load
+        //     misses and must fill, returning the requested word (wsel != 0).
+        begin : raw_nonzero_wsel
+            integer lat, w;
+            for (lat = 0; lat <= 3; lat = lat + (lat<1?1:2)) begin
+                set_latency(lat[7:0]);
+                for (w = 0; w < LINE_BYTES/WB; w = w + 1) begin
+                    // fresh line each time (stride by SET_STRIDE so it is uncached)
+                    do_store(BASE + 'h4000 + lat*SET_STRIDE + w*WB, 'h7700_0000 + (lat<<4) + w);
+                    do_load (BASE + 'h4000 + lat*SET_STRIDE + w*WB, rd);
+                    check(rd, 'h7700_0000 + (lat<<4) + w, "RAW store->load uncached, wsel!=0");
+                end
+            end
+        end
+
+        // 5c) partial-wstrb (sub-word) store -> load, both hit-update and miss
+        //     (RV64 SW: 32-bit store to addr[2]=1 uses wstrb=0xF0; addr[2]=0 -> 0x0F)
+        if (XLEN == 64) begin : partial_wstrb
+            // preload a full word, then SW the upper / lower half, read back
+            do_store(BASE + 'h6000, 64'hAAAA_AAAA_BBBB_BBBB);     // full (cached now)
+            @(negedge clk); c_req=1; c_we=1; c_addr=BASE+'h6000;
+            c_wdata=64'h1234_5678_0000_0000; c_wstrb=8'hF0;       // SW upper half (hit update)
+            #1; while (c_wait) begin @(negedge clk); #1; end
+            c_req=0; c_we=0; c_wstrb='1; @(negedge clk);
+            do_load(BASE + 'h6000, rd);
+            check(rd, 64'h1234_5678_BBBB_BBBB, "SW upper-half hit-update");
+            @(negedge clk); c_req=1; c_we=1; c_addr=BASE+'h6000;
+            c_wdata=64'h0000_0000_9ABC_DEF0; c_wstrb=8'h0F;       // SW lower half
+            #1; while (c_wait) begin @(negedge clk); #1; end
+            c_req=0; c_we=0; c_wstrb='1; @(negedge clk);
+            do_load(BASE + 'h6000, rd);
+            check(rd, 64'h1234_5678_9ABC_DEF0, "SW lower-half hit-update");
+        end
+
         // 6) latency sweep: many words across a line, all read back correctly
         begin : sweep
             integer lat, i;

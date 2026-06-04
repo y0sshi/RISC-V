@@ -119,7 +119,24 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello boot
+.PHONY: hello sim_hello boot stack_test
+
+# ----- stack_test: minimal reproducer for the variable-latency stack bug -----
+# Hammers the prologue/epilogue (sd ra/s0 ; recursive call ; ld ra/s0 ; ret)
+# pattern that corrupted the stack pointer under the AXI/cache path (the bug that
+# blocked real OpenSBI; fixed 2026-06-05).  Boots in tb_rv_boot_soc like the
+# firmware:  make stack_test  &&  (cd ../sim && make sim_boot \
+#   BOOT_HEX=../software/boot/stack_test.hex)
+stack_test: boot/stack_test.hex
+
+boot/stack_test.elf: boot/stack_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/stack_test.S -o boot/stack_test.elf
+
+boot/stack_test.hex: boot/stack_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/stack_test.elf boot/stack_test.hex
+	@echo "  stack_test hex: $@"
 
 # ----- mini-SBI boot firmware (OpenSBI stand-in for tb_rv_boot_soc) -----
 # RV64, linked at the DDR base 0x8000_0000, emitted as a base-relative verilog

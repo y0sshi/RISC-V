@@ -214,13 +214,25 @@ module rv_core
     // resolution (branch/trap commit + wrong-path kill) is deferred to the
     // completion cycle.  NO-OP for a 1-cycle IF (imem_ready=1 -> & 1).
     assign flush_id    = redir_eff & imem_ready;
-    // Suppress load-use bubble injection when stall_ex=1: the load can't
-    // advance to EX/MEM while the pipeline is frozen, so keep it in ID/EX
-    // (stall_id holds it there) rather than flushing it.  The bubble will be
-    // injected naturally on the cycle when stall_ex drops to 0.  redir_eff (vs
-    // raw branch_taken_ex) also bubbles ID/EX through a latched-redirect pending
-    // window so a wrong-path fetch cannot leak into EX.
-    assign flush_ex    = ((load_use_hazard && !stall_ex) | redir_eff) & imem_ready;
+    // flush_ex bubbles ID/EX (which holds the EX-stage instruction) the cycle a
+    // resolving branch/JAL/JALR or a load-use hazard ADVANCES out of EX, so the
+    // wrong-path / load-shadow instruction behind it does not execute.  It must be
+    // gated by ~stall_ex (the exact condition under which the EX instruction
+    // advances to EX/MEM), NOT merely by imem_ready: if a redirect resolves while
+    // stall_ex holds the EX instruction for a reason OTHER than ~imem_ready (e.g.
+    // dmem_wait from a prior store still completing, amo_stall, mal_stall,
+    // mem_stall, fpu_busy), then imem_ready=1 would let flush_ex CLEAR the branch
+    // from ID/EX while stall_ex prevents EX/MEM from capturing it -- losing the
+    // instruction.  Conditional branches survive this (no writeback), but a JAL/JALR
+    // would lose its link-register write: the redirect still fires (PC jumps to the
+    // target) yet `ra` is never updated, so the matching `ret` returns to a stale
+    // address (found via real OpenSBI: `jal` right after `sd s6,off(sp)`).  Gating
+    // by ~stall_ex holds the branch/JAL in EX until it can advance and capture its
+    // result; the redirect is applied throughout via redir_eff (independent of
+    // flush_ex), and the wrong path stays bubbled in IF/ID by flush_id.  ~stall_ex
+    // implies imem_ready, so this is a strict refinement / no-op whenever the only
+    // stall source is ~imem_ready or there is no stall (the common BRAM case).
+    assign flush_ex    = (load_use_hazard | redir_eff) & ~stall_ex;
     // EX/MEM must NOT be flushed for branch or load-use:
     //   - branch in EX: EX/MEM holds the instruction before the branch (already
     //     committed to EX; it must reach MEM/WB).  JAL's rd writeback also lives
@@ -449,6 +461,11 @@ module rv_core
     // FP operands registered from fregfile (64-bit for F+D extensions)
     logic [63:0]     id_ex_frs1_data, id_ex_frs2_data, id_ex_frs3_data;
 
+    // Forwarded EX operands (declared here so the ID/EX register can latch them
+    // while an instruction is held in EX; driven by the forwarding muxes below).
+    logic [XLEN-1:0] fwd_rs1_data, fwd_rs2_data;
+    logic [63:0]     fwd_frs1_data, fwd_frs2_data, fwd_frs3_data;
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush_ex) begin
             id_ex_ctrl      <= '0;
@@ -486,8 +503,25 @@ module rv_core
             id_ex_frs1_data <= id_frs1_data;
             id_ex_frs2_data <= id_frs2_data;
             id_ex_frs3_data <= id_frs3_data;
+        end else begin
+            // stall_id=1 && !flush_ex — hold this instruction in EX, but REFRESH the
+            // operand data with the currently-forwarded value.  A consumer frozen in
+            // EX would otherwise lose a forwarding source that advances or bubbles
+            // out from under it while it waits — e.g. MEM/WB bubbling on
+            // dmem_wait/amo_stall/mal_stall (a store stalling the pipeline) drops the
+            // address-producing instruction's result, so a dependent store reverts to
+            // its stale ID/EX operand and writes the wrong address.  By latching the
+            // resolved forward each stall cycle the operand stays correct once the
+            // source leaves the forward network (it has already retired to the
+            // regfile).  When no forward is active fwd_*_data == id_ex_*_data, so this
+            // reduces to a plain hold (a no-op for the unstalled steady state, which
+            // never takes this branch).  All other ID/EX fields are held.
+            id_ex_rs1_data  <= fwd_rs1_data;
+            id_ex_rs2_data  <= fwd_rs2_data;
+            id_ex_frs1_data <= fwd_frs1_data;
+            id_ex_frs2_data <= fwd_frs2_data;
+            id_ex_frs3_data <= fwd_frs3_data;
         end
-        // else: stall_id=1 && !flush_ex — hold current ID/EX value
     end
 
     // =========================================================================
@@ -554,7 +588,7 @@ module rv_core
     // --- Forwarded operands ---
     // wb_data (MEM/WB result) is defined after the MEM/WB register below.
     // SV always_comb allows this forward reference since there is no circular path.
-    logic [XLEN-1:0] fwd_rs1_data, fwd_rs2_data;
+    // fwd_rs1_data, fwd_rs2_data forward-declared above (latched by ID/EX hold).
 
     always_comb begin
         unique case (fwd_rs1_sel)
@@ -577,7 +611,7 @@ module rv_core
     // before their full declaration in the EX/MEM and MEM/WB register sections.
     logic [63:0] ex_mem_fpu_result_f;
     logic [63:0] mem_wb_fpu_result_f;
-    logic [63:0] fwd_frs1_data, fwd_frs2_data, fwd_frs3_data;
+    // fwd_frs1_data, fwd_frs2_data, fwd_frs3_data forward-declared above.
 
     always_comb begin
         unique case (fwd_frs1_sel)
@@ -717,21 +751,30 @@ module rv_core
             amo_state         <= 1'b0;
             reservation_valid <= 1'b0;
             reservation_addr  <= '0;
-        end else if (!dmem_wait) begin
-            // dmem_wait holds the AMO FSM so a phase advances only once its
-            // data access has actually completed (no-op when dmem_wait==0).
-            // AMO 2-phase: toggle state on active AMO
-            if (amo_active && !amo_state)
-                amo_state <= 1'b1;   // phase 0 → phase 1
-            else
-                amo_state <= 1'b0;   // phase 1 → idle, or no AMO
+        end else begin
+            // AMO 2-phase: advance read(0) -> write(1) ONCE when the read access
+            // completes, and HOLD the write phase until the AMO actually leaves
+            // the MEM stage (amo_active drops).  Previously amo_state toggled back
+            // to 0 on the next !dmem_wait, so if the AMO was held in MEM by an
+            // UNRELATED stall (e.g. ~imem_ready during an in-flight instruction
+            // fetch under AXI/DDR), it re-entered the read phase and the whole AMO
+            // executed twice (e.g. OpenSBI's lottery amoadd ran 0->1->2, so the
+            // single hart lost the boot-hart lottery).  Re-issuing the WRITE while
+            // held is harmless (idempotent: same address, same computed value);
+            // re-issuing the READ was the bug.
+            if (!amo_active)
+                amo_state <= 1'b0;                    // reset only when AMO leaves MEM
+            else if (!dmem_wait && !amo_state)
+                amo_state <= 1'b1;                    // read complete -> write phase
 
-            // Reservation update (in MEM stage)
-            if (ex_mem_ctrl.is_lr && ex_mem_valid) begin
-                reservation_valid <= 1'b1;
-                reservation_addr  <= ex_mem_alu_result;
-            end else if (ex_mem_ctrl.is_sc && ex_mem_valid) begin
-                reservation_valid <= 1'b0;   // SC always clears reservation
+            // Reservation update (in MEM stage), once the access completes
+            if (!dmem_wait) begin
+                if (ex_mem_ctrl.is_lr && ex_mem_valid) begin
+                    reservation_valid <= 1'b1;
+                    reservation_addr  <= ex_mem_alu_result;
+                end else if (ex_mem_ctrl.is_sc && ex_mem_valid) begin
+                    reservation_valid <= 1'b0;   // SC always clears reservation
+                end
             end
         end
     end
@@ -785,6 +828,10 @@ module rv_core
         end else begin
             // State advances only when the current phase's data access has
             // completed (held by dmem_wait under variable latency; no-op when 0).
+            // NOTE: unlike amo_state (which is gated by is_amo in the dmem driver),
+            // mal_state is consumed by ALL loads/stores, so it must drop the cycle
+            // the access advances -- it cannot be held high into the next
+            // instruction's MEM cycle (that mis-addresses the next access).
             if (!dmem_wait) begin
                 if (mal_cross && !mal_state)
                     mal_state <= 1'b1;   // phase 0 -> phase 1
@@ -1194,6 +1241,12 @@ module rv_core
     logic [BYTE_LANE_W-1:0] mem_wb_byte_offset;  // addr[BYTE_LANE_W-1:0] — byte lane selector for sub-word loads
     // mem_wb_fpu_result_f declared earlier (forward-decl for FP forwarding mux, 64-bit)
     logic [XLEN-1:0] mem_wb_fpu_result_i;
+    // mem_wb_fresh: 1 only on the cycle MEM/WB just advanced (the WB instruction's
+    // FIRST cycle in WB).  A load's dmem_rdata is valid on this cycle; on later
+    // (held) cycles the live dmem_rdata reflects a YOUNGER load re-issuing from MEM
+    // during an IF freeze, so the WB load must use a latched copy (dmem_rdata_held).
+    logic            mem_wb_fresh;
+    logic [XLEN-1:0] dmem_rdata_held;
 
     // SC result: 0 = success, 1 = failure (rd receives this value via WB_SRC_ALU)
     wire [XLEN-1:0] sc_result = {{(XLEN-1){1'b0}}, ~sc_success};
@@ -1211,6 +1264,7 @@ module rv_core
             mem_wb_fpu_result_f   <= '0;
             mem_wb_fpu_result_i   <= '0;
             mal_active_wb         <= 1'b0;
+            mem_wb_fresh          <= 1'b0;
         end else if (amo_stall || mal_stall || dmem_wait) begin
             // AMO read phase / misaligned (incl. RV32 64-bit FLD/FSD) phase 0 /
             // data access in flight (dmem_wait): insert a BUBBLE rather than
@@ -1222,8 +1276,10 @@ module rv_core
             mem_wb_ctrl   <= '0;
             mem_wb_valid  <= 1'b0;
             mal_active_wb <= 1'b0;
+            mem_wb_fresh  <= 1'b0;
         end else if (imem_ready) begin
-            // Normal advance.
+            // Normal advance.  This instruction is FRESH in WB next cycle.
+            mem_wb_fresh          <= 1'b1;
             mem_wb_ctrl           <= ex_mem_ctrl;
             mem_wb_alu_result     <= ex_mem_ctrl.is_sc ? sc_result : ex_mem_alu_result;
             mem_wb_rd_addr        <= ex_mem_rd_addr;
@@ -1235,13 +1291,28 @@ module rv_core
             mem_wb_fpu_result_f   <= ex_mem_fpu_result_f;
             mem_wb_fpu_result_i   <= ex_mem_fpu_result_i_fwd;
             mal_active_wb         <= mal_cross;
+        end else begin
+            // (~imem_ready, IF fetch in flight): HOLD MEM/WB.  The full pipeline
+            // freezes during a multi-cycle IF fetch, so MEM/WB must hold (not bubble)
+            // to preserve the MEM/WB forwarding source for a consumer in EX.  retire
+            // is gated by imem_ready (rv_csr), so holding does not double-count.
+            // No longer FRESH: a held load must use dmem_rdata_held (see below), as
+            // the live dmem_rdata now belongs to a younger load re-issuing from MEM.
+            // NO-OP for a 1-cycle IF (imem_ready=1: this branch is never taken).
+            mem_wb_fresh <= 1'b0;
         end
-        // else (~imem_ready, IF fetch in flight): HOLD MEM/WB.  The full pipeline
-        // freezes during a multi-cycle IF fetch, so MEM/WB must hold (not bubble)
-        // to preserve the MEM/WB forwarding source for a consumer in EX.  retire
-        // is gated by imem_ready (rv_csr), so holding does not double-count.
-        // NO-OP for a 1-cycle IF (imem_ready=1: this branch is never taken).
     end
+
+    // Latch the load result on its FRESH WB cycle so a load HELD in MEM/WB across an
+    // IF freeze writes back / forwards its OWN data, not the live dmem_rdata of a
+    // younger load re-issuing from the (frozen) MEM stage.  NO-OP when imem_ready=1
+    // every cycle (every WB instruction is fresh for its single WB cycle).
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)            dmem_rdata_held <= '0;
+        else if (mem_wb_fresh) dmem_rdata_held <= dmem_rdata;
+    end
+    // Effective load data for WB: live on the fresh cycle, latched while held.
+    wire [XLEN-1:0] dmem_eff = mem_wb_fresh ? dmem_rdata : dmem_rdata_held;
 
     // =========================================================================
     // Stage 5: Writeback (WB)
@@ -1271,7 +1342,7 @@ module rv_core
     logic [2*XLEN-1:0] mal_wide;
     logic [XLEN-1:0]   mal_combined;
     assign mal_wide     = ({(XLEN)'(0), mal_first_data} >> wb_shr)
-                        | ({(XLEN)'(0), dmem_rdata}     << wb_shl);
+                        | ({(XLEN)'(0), dmem_eff}       << wb_shl);
     assign mal_combined = mal_wide[XLEN-1:0];
 
     // dmem_shifted: for normal (non-crossing) loads, shift by byte offset.
@@ -1282,7 +1353,7 @@ module rv_core
             dmem_shifted = mal_combined;
         else
             // Shift by byte_offset*8: RV32 max shift=24, RV64 max shift=56
-            dmem_shifted = dmem_rdata >> ({3'b0, mem_wb_byte_offset} << 3);
+            dmem_shifted = dmem_eff >> ({3'b0, mem_wb_byte_offset} << 3);
     end
 
     always_comb begin
