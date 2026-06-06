@@ -28,7 +28,7 @@ module tb_rv_plic;
     logic        clk;
     logic        rst_n;
 
-    logic [11:0] addr;
+    logic [21:0] addr;
     logic        req;
     logic        we;
     logic [31:0] wdata;
@@ -62,23 +62,24 @@ module tb_rv_plic;
     // =========================================================================
     // Address constants
     // =========================================================================
+    // Standard SiFive PLIC map (offsets from the PLIC base).
     // Priority: base 0x000, source N at offset N*4
-    function automatic logic [11:0] PRIO_ADDR(input int src);
-        return 12'(src * 4);
+    function automatic logic [21:0] PRIO_ADDR(input int src);
+        return 22'(src * 4);
     endfunction
 
-    localparam logic [11:0] PENDING_ADDR  = 12'h100;
-    localparam logic [11:0] ENABLE0_ADDR  = 12'h200;   // M-mode enable
-    localparam logic [11:0] ENABLE1_ADDR  = 12'h204;   // S-mode enable
-    localparam logic [11:0] THRESH0_ADDR  = 12'h300;   // M-mode threshold
-    localparam logic [11:0] CLAIM0_ADDR   = 12'h304;   // M-mode claim/complete
-    localparam logic [11:0] THRESH1_ADDR  = 12'h308;   // S-mode threshold
-    localparam logic [11:0] CLAIM1_ADDR   = 12'h30C;   // S-mode claim/complete
+    localparam logic [21:0] PENDING_ADDR  = 22'h001000;   // pending word 0
+    localparam logic [21:0] ENABLE0_ADDR  = 22'h002000;   // M-mode enable (ctx0)
+    localparam logic [21:0] ENABLE1_ADDR  = 22'h002080;   // S-mode enable (ctx1)
+    localparam logic [21:0] THRESH0_ADDR  = 22'h200000;   // M-mode threshold
+    localparam logic [21:0] CLAIM0_ADDR   = 22'h200004;   // M-mode claim/complete
+    localparam logic [21:0] THRESH1_ADDR  = 22'h201000;   // S-mode threshold
+    localparam logic [21:0] CLAIM1_ADDR   = 22'h201004;   // S-mode claim/complete
 
     // =========================================================================
     // Bus tasks
     // =========================================================================
-    task automatic bus_write(input logic [11:0] a, input logic [31:0] d);
+    task automatic bus_write(input logic [21:0] a, input logic [31:0] d);
         @(posedge clk); #1;
         addr  <= a;
         wdata <= d;
@@ -92,7 +93,7 @@ module tb_rv_plic;
     endtask
 
     logic [31:0] rd_val;
-    task automatic bus_read(input logic [11:0] a);
+    task automatic bus_read(input logic [21:0] a);
         @(posedge clk); #1;
         addr  <= a;
         req   <= 1'b1;

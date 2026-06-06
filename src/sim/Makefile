@@ -159,6 +159,7 @@ TIMER_SRC = $(CSR_SRC)
             sim_cdecode sim_cdecode64 sim_axi sim_axi_core sim_axi_soc \
             sim_axi_burst sim_axi_ifetch sim_dcache sim_dcache64 \
             sim_icache sim_icache64 sim_cache_soc sim_cache_soc64 sim_boot \
+            vl_boot image_verilator \
             wave_alu wave_csr wave_rv64i wave_mext wave_mext64 wave_amo wave_amo64 \
             wave_cdecode \
             wave_mmu wave_mmu64 wave_sv wave_sv64 wave_timer wave_timer64 \
@@ -594,6 +595,17 @@ else
 BOOT_MAX_FLAG =
 endif
 
+# CLINT mtime prescaler (1 = +1/cycle).  Linux boots should use
+# BOOT_MTIME_DIV=64: with mtime at +1/cycle the 250 Hz tick fires every 4000
+# cycles, which is LESS than the tick handler costs -> the kernel livelocks in
+# tick_handle_periodic catch-up.  DIV=64 emulates a 64 MHz core with the 1 MHz
+# device-tree timebase.
+ifneq ($(BOOT_MTIME_DIV),)
+BOOT_MTIME_FLAG = -DBOOT_MTIME_DIV=$(BOOT_MTIME_DIV)
+else
+BOOT_MTIME_FLAG =
+endif
+
 # Optional: -DBOOT_TRACE early divergence trace (make sim_boot BOOT_TRACE=1)
 ifneq ($(BOOT_TRACE),)
 BOOT_TRACE_FLAG = -DBOOT_TRACE
@@ -616,6 +628,24 @@ BOOT_TRACE_FLAG += -DBOOT_DUMP_AT=$(BOOT_DUMP_AT)
 endif
 ifneq ($(BOOT_EXEC_LO),)
 BOOT_TRACE_FLAG += -DBOOT_EXEC_LO=$(BOOT_EXEC_LO)
+endif
+ifneq ($(BOOT_IPROBE),)
+BOOT_TRACE_FLAG += -DBOOT_IPROBE
+endif
+ifneq ($(BOOT_PTWLO),)
+BOOT_TRACE_FLAG += -DBOOT_PTWLO=$(BOOT_PTWLO)
+endif
+ifneq ($(BOOT_DCWIN),)
+BOOT_TRACE_FLAG += -DBOOT_DCWIN=$(BOOT_DCWIN)
+endif
+# Physical-address write watch (one 8-byte word), e.g. BOOT_WATCH_PA="64'h818690e8"
+ifneq ($(BOOT_WATCH_PA),)
+BOOT_TRACE_FLAG += -DBOOT_WATCH_PA="$(BOOT_WATCH_PA)"
+endif
+# udelay entry PC for the [UDELAY] probe (vmlinux-layout dependent), e.g.
+#   make vl_boot ... BOOT_TRACE=1 BOOT_UDELAY_PC="64'hffffffff8094f5b4"
+ifneq ($(BOOT_UDELAY_PC),)
+BOOT_TRACE_FLAG += -DBOOT_UDELAY_PC="$(BOOT_UDELAY_PC)"
 endif
 else
 BOOT_TRACE_FLAG =
@@ -642,7 +672,7 @@ BOOT_DBG_FLAG += -DBOOT_VCD
 endif
 
 sim_boot: dirs
-	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
 		-o $(OUT_DIR)/tb_rv_boot_soc.vvp \
 		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
 	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_boot_soc.vvp
@@ -650,6 +680,36 @@ sim_boot: dirs
 wave_boot:
 	$(MAKE) sim_boot BOOT_VCD=1
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_boot_soc.vcd &
+
+# --- Verilator fast boot harness (same RTL/TB as sim_boot, ~100x faster) ---
+# iverilog runs the OpenSBI full boot (~8M cycles) in ~15-20 min; Verilator does
+# it in ~8 s, which is what makes the multi-10M..100M-cycle Linux boot tractable.
+# Uses the SAME BOOT_* knobs as sim_boot (all are compile-time -D defines, so a
+# config change rebuilds the model -- the build is only ~7 s):
+#   make image_verilator                         # build verilator:5.020 image (once)
+#   make vl_boot                                 # mini-SBI stand-in (default)
+#   make vl_boot BOOT_HEX=/abs/fw_payload.hex BOOT_MAX=200000000
+#   make vl_boot BOOT_HEX=... BOOT_TRACE=1 BOOT_EXEC=1 BOOT_EXEC_LO=8000000
+# See docs/verilator_sim.md.
+VL_IMAGE := verilator:5.020
+VL_DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) \
+                -v $(PROJECT_ROOT):/workspace \
+                -w /workspace/src/sim \
+                $(VL_IMAGE)
+VL_BOOT_MDIR = $(OUT_DIR)/vl_boot
+# --timing handles the TB's #-delay clock; -Wno-fatal keeps WIDTH/LATCH warnings
+# non-fatal (the RTL is iverilog-clean and these are known benign).
+VL_FLAGS = --binary -j 0 --timing -Wno-fatal -O3 -CFLAGS -O2 -DRISCV_FORMAL
+
+image_verilator:
+	cd $(MAKEFILE_DIR) && docker build -t $(VL_IMAGE) -f Dockerfile.verilator .
+
+vl_boot: dirs
+	$(VL_DOCKER_RUN) verilator $(VL_FLAGS) -DRV_XLEN_64 \
+		$(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
+		-I$(INC_DIR) --top-module tb_rv_boot_soc --Mdir $(VL_BOOT_MDIR) -o tb_rv_boot_soc \
+		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
+	$(VL_DOCKER_RUN) ./$(VL_BOOT_MDIR)/tb_rv_boot_soc
 
 # --- rv_core instruction port over AXI (variable latency) integration TB ---
 AXI_IF_SRC = $(CORE_SRC) $(BUS_DIR)/rv_axi_bridge.sv $(TB_DIR)/rv_axi_slave_bfm.sv

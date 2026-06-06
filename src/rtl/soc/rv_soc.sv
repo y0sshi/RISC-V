@@ -30,6 +30,7 @@ module rv_soc
     parameter int          AXI_ID_WIDTH = 4,
     parameter int          CLK_FREQ     = 125_000_000,
     parameter int          BAUD_RATE    = 115_200,
+    parameter int          MTIME_DIV    = 1,           // CLINT mtime prescaler
     // ---- Cache configuration ----
     parameter bit          ICACHE_EN    = 1'b1,
     parameter int          ICACHE_LINE  = 32,
@@ -140,7 +141,16 @@ module rv_soc
         .fence_i_out (cpu_fence_i),
         .ptw_paddr (ptw_paddr), .ptw_req (ptw_req),
         .ptw_rdata (ptw_rdata), .ptw_ready (ptw_ready),
-        .timer_irq (timer_irq_sig), .sw_irq (sw_irq_sig), .ext_irq (plic_ext_irq[0]),
+        // External interrupt: OR both PLIC contexts (0 = M/MEIP, 1 = S/SEIP per
+        // the DT interrupts-extended <&intc 11 &intc 9>).  Only one context owns
+        // a given source, so the OR is unambiguous; rv_csr routes the shared line
+        // to SEIP or MEIP by mideleg[9] (delegated -> S).  Linux services external
+        // IRQs (e.g. the 8250 TX-empty IRQ that drains a userspace tty write) via
+        // the S context.  (The PLIC itself must use the standard SiFive register
+        // map for the Linux driver to ever enable an S-context source -- see
+        // rv_plic.sv.)  Bare/mini-SBI leave both contexts at 0 (no-op).
+        .timer_irq (timer_irq_sig), .sw_irq (sw_irq_sig),
+        .ext_irq (plic_ext_irq[0] | plic_ext_irq[1]),
         .time_val  (periph_mtime)
     );
 
@@ -227,9 +237,9 @@ module rv_soc
     logic            periph_rdata_valid;
     logic            uart_tx_sig;
 
-    rv_periph #(.XLEN (XLEN), .CLK_FREQ (CLK_FREQ), .BAUD_RATE (BAUD_RATE)) u_periph (
+    rv_periph #(.XLEN (XLEN), .CLK_FREQ (CLK_FREQ), .BAUD_RATE (BAUD_RATE), .MTIME_DIV (MTIME_DIV)) u_periph (
         .clk (clk), .rst_n (rst_n),
-        .addr (mmu_dmem_pa), .wdata (core_dmem_wdata),
+        .addr (mmu_dmem_pa), .wdata (core_dmem_wdata), .wstrb (core_dmem_wstrb),
         .req (mmu_dmem_req), .we (mmu_dmem_we),
         .is_periph (periph_is_periph), .rdata (periph_rdata), .rdata_valid (periph_rdata_valid),
         .timer_irq (timer_irq_sig), .sw_irq (sw_irq_sig), .ext_irq (plic_ext_irq), .mtime (periph_mtime),
@@ -260,6 +270,27 @@ module rv_soc
     logic              br_rvalid, br_rlast, br_done, br_busy;
     logic [7:0]        br_rbeat;
 
+    // ---- Atomic arbiter for the shared data bridge (PTW priority) -----------
+    // (declared before the D-cache generate so the gated completion signals can
+    // feed the D-cache instance.)  The burst bridge serves ONE master per
+    // transaction; the owner is latched at transaction start and held until
+    // completion, so a PTW request asserted mid-transaction cannot steal the
+    // in-flight D-cache transaction's completion (br_done) / stale rdata_hold.
+    // That theft made a store's multi-cycle write-through B-response look like a
+    // PTW read return (stale data -> bogus PTE -> spurious page fault -> Linux
+    // panic "Attempted to kill the idle task!").
+    logic owner_ptw_q;
+    wire  bridge_idle = ~br_busy;
+    wire  owner_ptw   = bridge_idle ? ptw_req : owner_ptw_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)           owner_ptw_q <= 1'b0;
+        else if (bridge_idle) owner_ptw_q <= ptw_req;   // latch owner at (idle) grant
+    end
+    // Bridge completion / read-beat signals routed to the granted master only.
+    wire dc_br_done   = br_done   & ~owner_ptw;
+    wire dc_br_rvalid = br_rvalid & ~owner_ptw;
+    wire dc_br_rlast  = br_rlast  & ~owner_ptw;
+
     // Cacheable data request: not a peripheral access
     wire dc_c_req = mmu_dmem_req & ~periph_is_periph;
 
@@ -273,13 +304,13 @@ module rv_soc
             .hit_cnt (), .miss_cnt (),
             .m_req (dc_m_req), .m_we (dc_m_we), .m_addr (dc_m_addr), .m_len (dc_m_len),
             .m_wdata (dc_m_wdata), .m_wstrb (dc_m_wstrb),
-            .m_rdata (br_rdata), .m_rvalid (br_rvalid), .m_rbeat (br_rbeat),
-            .m_rlast (br_rlast), .m_done (br_done), .m_busy (br_busy)
+            .m_rdata (br_rdata), .m_rvalid (dc_br_rvalid), .m_rbeat (br_rbeat),
+            .m_rlast (dc_br_rlast), .m_done (dc_br_done), .m_busy (br_busy)
         );
     end else begin : gen_no_dcache
         // Bypass: every cacheable access is a single-beat AXI transaction.
         assign dc_c_rdata = br_rdata;
-        assign dc_c_wait  = (dc_c_req | dc_m_req) & ~br_done;  // mirror original s_wait
+        assign dc_c_wait  = (dc_c_req | dc_m_req) & ~dc_br_done;  // mirror original s_wait
         assign dc_m_req   = dc_c_req;
         assign dc_m_we    = mmu_dmem_we;
         assign dc_m_addr  = mmu_dmem_pa;
@@ -289,10 +320,10 @@ module rv_soc
     end
     endgenerate
 
-    // ---- PTW (priority) vs D-cache memory side -> shared burst bridge --------
+    // ---- Shared data bridge request mux (owner from the arbiter above) ------
     always_comb begin
-        if (ptw_req) begin
-            br_req = 1'b1; br_we = 1'b0; br_addr = ptw_paddr; br_len = 8'd0;
+        if (owner_ptw) begin
+            br_req = ptw_req; br_we = 1'b0; br_addr = ptw_paddr; br_len = 8'd0;
             br_wdata = '0; br_wstrb = '0;
         end else begin
             br_req = dc_m_req; br_we = dc_m_we; br_addr = dc_m_addr; br_len = dc_m_len;
@@ -332,7 +363,7 @@ module rv_soc
     // read is selected next cycle.
     assign core_dmem_wait = ptw_req ? 1'b0 : dc_c_wait;
     assign ptw_rdata      = br_rdata;
-    assign ptw_ready      = ptw_req ? br_done : 1'b0;
+    assign ptw_ready      = owner_ptw & br_done;   // only the PTW's own completion
 
     always_comb begin
         if (periph_rdata_valid) begin

@@ -119,7 +119,43 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello boot stack_test
+.PHONY: hello sim_hello boot stack_test atomic_test lrsc_irq_test
+
+# ----- lrsc_irq_test: LR/SC reservation vs trap/interrupt (lost update) -----
+# Timer interrupt lands between LR and SC; the handler AMOs the same address.
+# Fails on RTL where the reservation survives traps/xRET (the SC then succeeds
+# with the pre-trap value, losing the handler's update -- the Linux refcount
+# corruption, 2026-06-10).
+#   make lrsc_irq_test  &&  (cd ../sim && make vl_boot \
+#     BOOT_HEX=../software/boot/lrsc_irq_test.hex)
+lrsc_irq_test: boot/lrsc_irq_test.hex
+
+boot/lrsc_irq_test.elf: boot/lrsc_irq_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/lrsc_irq_test.S -o boot/lrsc_irq_test.elf
+
+boot/lrsc_irq_test.hex: boot/lrsc_irq_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/lrsc_irq_test.elf boot/lrsc_irq_test.hex
+	@echo "  lrsc_irq_test hex: $@"
+
+# ----- atomic_test: AMO / LR-SC stress under the cached path -----
+# Per-iteration return-value checks on amoadd.d / lr.d-sc.d / amoxor.d with the
+# counter line force-evicted each iteration (direct-mapped aliasing loads) and a
+# write-through store draining right before the next AMO.  Repro harness for the
+# Linux printk-ringbuffer/refcount atomic-corruption suspicion (2026-06-10).
+#   make atomic_test  &&  (cd ../sim && make vl_boot \
+#     BOOT_HEX=../software/boot/atomic_test.hex)
+atomic_test: boot/atomic_test.hex
+
+boot/atomic_test.elf: boot/atomic_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/atomic_test.S -o boot/atomic_test.elf
+
+boot/atomic_test.hex: boot/atomic_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/atomic_test.elf boot/atomic_test.hex
+	@echo "  atomic_test hex: $@"
 
 # ----- stack_test: minimal reproducer for the variable-latency stack bug -----
 # Hammers the prologue/epilogue (sd ra/s0 ; recursive call ; ld ra/s0 ; ret)

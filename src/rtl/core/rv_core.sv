@@ -106,6 +106,16 @@ module rv_core
     logic        ex_sret_en;      // SRET in EX
     // MEM stage page fault (load/store page fault from MMU, TLB-hit permission fail)
     logic        mem_trap_enter;
+    // Instruction page fault (from rv_mmu if_fault) and the SATP-write fetch
+    // barrier.  Declared here (before any_redirect / the redir mux use them);
+    // driven further below.  All are 0 unless the MMU is active and a fetch
+    // translation faults / SATP is written, so every path here is a structural
+    // no-op for bare-mode (M-mode boot, all unit/compliance tests) where if_fault
+    // never fires and SATP is only written in M-mode (which cannot fault on fetch).
+    logic            ifpf_take;          // 1 = take an instruction page fault trap this cycle
+    logic [XLEN-1:0] ifpf_pc;            // faulting instruction VA (-> mepc / mtval)
+    logic            satp_write_redir;   // SATP write committed -> refetch next insn under new satp
+    logic [XLEN-1:0] satp_redir_tgt;     // = PC of the instruction after the SATP write
     logic        trap_or_mret;    // Combined: causes PC redirect + pipeline flush
     assign trap_or_mret = ex_trap_enter | ex_mret_en | ex_sret_en | mem_trap_enter;
 
@@ -125,7 +135,7 @@ module rv_core
     // the PC from the (possibly invalid) fetched instruction.  In bare mode this
     // simply adds a couple of fetch bubbles after a branch/jump/trap.
     logic [1:0]  redirect_settle;
-    wire         any_redirect = branch_taken_ex | trap_or_mret;
+    wire         any_redirect = branch_taken_ex | trap_or_mret | satp_write_redir | ifpf_take;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) redirect_settle <= 2'b00;
         else        redirect_settle <= {redirect_settle[0], any_redirect};
@@ -239,8 +249,14 @@ module rv_core
     //     here and must not be discarded.
     //   - load-use in EX: the load itself must proceed to MEM so dmem is accessed.
     // Only flush EX/MEM for traps/MRET to prevent the interrupted instruction
-    // from spuriously writing its destination register.
-    assign flush_ex_mem = trap_or_mret & imem_ready;
+    // from spuriously writing its destination register.  Gate by ~stall_ex (the
+    // EX-advance cycle), NOT imem_ready: the trap/MRET now commits on ~stall_ex
+    // (csr_commit_ex), so the flush must fire on the same cycle.  Were it left on
+    // imem_ready it could bubble EX/MEM while EX is held by a non-IF stall
+    // (dmem_wait/amo/mal/mem_stall) -- discarding the held MEM-stage instruction
+    // (e.g. the very store whose dmem_wait caused the stall).  ~stall_ex implies
+    // imem_ready, so this is a no-op for the common BRAM case (stall_ex=0).
+    assign flush_ex_mem = trap_or_mret & ~stall_ex;
 
     // =========================================================================
     // Stage 1: Instruction Fetch (IF) — variable-length (C-extension capable)
@@ -280,10 +296,12 @@ module rv_core
     logic [XLEN-1:0] redir_tgt;
     always_comb begin
         redir_req = 1'b1;
-        if      (ex_trap_enter || mem_trap_enter) redir_tgt = trap_vector;
+        if      (ifpf_take)                       redir_tgt = trap_vector;  // instruction page fault
+        else if (ex_trap_enter || mem_trap_enter) redir_tgt = trap_vector;
         else if (ex_mret_en)                      redir_tgt = mepc_out;
         else if (ex_sret_en)                      redir_tgt = sepc_out;
         else if (branch_taken_ex)                 redir_tgt = branch_target_ex;
+        else if (satp_write_redir)                redir_tgt = satp_redir_tgt; // SATP fetch barrier
         else begin redir_req = 1'b0; redir_tgt = '0; end
     end
 
@@ -332,6 +350,33 @@ module rv_core
     end
 
     assign imem_req = 1'b1;
+
+    // -------------------------------------------------------------------------
+    // Instruction page fault (rv_mmu if_fault)
+    // -------------------------------------------------------------------------
+    // A faulting instruction fetch never completes (the MMU blocks the request,
+    // so imem_ready stays 0 and the would-be instruction never enters ID/EX to
+    // raise the trap the normal way).  Latch the MMU's if_fault and TAKE the trap
+    // directly here as a one-cycle event: it commits the CSR trap (cause=12,
+    // mepc/mtval = faulting VA) without waiting for imem_ready, and redirects the
+    // fetch to trap_vector via the standard latched-redirect path (redir_pend),
+    // which then re-fetches the handler under the now-correct translation.  The
+    // SATP-write fetch barrier (below) guarantees this fault is precise: the
+    // faulting instruction is the first fetched after the address space changed,
+    // so nothing younger has been (incorrectly) committed and nothing older is
+    // still in flight.  ifpf_take is 0 whenever if_fault never fires (bare mode).
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ifpf_take <= 1'b0;
+            ifpf_pc   <= '0;
+        end else if (ifpf_take) begin
+            ifpf_take <= 1'b0;                     // one-shot: cleared after the commit cycle
+        end else if (if_fault && !redir_eff) begin
+            ifpf_take <= 1'b1;
+            ifpf_pc   <= fetch_pc;                 // faulting instruction VA (== translated VA)
+        end
+    end
+
 
     // =========================================================================
     // IF/ID Pipeline Register  (between IF and ID)
@@ -734,6 +779,19 @@ module rv_core
     logic            reservation_valid;
     logic [XLEN-1:0] reservation_addr;
 
+    // LR/SC reservation kill: any COMMITTED trap entry or xRET voids the
+    // reservation (priv spec: xRET voids an outstanding reservation; an SC is
+    // always allowed to fail).  Without this, an interrupt taken between LR
+    // and SC whose handler performs an AMO to the SAME address let the resumed
+    // SC succeed with the PRE-trap loaded value, silently losing the handler's
+    // update (Linux: atomic_fetch_add in IRQ context vs a try_cmpxchg loop in
+    // task context -> refcount saturate/underflow WARNs, 2026-06-10).
+    // Repro/regression: src/software/boot/lrsc_irq_test.S.
+    // Mirrors the commit-gated trap/mret/sret events rv_csr receives (assigned
+    // below, after csr_commit_ex), so it fires exactly once per event and is a
+    // strict no-op while no trap/xRET commits.
+    logic lrsc_kill;
+
     // --- AMO 2-phase state (0 = read phase, 1 = write phase) ---
     // Only non-LR, non-SC AMOs require 2 phases.
     logic amo_state;
@@ -762,13 +820,41 @@ module rv_core
             // single hart lost the boot-hart lottery).  Re-issuing the WRITE while
             // held is harmless (idempotent: same address, same computed value);
             // re-issuing the READ was the bug.
+            // !mem_stall: while the AMO's data translation is pending (TLB miss
+            // -> PTW), the MMU suppresses mem_req_out, so NO read is issued and
+            // dmem_wait stays 0 -- without this term amo_state advanced to the
+            // WRITE phase having never read, and the write was computed from
+            // the STALE previous load's dmem_rdata (Linux: get_user_ns/get_net
+            // refcount inc on a kernel VA that TLB-missed wrote (0xFFFFFFFF+1)
+            // = 0 over the counter -> refcount saturate/underflow WARNs).
+            // Bare/M-mode: vm_data=0 -> mem_stall=0 -> strict no-op.
             if (!amo_active)
                 amo_state <= 1'b0;                    // reset only when AMO leaves MEM
-            else if (!dmem_wait && !amo_state)
+            else if (!dmem_wait && !mem_stall && !amo_state)
                 amo_state <= 1'b1;                    // read complete -> write phase
 
-            // Reservation update (in MEM stage), once the access completes
-            if (!dmem_wait) begin
+            // Reservation update (in MEM stage), exactly when the LR/SC ADVANCES
+            // out of MEM (same gate as the MEM/WB capture below).  Gating on
+            // !dmem_wait alone re-fired the update on every cycle an LR/SC was
+            // HELD in MEM by a non-data stall (~imem_ready during an I$ miss):
+            // an SC whose write had already completed cleared the reservation
+            // while still held, so the MEM/WB capture later recomputed
+            // sc_success=0 -- the SC WROTE MEMORY but REPORTED FAILURE (rd=1).
+            // Linux's cmpxchg loops then saw perpetual "failure", walking the
+            // printk ringbuffer head through the whole ring (silent console) --
+            // same stall-refire family as the EX-stage CSR-commit bug (#4).
+            // Repro: src/software/boot/atomic_test.S with BOOT_NO_ICACHE=1.
+            // No-op for bare BRAM (imem_ready=1 every cycle; amo_stall excludes
+            // LR/SC by construction; aligned LR/SC never raise mal_stall).
+            if (lrsc_kill) begin
+                // Trap entry / xRET commit voids the reservation (see decl).
+                // Takes priority over an LR advancing on the same edge: the
+                // paired SC then fails and the constrained loop retries.
+                reservation_valid <= 1'b0;
+            end else if (!amo_stall && !mal_stall && !dmem_wait && !mem_stall
+                         && imem_ready) begin
+                // !mem_stall: same translation-pending hole as amo_state above
+                // (the LR/SC has not actually accessed memory yet).
                 if (ex_mem_ctrl.is_lr && ex_mem_valid) begin
                     reservation_valid <= 1'b1;
                     reservation_addr  <= ex_mem_alu_result;
@@ -832,7 +918,9 @@ module rv_core
             // mal_state is consumed by ALL loads/stores, so it must drop the cycle
             // the access advances -- it cannot be held high into the next
             // instruction's MEM cycle (that mis-addresses the next access).
-            if (!dmem_wait) begin
+            // !mem_stall: while the data translation is pending no access has
+            // been issued (same hole as amo_state; no-op when vm off).
+            if (!dmem_wait && !mem_stall) begin
                 if (mal_cross && !mal_state)
                     mal_state <= 1'b1;   // phase 0 -> phase 1
                 else
@@ -907,6 +995,7 @@ module rv_core
 
     // CSR module outputs
     logic [XLEN-1:0] csr_rdata_ex;   // old CSR value (for rd writeback)
+    logic            csr_access_ok;  // EX CSR address implemented + privilege OK
     priv_level_t     priv_level;
     logic            irq_pending;
     logic [XLEN-1:0] irq_cause;       // highest-priority interrupt cause (from rv_csr)
@@ -928,9 +1017,14 @@ module rv_core
         ex_trap_val   = '0;
 
         if (id_ex_valid) begin
-            if (id_ex_ctrl.is_illegal) begin
+            if (id_ex_ctrl.is_illegal
+                || (id_ex_ctrl.csr_write && !csr_access_ok)) begin
                 // Illegal-instruction exception (synchronous; highest priority here).
                 // mtval = the faulting instruction (16-bit zero-extended if compressed).
+                // The CSR term fires for accesses to unimplemented CSRs or CSRs
+                // above the current privilege (csr_access_ok from rv_csr) --
+                // required so OpenSBI's trap-and-detect feature probing
+                // (stimecmp/menvcfg/mhpm*) correctly concludes "absent".
                 ex_trap_enter = 1'b1;
                 ex_trap_cause = xlen_t'(EXC_ILLEGAL_INST);
                 ex_trap_val   = id_ex_ctrl.is_compressed ? xlen_t'(id_ex_inst[15:0])
@@ -989,7 +1083,14 @@ module rv_core
     logic [XLEN-1:0] csr_trap_epc;
 
     always_comb begin
-        if (mem_trap_enter) begin
+        if (ifpf_take) begin
+            // Instruction page fault (taken at IF; highest priority since the
+            // pipeline is otherwise idle/flushed when it fires).
+            csr_trap_enter = 1'b1;
+            csr_trap_cause = xlen_t'(EXC_INST_PAGE_FAULT);
+            csr_trap_val   = ifpf_pc;
+            csr_trap_epc   = ifpf_pc;
+        end else if (mem_trap_enter) begin
             csr_trap_enter = 1'b1;
             csr_trap_cause = mem_trap_cause;
             csr_trap_val   = mem_trap_val;
@@ -1013,6 +1114,45 @@ module rv_core
     // are left ungated (multi-cycle FP's result_valid pulse need not coincide
     // with imem_ready, and fflags accumulation is idempotent).
     wire csr_commit = imem_ready;
+    // EX-stage commit gate for state changes attributed to the instruction in EX
+    // (CSR write, trap entry, MRET/SRET).  These must fire EXACTLY ONCE -- on the
+    // cycle the EX instruction actually advances out of EX (~stall_ex) -- NOT merely
+    // when imem_ready=1.  imem_ready alone is insufficient: when EX is held by a
+    // non-IF stall (dmem_wait from a write-through store, amo/mal/mem_stall, FPU
+    // busy) while imem_ready stays 1, the EX CSR write would re-fire every held
+    // cycle.  For a CSR swap idiom this is catastrophic: a stalled
+    // "csrrw tp, mscratch, tp" (OpenSBI/Linux trap entry/exit) re-executes while
+    // held behind the preceding store, overwriting mscratch with its own (already
+    // swapped) tp on the 2nd+ cycle, so the kernel's tp is lost and never restored
+    // on trap return -> the early-boot exception storm.  ~stall_ex implies
+    // imem_ready (see flush_ex), so this is a strict refinement / no-op for the
+    // common BRAM case (stall_ex=0).  retire_en stays on csr_commit (it is a WB-
+    // stage event; MEM/WB bubbles under amo/mal/dmem_wait and holds only under an IF
+    // freeze, which imem_ready already gates -- so it never double-counts).
+    wire csr_commit_ex = ~stall_ex;
+
+    // LR/SC reservation kill (declared in the A-extension section above):
+    // exactly the commit-gated trap-entry/MRET/SRET events rv_csr receives.
+    // ifpf_take bypasses the gate like the rv_csr trap_enter input does (the
+    // faulting fetch keeps imem_ready low, so stall_ex stays high).
+    assign lrsc_kill = ((csr_trap_enter | ex_mret_en | ex_sret_en) & csr_commit_ex)
+                     | ifpf_take;
+
+    // -------------------------------------------------------------------------
+    // SATP-write fetch barrier (assigned here: needs id_ex_* and csr_commit)
+    // -------------------------------------------------------------------------
+    // Writing satp changes the active address space, but instructions already
+    // prefetched (under the OLD translation) sit in the pipeline and would run
+    // before the new mapping takes effect.  Real hardware (and the RISC-V boot
+    // sequence) require the next fetch to use the new satp: Linux's
+    // relocate_enable_mmu deliberately faults the first post-satp fetch to vector
+    // (via stvec) into the freshly-mapped virtual address space.  Force that by
+    // redirecting to the instruction right after the satp write the cycle it
+    // commits, flushing the stale prefetch and re-fetching under the new satp
+    // (redirect_settle then lets the change settle before the PC advances).
+    assign satp_write_redir = id_ex_valid && id_ex_ctrl.csr_write
+                              && (id_ex_csr_addr == CSR_SATP) && csr_commit && ~stall_ex;
+    assign satp_redir_tgt   = id_ex_pc + (id_ex_ctrl.is_compressed ? XLEN'(2) : XLEN'(4));
 
     rv_csr #(
         .XLEN   (XLEN),
@@ -1023,14 +1163,17 @@ module rv_core
         .csr_addr   (id_ex_csr_addr),
         .csr_wdata  (ex_csr_wdata),
         .csr_op     (id_ex_funct3),
-        .csr_we     (id_ex_ctrl.csr_write & id_ex_valid & csr_commit),
+        .csr_we     (id_ex_ctrl.csr_write & id_ex_valid & csr_commit_ex & csr_access_ok),
         .csr_rdata  (csr_rdata_ex),
-        .trap_enter (csr_trap_enter & csr_commit),
+        .csr_access_ok (csr_access_ok),
+        // ifpf_take is a clean one-cycle pulse that must commit even though the
+        // faulting fetch keeps imem_ready (and thus csr_commit_ex) low.
+        .trap_enter ((csr_trap_enter & csr_commit_ex) | ifpf_take),
         .trap_cause (csr_trap_cause),
         .trap_val   (csr_trap_val),
         .trap_epc   (csr_trap_epc),
-        .mret_en    (ex_mret_en & csr_commit),
-        .sret_en    (ex_sret_en & csr_commit),
+        .mret_en    (ex_mret_en & csr_commit_ex),
+        .sret_en    (ex_sret_en & csr_commit_ex),
         .trap_vector(trap_vector),
         .mepc_out   (mepc_out),
         .sepc_out   (sepc_out),
@@ -1061,13 +1204,14 @@ module rv_core
     assign mstatus_mprv_out = mstatus_mprv_int;
     assign mstatus_mpp_out  = mstatus_mpp_int;
 
-    // SFENCE.VMA in EX stage → TLB flush pulse (1-cycle).  Gated by csr_commit so
-    // a frozen SFENCE under IF latency flushes once (no-op when imem_ready=1).
-    assign tlb_flush_out   = id_ex_valid && id_ex_ctrl.is_sfence_vma && csr_commit;
+    // SFENCE.VMA in EX stage → TLB flush pulse (1-cycle).  Gated by csr_commit_ex
+    // (~stall_ex) so a frozen SFENCE flushes exactly once on the advance cycle, not
+    // every held cycle (no-op when stall_ex=0; the flush is idempotent regardless).
+    assign tlb_flush_out   = id_ex_valid && id_ex_ctrl.is_sfence_vma && csr_commit_ex;
 
     // FENCE.I in EX stage → instruction-cache flush pulse (1-cycle).  Gated by
-    // csr_commit like the TLB flush so it fires exactly once under IF latency.
-    assign fence_i_out     = id_ex_valid && id_ex_ctrl.is_fence_i && csr_commit;
+    // csr_commit_ex like the TLB flush so it fires exactly once on the EX advance.
+    assign fence_i_out     = id_ex_valid && id_ex_ctrl.is_fence_i && csr_commit_ex;
 
     // --- Branch / Jump resolution ---
     // Forwarded rs1/rs2 are used for branch comparisons.
@@ -1265,9 +1409,13 @@ module rv_core
             mem_wb_fpu_result_i   <= '0;
             mal_active_wb         <= 1'b0;
             mem_wb_fresh          <= 1'b0;
-        end else if (amo_stall || mal_stall || dmem_wait) begin
+        end else if (amo_stall || mal_stall || dmem_wait || mem_stall) begin
             // AMO read phase / misaligned (incl. RV32 64-bit FLD/FSD) phase 0 /
-            // data access in flight (dmem_wait): insert a BUBBLE rather than
+            // data access in flight (dmem_wait) / data translation pending
+            // (mem_stall: the access has not even been issued -- capturing here
+            // would retire the instruction with stale dmem_rdata and re-capture
+            // it again when the translation completes = double retire/garbage
+            // rd write; no-op when vm off): insert a BUBBLE rather than
             // holding the previous WB instruction.  Holding would re-write the
             // just-retired instruction's destination a second time using the now-
             // stale live dmem_rdata, corrupting it — and double-count retire.  The

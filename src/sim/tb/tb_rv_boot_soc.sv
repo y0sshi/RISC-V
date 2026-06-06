@@ -84,9 +84,17 @@ module tb_rv_boot_soc;
 `ifndef BOOT_DCACHE_SETS
   `define BOOT_DCACHE_SETS 512
 `endif
+// CLINT mtime prescaler: 1 = mtime +1/cycle (a "1 MHz" CPU vs the 1 MHz DT
+// timebase -- the 250 Hz Linux periodic tick then fires every 4000 cycles and
+// its handler costs more than that, livelocking tick_handle_periodic catch-up).
+// Linux boots should use BOOT_MTIME_DIV=64 (a 64 MHz core, tick every 256k cy).
+`ifndef BOOT_MTIME_DIV
+  `define BOOT_MTIME_DIV 1
+`endif
     rv_soc #(.XLEN(XLEN), .RST_ADDR(MEM_BASE), .AXI_ID_WIDTH(IDW),
              .CLK_FREQ(CLKF), .BAUD_RATE(BAUD),
              .ICACHE_EN(ICEN), .DCACHE_EN(DCEN),
+             .MTIME_DIV(`BOOT_MTIME_DIV),
              .ICACHE_SETS(`BOOT_ICACHE_SETS), .DCACHE_SETS(`BOOT_DCACHE_SETS)) u_soc (
         .clk(clk), .rst_n(rst_n), .gpio_in(4'b0), .gpio_out(gpio_out_w),
         .uart_rx(1'b1), .uart_tx(uart_tx),
@@ -154,9 +162,38 @@ module tb_rv_boot_soc;
 
     // diagnostics
     integer if_ar = 0, d_ar = 0;
+    integer nvpe = 0;        // TEMP-DIAG vprintk_emit entry count (BOOT_TRACE only)
     always @(posedge clk) if (rst_n) begin
         if (i_arvalid & i_arready) if_ar = if_ar + 1;
         if (arvalid   & arready  ) d_ar  = d_ar  + 1;
+    end
+
+    // ---- P0-5 interrupt-delivery chain diagnostics (always-on, cheap) --------
+    // Pinpoints where the 8250-TX / PLIC-S-context / SEIP chain breaks when a
+    // userspace tty write() never flushes.  All sticky flags + edge counters,
+    // reported at every 1M-cycle progress line and at the final summary.
+    integer n_seip = 0, n_meip = 0, n_stip = 0;
+    logic   ever_extirq1 = 0, ever_extirq0 = 0, ever_uirq = 0, ever_ier1 = 0;
+    logic   ever_en1 = 0, ever_pend1 = 0;
+    logic   itr_d = 0;
+    always @(posedge clk) if (rst_n) begin
+        if (u_soc.plic_ext_irq[1])            ever_extirq1 <= 1'b1;
+        if (u_soc.plic_ext_irq[0])            ever_extirq0 <= 1'b1;
+        if (u_soc.u_periph.u_uart.rx_irq)     ever_uirq    <= 1'b1;  // combined UART IRQ line
+        if (u_soc.u_periph.u_uart.ier[1])     ever_ier1    <= 1'b1;  // THRI (TX int) enabled by driver
+        if (|u_soc.u_periph.u_plic.enable1)   ever_en1     <= 1'b1;  // S-context source enabled
+        if (|u_soc.u_periph.u_plic.pending)   ever_pend1   <= 1'b1;  // any PLIC source pended
+        // Count interrupt traps on the committed-trap edge (cause MSB set).
+        itr_d <= u_soc.u_cpu.u_core.csr_trap_enter & u_soc.u_cpu.u_core.csr_commit_ex;
+        if ((u_soc.u_cpu.u_core.csr_trap_enter & u_soc.u_cpu.u_core.csr_commit_ex)
+            && !itr_d && u_soc.u_cpu.u_core.csr_trap_cause[XLEN-1]) begin
+            case (u_soc.u_cpu.u_core.csr_trap_cause[3:0])
+                4'd9:  n_seip <= n_seip + 1;
+                4'd11: n_meip <= n_meip + 1;
+                4'd5:  n_stip <= n_stip + 1;
+                default: ;
+            endcase
+        end
     end
 
 `ifdef BOOT_TRACE
@@ -186,6 +223,19 @@ module tb_rv_boot_soc;
     integer          ndup = 0;
     logic [XLEN-1:0] last_exmem_pc = 64'hFFFF_FFFF_FFFF_FFFF;
     integer nmis = 0;
+    integer nipa = 0;
+    integer npw  = 0;
+    integer ncsr = 0;        // sscratch/satp/stvec CSR-write monitor cap
+    integer ntp  = 0;        // tp (x4) writeback monitor cap
+    integer nud  = 0;        // udelay-entry probe cap
+    integer ntm  = 0;        // timer-path probe cap
+    integer nrc  = 0;        // refcount_warn_saturate probe cap
+`ifndef BOOT_PTWLO
+  `define BOOT_PTWLO 0
+`endif
+`ifndef BOOT_WATCH_PA
+  `define BOOT_WATCH_PA 64'h0
+`endif
     function automatic logic [31:0] mem_win(input [XLEN-1:0] pa);
         logic [63:0] o; o = pa - MEM_BASE;
         return {u_bfm.mem_b[o+3], u_bfm.mem_b[o+2], u_bfm.mem_b[o+1], u_bfm.mem_b[o+0]};
@@ -196,6 +246,26 @@ module tb_rv_boot_soc;
         return {u_bfm.mem_b[o+7], u_bfm.mem_b[o+6], u_bfm.mem_b[o+5], u_bfm.mem_b[o+4],
                 u_bfm.mem_b[o+3], u_bfm.mem_b[o+2], u_bfm.mem_b[o+1], u_bfm.mem_b[o+0]};
     endfunction
+    // Software Sv39 page-table walk over the shared DDR (diagnostic): prints each
+    // level's PTE + permission bits for a VA, to see why a fault was raised.
+    task automatic ptwalk(input [63:0] va);
+        logic [63:0] satp_v, base, pte; integer i; logic [8:0] vpn;
+        begin
+            satp_v = u_soc.u_cpu.satp_out;
+            base   = (satp_v & 64'hFFF_FFFF_FFFF) << 12;
+            $display("  [ptwalk va=%h satp=%h]", va, satp_v);
+            for (i = 2; i >= 0; i = i - 1) begin
+                vpn = va[12 + i*9 +: 9];
+                pte = mem_win64(base + vpn*8);
+                $display("    L%0d idx=%0d @%h pte=%h V=%b R=%b W=%b X=%b U=%b A=%b D=%b",
+                         i, vpn, base + vpn*8, pte, pte[0], pte[1], pte[2], pte[3],
+                         pte[4], pte[6], pte[7]);
+                if (!pte[0]) begin $display("    -> NOT VALID"); i = -1; end
+                else if (pte[1] || pte[3]) begin $display("    -> LEAF"); i = -1; end
+                else base = (pte[53:10]) << 12;
+            end
+        end
+    endtask
     // --- D-load-vs-DDR correctness check (decisive: catches a load whose data the
     // core actually USES (dmem_eff) diverges from the shared-DDR word). Valid only
     // while satp=0 (VA==PA, early M-mode boot) and for cacheable DDR (>= MEM_BASE).
@@ -218,6 +288,43 @@ module tb_rv_boot_soc;
     endfunction
     always @(posedge clk) if (rst_n) begin
         tcyc <= tcyc + 1;
+`ifdef BOOT_DCWIN
+        // Cycle-by-cycle D-cache + core MEM/WB state around a target cycle, to see
+        // why a load's rdata_q goes stale / byte_offset desyncs under IF latency.
+        if (tcyc >= `BOOT_DCWIN && tcyc <= `BOOT_DCWIN + 160)
+            $display("[dc c%0d] st=%0d creq=%b cwe=%b caddr=%h hit=%b cwait=%b mdone=%b mrv=%b rdq=%h cwd=%h | imrdy=%b sex=%b dwait=%b memrd=%b exmpc=%h exmpa=%h exmv=%b mwv=%b fresh=%b ddr@a=%h",
+                tcyc, u_soc.gen_dcache.u_dc.state, u_soc.gen_dcache.u_dc.c_req,
+                u_soc.gen_dcache.u_dc.c_we, u_soc.gen_dcache.u_dc.c_addr,
+                u_soc.gen_dcache.u_dc.hit, u_soc.gen_dcache.u_dc.c_wait,
+                u_soc.gen_dcache.u_dc.m_done, u_soc.gen_dcache.u_dc.m_rvalid,
+                u_soc.gen_dcache.u_dc.rdata_q, u_soc.gen_dcache.u_dc.c_wdata,
+                u_soc.imem_ready, u_soc.u_cpu.u_core.stall_ex, u_soc.core_dmem_wait,
+                u_soc.u_cpu.u_core.ex_mem_ctrl.mem_read, u_soc.u_cpu.u_core.ex_mem_pc,
+                u_soc.mmu_dmem_pa,
+                u_soc.u_cpu.u_core.ex_mem_valid, u_soc.u_cpu.u_core.mem_wb_valid,
+                u_soc.u_cpu.u_core.mem_wb_fresh,
+                ((^u_soc.mmu_dmem_pa !== 1'bx && u_soc.mmu_dmem_pa >= MEM_BASE)
+                    ? mem_win64(u_soc.mmu_dmem_pa) : 64'hX));
+        // CSR internals in-window: catch a csrrw to mscratch whose CSR-write may be
+        // dropped by a concurrent trap/mret (else-if priority) or IF-freeze gate.
+        if (tcyc >= `BOOT_DCWIN && tcyc <= `BOOT_DCWIN + 100
+            && u_soc.u_cpu.u_core.id_ex_valid
+            && u_soc.u_cpu.u_core.id_ex_ctrl.csr_write
+            && u_soc.u_cpu.u_core.id_ex_csr_addr == 12'h340)
+            $display("   [MSCR c%0d] pc=%h op=%b wdata=%h rdata_ex=%h | imrdy=%b sex=%b te=%b mte=%b mret=%b sret=%b ifpf=%b csr_we=%b mscr_reg=%h",
+                tcyc, u_soc.u_cpu.u_core.id_ex_pc, u_soc.u_cpu.u_core.id_ex_funct3,
+                u_soc.u_cpu.u_core.ex_csr_wdata, u_soc.u_cpu.u_core.csr_rdata_ex,
+                u_soc.imem_ready, u_soc.u_cpu.u_core.stall_ex,
+                u_soc.u_cpu.u_core.ex_trap_enter, u_soc.u_cpu.u_core.mem_trap_enter,
+                u_soc.u_cpu.u_core.ex_mret_en, u_soc.u_cpu.u_core.ex_sret_en,
+                u_soc.u_cpu.u_core.ifpf_take, u_soc.u_cpu.u_core.u_csr.csr_we,
+                u_soc.u_cpu.u_core.u_csr.mscratch_reg);
+        // Per-cycle mscratch_reg value (to see when/whether the 1st csrrw's write
+        // lands and whether it is later clobbered).
+        if (tcyc >= `BOOT_DCWIN && tcyc <= `BOOT_DCWIN + 100)
+            $display("   [MSREG c%0d] mscratch_reg=%h exmpc=%h", tcyc,
+                u_soc.u_cpu.u_core.u_csr.mscratch_reg, u_soc.u_cpu.u_core.ex_mem_pc);
+`endif
 `ifdef BOOT_CYCTRACE
         if (tcyc < 50)
             $display("[c%0d] fpc=%h ir=%b ird=%08h memwin=%08h sid=%b sex=%b idxpc=%h idxv=%b",
@@ -230,6 +337,27 @@ module tb_rv_boot_soc;
 `ifdef BOOT_EXEC
 `ifndef BOOT_EXEC_LO
   `define BOOT_EXEC_LO 0
+`endif
+`ifdef BOOT_IPROBE
+      if (tcyc >= `BOOT_EXEC_LO && tcyc <= `BOOT_EXEC_LO + 40)
+        $display("c%0d fpc=%h ifhit=%b iffault=%b | PTW st=%0d forif=%b faultr=%b | idexv=%b idexpc=%h exmemv=%b memwbv=%b sif=%b sid=%b sex=%b",
+          tcyc, u_soc.u_cpu.u_core.fetch_pc,
+          u_soc.u_cpu.u_mmu.if_tlb_hit, u_soc.u_cpu.u_mmu.if_fault,
+          u_soc.u_cpu.u_mmu.ptw_state, u_soc.u_cpu.u_mmu.ptw_for_if,
+          u_soc.u_cpu.u_mmu.ptw_fault_r,
+          u_soc.u_cpu.u_core.id_ex_valid, u_soc.u_cpu.u_core.id_ex_pc,
+          u_soc.u_cpu.u_core.ex_mem_valid, u_soc.u_cpu.u_core.mem_wb_valid,
+          u_soc.u_cpu.u_core.stall_if, u_soc.u_cpu.u_core.stall_id,
+          u_soc.u_cpu.u_core.stall_ex);
+      if (tcyc == `BOOT_EXEC_LO) begin
+        $display("[PTMEM] tramp[2]@81725010=%h tramp[511]@81725ff8=%h",
+          mem_win64(64'h0000000081725010), mem_win64(64'h0000000081725ff8));
+        $display("[PTMEM] early[2]@80e05010=%h early[511]@80e05ff8=%h",
+          mem_win64(64'h0000000080e05010), mem_win64(64'h0000000080e05ff8));
+        $display("[PTMEM] tramp0=%h tramp8=%h early0=%h early8=%h",
+          mem_win64(64'h0000000081725000), mem_win64(64'h0000000081725008),
+          mem_win64(64'h0000000080e05000), mem_win64(64'h0000000080e05008));
+      end
 `endif
       if (tcyc >= `BOOT_EXEC_LO) begin
         // Committed-instruction stream: every cycle EX/MEM advances capturing a
@@ -290,14 +418,197 @@ module tb_rv_boot_soc;
                      tcyc, u_soc.u_cpu.u_core.fetch_pc, u_soc.imem_rdata,
                      mem_win(u_soc.u_cpu.u_core.fetch_pc));
         end
+        // PTE-store watch: any DRAM store whose low byte has the valid bit set
+        // (a plausible page-table entry).  Localizes where (if anywhere) the
+        // kernel installs page tables.
+        if (u_soc.mmu_dmem_req && u_soc.core_dmem_we && !u_soc.periph_is_periph
+            && !u_soc.core_dmem_wait
+            && (u_soc.core_dmem_wdata != 0)
+            && (((u_soc.mmu_dmem_pa >= 64'h80e05000) && (u_soc.mmu_dmem_pa < 64'h80e06000))
+             || ((u_soc.mmu_dmem_pa >= 64'h81725000) && (u_soc.mmu_dmem_pa < 64'h81726000)))
+            && nipa < 40) begin
+            nipa <= nipa + 1;
+            $display("[PTST @%0d] pa=%h wdata=%h pc=%h",
+                     tcyc, u_soc.mmu_dmem_pa, u_soc.core_dmem_wdata,
+                     u_soc.u_cpu.u_core.ex_mem_pc);
+        end
+        // Physical-address I$ content check (valid under MMU too: addr_q is the
+        // PHYSICAL line address the I$ believes it is serving).  If the delivered
+        // window diverges from the shared DDR at addr_q, the I$ line content (or
+        // its part-select) is wrong; if this stays silent while the core still
+        // commits garbage, addr_q itself is the wrong physical address.
+        if (u_soc.imem_ready
+            && (^u_soc.gen_icache.u_ic.addr_q !== 1'bx)
+            && (u_soc.gen_icache.u_ic.addr_q >= MEM_BASE)
+            && (u_soc.imem_rdata !== mem_win(u_soc.gen_icache.u_ic.addr_q))
+            && nipa < 40) begin
+            nipa <= nipa + 1;
+            $display("[IPA @%0d] addr_q=%h pa=%h I$=%h mem@addr_q=%h",
+                     tcyc, u_soc.gen_icache.u_ic.addr_q, u_soc.mmu_imem_pa,
+                     u_soc.imem_rdata, mem_win(u_soc.gen_icache.u_ic.addr_q));
+        end
 `endif
-        if (u_soc.u_cpu.u_core.trap_or_mret)
-            $display("[trap @%0d] tgt=%h te=%b mte=%b mret=%b sret=%b mcause=%h mepc=%h mtval=%h",
+        // PTW state tracer for DATA walks around the first store-fault window.
+        if (`BOOT_PTWLO != 0 && tcyc >= `BOOT_PTWLO && tcyc <= `BOOT_PTWLO + 400
+            && !u_soc.u_cpu.u_mmu.ptw_for_if
+            && u_soc.u_cpu.u_mmu.ptw_state != 0)
+            $display("[PTW @%0d] st=%0d wait=%b rdy=%b paddr=%h rdata=%h vpn=%h ppncur=%h",
+                tcyc, u_soc.u_cpu.u_mmu.ptw_state, u_soc.u_cpu.u_mmu.ptw_wait,
+                u_soc.u_cpu.ptw_ready, u_soc.u_cpu.u_mmu.ptw_paddr,
+                u_soc.u_cpu.u_mmu.ptw_rdata, u_soc.u_cpu.u_mmu.ptw_vpn,
+                u_soc.u_cpu.u_mmu.ptw_ppn_cur);
+        if (u_soc.u_cpu.u_core.trap_or_mret || u_soc.u_cpu.u_core.ifpf_take)
+            $display("[trap @%0d] tgt=%h te=%b mte=%b ifpf=%b mret=%b sret=%b | LIVE cause=%h epc=%h tval=%h priv=%0d a7=%h a6=%h a0=%h",
                 tcyc, u_soc.u_cpu.u_core.redir_tgt,
                 u_soc.u_cpu.u_core.ex_trap_enter, u_soc.u_cpu.u_core.mem_trap_enter,
+                u_soc.u_cpu.u_core.ifpf_take,
                 u_soc.u_cpu.u_core.ex_mret_en, u_soc.u_cpu.u_core.ex_sret_en,
-                u_soc.u_cpu.u_core.u_csr.mcause_reg, u_soc.u_cpu.u_core.u_csr.mepc_out,
-                u_soc.u_cpu.u_core.u_csr.mtval_reg);
+                u_soc.u_cpu.u_core.csr_trap_cause, u_soc.u_cpu.u_core.csr_trap_epc,
+                u_soc.u_cpu.u_core.csr_trap_val, u_soc.u_cpu.priv_out,
+                u_soc.u_cpu.u_core.u_regfile.regs[17],
+                u_soc.u_cpu.u_core.u_regfile.regs[16],
+                u_soc.u_cpu.u_core.u_regfile.regs[10]);
+        // CSR-write monitor (sscratch/satp/stvec): the kernel storm uses
+        // tp == sscratch == 0x8003e000 (an OpenSBI-firmware PHYSICAL address) as a
+        // pointer.  Trace where that value gets installed -- whether the kernel
+        // COMPUTED it (DTB/per-CPU/memory-map bug) or a LOAD returned wrong data
+        // (residual cache/data-path corruption).  Capped to avoid log flooding.
+        if (u_soc.u_cpu.u_core.id_ex_valid && !u_soc.u_cpu.u_core.stall_ex
+            && u_soc.u_cpu.u_core.id_ex_ctrl.csr_write && u_soc.imem_ready
+            && (u_soc.u_cpu.u_core.id_ex_csr_addr == 12'h140    // sscratch
+             || u_soc.u_cpu.u_core.id_ex_csr_addr == 12'h180    // satp
+             || u_soc.u_cpu.u_core.id_ex_csr_addr == 12'h105)   // stvec
+            && ncsr < 80) begin
+            ncsr <= ncsr + 1;
+            $display("[CSRW @%0d] pc=%h csr=%h wdata=%h", tcyc,
+                u_soc.u_cpu.u_core.id_ex_pc, u_soc.u_cpu.u_core.id_ex_csr_addr,
+                u_soc.u_cpu.u_core.ex_csr_wdata);
+        end
+        // tp (x4) architectural writeback -- catches the moment tp becomes the bad
+        // firmware-physical pointer.
+        if (u_soc.u_cpu.u_core.wb_reg_write && u_soc.u_cpu.u_core.wb_rd_addr == 5'd4
+            && ntp < 80) begin
+            ntp <= ntp + 1;
+            $display("[TPWB @%0d] tp <= %h (pc-ish wb)", tcyc,
+                u_soc.u_cpu.u_core.wb_data);
+        end
+        // udelay entry probe: caller (ra), argument (a0), computed target (a4) and
+        // the live time CSR.  Characterizes why a udelay spins for tens of millions
+        // of cycles (large target vs stuck rdtime).  The udelay entry PC moves with
+        // each vmlinux layout: override with -DBOOT_UDELAY_PC=64'h... (default =
+        // the 2026-06-10 V01 build; old pre-V01 build was ...8094f380).
+`ifndef BOOT_UDELAY_PC
+  `define BOOT_UDELAY_PC 64'hffffffff8094f5b4
+`endif
+        if (u_soc.u_cpu.u_core.id_ex_valid && !u_soc.u_cpu.u_core.stall_ex
+            && u_soc.imem_ready
+            && u_soc.u_cpu.u_core.id_ex_pc == `BOOT_UDELAY_PC
+            && nud < 40) begin
+            nud <= nud + 1;
+            $display("[UDELAY @%0d] ra=%h a0=%h a4(target)=%h time=%0d",
+                tcyc, u_soc.u_cpu.u_core.u_regfile.regs[1],
+                u_soc.u_cpu.u_core.u_regfile.regs[10],
+                u_soc.u_cpu.u_core.u_regfile.regs[14],
+                u_soc.u_cpu.u_core.time_val);
+        end
+        // TEMP-DIAG: earlycon registration chain PC probes (2026-06-10 vmlinux)
+        if (u_soc.u_cpu.u_core.id_ex_valid && !u_soc.u_cpu.u_core.stall_ex
+            && u_soc.imem_ready && nud < 40) begin
+            case (u_soc.u_cpu.u_core.id_ex_pc)
+                64'hffffffff80a00678: $display("[ECPROBE @%0d] parse_early_param", tcyc);
+                64'hffffffff80a000ba: $display("[ECPROBE @%0d] do_early_param a0=%h", tcyc,
+                                               u_soc.u_cpu.u_core.u_regfile.regs[10]);
+                64'hffffffff80a28bd4: $display("[ECPROBE @%0d] setup_earlycon a0=%h", tcyc,
+                                               u_soc.u_cpu.u_core.u_regfile.regs[10]);
+                64'hffffffff80a28e48: $display("[ECPROBE @%0d] param_setup_earlycon a0=%h", tcyc,
+                                               u_soc.u_cpu.u_core.u_regfile.regs[10]);
+                64'hffffffff80a2914c: $display("[ECPROBE @%0d] early_sbi_setup", tcyc);
+                64'hffffffff8004ed7a: $display("[ECPROBE @%0d] register_console a0=%h", tcyc,
+                                               u_soc.u_cpu.u_core.u_regfile.regs[10]);
+                64'hffffffff8004dde8: begin
+                    $display("[ECPROBE @%0d] console_flush_all", tcyc);
+                    // TEMP-DIAG: printk_rb_static state (PA 0x816170f8)
+                    $display("  [PRB] head_id=%h tail_id=%h lastfin=%h fail=%h hlpos=%h tlpos=%h",
+                        mem_win64(64'h0000000081617110),   // desc_ring.head_id
+                        mem_win64(64'h0000000081617118),   // desc_ring.tail_id
+                        mem_win64(64'h0000000081617120),   // desc_ring.last_finalized_seq
+                        mem_win64(64'h0000000081617148),   // fail
+                        mem_win64(64'h0000000081617138),   // text_data_ring.head_lpos
+                        mem_win64(64'h0000000081617140));  // text_data_ring.tail_lpos
+                    $display("  [PRB2] cb=%h descs=%h infos=%h d0=%h d1=%h d2=%h",
+                        mem_win64(64'h00000000816170f8),   // count_bits|pad
+                        mem_win64(64'h0000000081617100),   // descs ptr
+                        mem_win64(64'h0000000081617108),   // infos ptr
+                        mem_win64(64'h000000008166f190),   // descs[0].state_var
+                        mem_win64(64'h000000008166f1a8),   // descs[1].state_var
+                        mem_win64(64'h000000008166f1c0));  // descs[2].state_var
+                end
+                64'hffffffff80563502: $display("[ECPROBE @%0d] sbi_0_1_console_write a2(n)=%h", tcyc,
+                                               u_soc.u_cpu.u_core.u_regfile.regs[12]);
+                64'hffffffff80009144: $display("[ECPROBE @%0d] sbi_console_putchar a0=%h", tcyc,
+                                               u_soc.u_cpu.u_core.u_regfile.regs[10]);
+                default: ;
+            endcase
+        end
+        // TEMP-DIAG: timer arming chain PC probes (2026-06-10 vmlinux).  Traces
+        // why the kernel never issues SBI set_timer (no STIP -> idle forever):
+        // riscv_timer_init_dt -> riscv_timer_starting_cpu -> tick_check_new_device
+        // -> clockevents_program_event -> riscv_clock_next_event -> sbi_set_timer.
+        if (u_soc.u_cpu.u_core.id_ex_valid && !u_soc.u_cpu.u_core.stall_ex
+            && u_soc.imem_ready && ntm < 60) begin
+            case (u_soc.u_cpu.u_core.id_ex_pc)
+                64'hffffffff80a3287c: begin ntm <= ntm + 1;
+                    $display("[TMPROBE @%0d] riscv_timer_init_dt", tcyc); end
+                64'hffffffff80730dd8: begin ntm <= ntm + 1;
+                    $display("[TMPROBE @%0d] riscv_timer_starting_cpu", tcyc); end
+                64'hffffffff80078408: begin ntm <= ntm + 1;
+                    $display("[TMPROBE @%0d] tick_check_new_device", tcyc); end
+                64'hffffffff80077d9a: begin ntm <= ntm + 1;
+                    $display("[TMPROBE @%0d] clockevents_program_event a1=%h", tcyc,
+                             u_soc.u_cpu.u_core.u_regfile.regs[11]); end
+                64'hffffffff80730d62: begin ntm <= ntm + 1;
+                    $display("[TMPROBE @%0d] riscv_clock_next_event a0=%h time=%0d", tcyc,
+                             u_soc.u_cpu.u_core.u_regfile.regs[10],
+                             u_soc.u_cpu.u_core.time_val); end
+                64'hffffffff800096a6: begin ntm <= ntm + 1;
+                    $display("[TMPROBE @%0d] sbi_set_timer a0=%h time=%0d", tcyc,
+                             u_soc.u_cpu.u_core.u_regfile.regs[10],
+                             u_soc.u_cpu.u_core.time_val); end
+                default: ;
+            endcase
+        end
+        // refcount_warn_saturate(r, t): a0 = the corrupted refcount_t pointer,
+        // a1 = saturation type.  Identifies WHICH object's count went bad
+        // (2026-06-10 vmlinux).  Own cap: the ntm probes flood once the tick
+        // is running (clockevents_program_event fires every ~4000 cycles).
+        if (u_soc.u_cpu.u_core.id_ex_valid && !u_soc.u_cpu.u_core.stall_ex
+            && u_soc.imem_ready && nrc < 20
+            && u_soc.u_cpu.u_core.id_ex_pc == 64'hffffffff803bce1e) begin
+            nrc <= nrc + 1;
+            $display("[RCPROBE @%0d] refcount_warn_saturate r=%h type=%0d ra=%h", tcyc,
+                     u_soc.u_cpu.u_core.u_regfile.regs[10],
+                     u_soc.u_cpu.u_core.u_regfile.regs[11],
+                     u_soc.u_cpu.u_core.u_regfile.regs[1]);
+        end
+        // TEMP-DIAG: count vprintk_emit entries (flood vs livelock discriminator)
+        if (u_soc.u_cpu.u_core.id_ex_valid && !u_soc.u_cpu.u_core.stall_ex
+            && u_soc.imem_ready
+            && u_soc.u_cpu.u_core.id_ex_pc == 64'hffffffff8004e4aa)
+            nvpe <= nvpe + 1;
+        // On a load/store page fault to a kernel VA, dump the page-table walk to
+        // see the leaf PTE permission/A/D bits behind the fault.
+        if (u_soc.u_cpu.u_core.mem_trap_enter
+            && (u_soc.u_cpu.u_core.csr_trap_val[63:40] == 24'hFFFFFF)
+            && npw < 6) begin
+            npw <= npw + 1;
+            $display("  [MEMMMU we=%b tlbhit=%b tlb_w=%b tlb_d=%b tlb_u=%b permok=%b ptwst=%0d ptwfault=%b forif=%b sum=%b]",
+                u_soc.u_cpu.u_mmu.mem_we, u_soc.u_cpu.u_mmu.mem_tlb_hit,
+                u_soc.u_cpu.u_mmu.mem_tlb_w, u_soc.u_cpu.u_mmu.mem_tlb_d,
+                u_soc.u_cpu.u_mmu.mem_tlb_u, u_soc.u_cpu.u_mmu.mem_perm_ok,
+                u_soc.u_cpu.u_mmu.ptw_state, u_soc.u_cpu.u_mmu.ptw_fault_r,
+                u_soc.u_cpu.u_mmu.ptw_for_if, u_soc.u_cpu.u_mmu.mstatus_sum);
+            ptwalk(u_soc.u_cpu.u_core.csr_trap_val);
+        end
         // Trace AMO/data accesses to the OpenSBI lottery region (boot-hart select)
         if (lpend) begin
             $display("   [lottery LD result @%0d] rdata=%h", tcyc, u_soc.dmem_rdata);
@@ -374,6 +685,16 @@ module tb_rv_boot_soc;
                 $display("[DLOAD BUG @%0d] pc=%h addr=%h f3=%b fresh=%b wb_data=%h exp=%h (ddr_word=%h)",
                     tcyc, ld_pc, ld_addr, f3, u_soc.u_cpu.u_core.mem_wb_fresh,
                     u_soc.u_cpu.u_core.wb_data, exp, mem_win64(ld_addr));
+                // Decisive fork: is the raw 64-bit value the core received already
+                // wrong (cache delivered bad data), or does it match DDR but the
+                // sub-word shift/offset is wrong (core load-path bug)?
+                $display("   [DLDBG] core_dmem_rdata=%h held=%h boff=%h | dc_rdata_q=%h dc_idx_data=%h v=%b tag_ok=%b",
+                    u_soc.u_cpu.u_core.dmem_rdata, u_soc.u_cpu.u_core.dmem_rdata_held,
+                    u_soc.u_cpu.u_core.mem_wb_byte_offset,
+                    u_soc.gen_dcache.u_dc.rdata_q,
+                    u_soc.gen_dcache.u_dc.data[ld_addr[13:5]][ld_addr[4:3]],
+                    u_soc.gen_dcache.u_dc.valid[ld_addr[13:5]],
+                    (u_soc.gen_dcache.u_dc.tagm[ld_addr[13:5]] == ld_addr[63:14]));
             end
         end
         // Latch a cacheable, aligned load as it advances MEM->WB (access complete).
@@ -492,14 +813,58 @@ module tb_rv_boot_soc;
         // run until the firmware signals done, or timeout
         for (cyc = 0; cyc < `BOOT_MAX_CYCLES; cyc = cyc + 1) begin
             @(posedge clk);
+            if ((cyc % 1_000_000) == 999_999) begin
+                $display("\n[progress @%0dM cyc] pc=%010h if_fills=%0d d_reads=%0d chars=%0d mtime=%0d vpe=%0d",
+                         (cyc+1)/1_000_000, u_soc.u_cpu.u_core.fetch_pc, if_ar, d_ar, nchars,
+                         u_soc.u_cpu.u_core.time_val, nvpe);
+                $display("  [IRQCHAIN] ier1=%b uirq=%b plic_en1=%b plic_pend=%b ext1=%b ext0=%b | seip=%0d meip=%0d stip=%0d | en1=%b th1=%0d pr1=%0d",
+                         ever_ier1, ever_uirq, ever_en1, ever_pend1, ever_extirq1, ever_extirq0,
+                         n_seip, n_meip, n_stip,
+                         u_soc.u_periph.u_plic.enable1, u_soc.u_periph.u_plic.thresh1,
+                         u_soc.u_periph.u_plic.prio[1]);
+            end
+`ifdef BOOT_TRACE
+            // TEMP-DIAG: periodic printk_rb_static head/tail/fail dump
             if ((cyc % 1_000_000) == 999_999)
-                $display("\n[progress @%0dM cyc] pc=%010h if_fills=%0d d_reads=%0d chars=%0d",
-                         (cyc+1)/1_000_000, u_soc.u_cpu.u_core.fetch_pc, if_ar, d_ar, nchars);
+                $display("  [PRBP] head_id=%h tail_id=%h fail=%h",
+                    mem_win64(64'h0000000081617110),
+                    mem_win64(64'h0000000081617118),
+                    mem_win64(64'h0000000081617148));
+            // TEMP-DIAG: interrupt-delivery state (CLINT + CSR), for the
+            // "timer armed but no MTIP" investigation.
+            if ((cyc % 1_000_000) == 999_999)
+                $display("  [IRQST] mtimecmp=%h tirq=%b mie=%h mip=%h mideleg=%h priv=%0d mie_bit=%b",
+                    u_soc.u_periph.u_timer.mtimecmp,
+                    u_soc.u_periph.u_timer.timer_irq,
+                    u_soc.u_cpu.u_core.u_csr.mie_reg,
+                    u_soc.u_cpu.u_core.u_csr.mip_val,
+                    u_soc.u_cpu.u_core.u_csr.mideleg_reg,
+                    u_soc.u_cpu.u_core.u_csr.cur_priv,
+                    u_soc.u_cpu.u_core.u_csr.mstatus_mie);
+            // TEMP-DIAG: physical-address write watch (BOOT_WATCH_PA=64'h...).
+            // Every store/AMO write reaching the shared DDR within the watched
+            // 8-byte word is logged with the MEM-stage PC (the store is held in
+            // MEM by dmem_wait until the write-through completes, so ex_mem_pc
+            // is the storing instruction).  For chasing single-object memory
+            // corruption (e.g. the refcount at shmem_init's fs_context).
+            if (`BOOT_WATCH_PA != 0
+                && u_bfm.d_wready && u_bfm.d_wvalid
+                && ((64'(u_bfm.d_waddr_q) & ~64'h7) == (`BOOT_WATCH_PA & ~64'h7)))
+                $display("[WATCH @%0d] PA=%h wdata=%h wstrb=%h mem_pc=%h",
+                    tcyc, 64'(u_bfm.d_waddr_q), u_bfm.d_wdata, u_bfm.d_wstrb,
+                    u_soc.u_cpu.u_core.ex_mem_pc);
+            if (`BOOT_WATCH_PA != 0 && (cyc % 1_000_000) == 999_999)
+                $display("  [WATCHV] [%h]=%h",
+                    (`BOOT_WATCH_PA & ~64'h7), mem_win64(`BOOT_WATCH_PA & ~64'h7));
+`endif
             if (sentinel() === DONE_MAGIC || sentinel() === FAIL_MAGIC) cyc = `BOOT_MAX_CYCLES;
         end
         #1;
         $display("\n----- end of console (%0d UART chars; IF line-fills=%0d, data reads=%0d) -----",
                  nchars, if_ar, d_ar);
+        $display("[IRQCHAIN final] ier1(THRI)=%b uart_irq=%b plic_en1=%b plic_pend=%b ext_ctx1=%b ext_ctx0=%b | seip_traps=%0d meip_traps=%0d stip_traps=%0d",
+                 ever_ier1, ever_uirq, ever_en1, ever_pend1, ever_extirq1, ever_extirq0,
+                 n_seip, n_meip, n_stip);
         if (sentinel() === DONE_MAGIC) begin
             $display("tb_rv_boot_soc: PASS (firmware reached SBI done; sentinel=0x%08h)", sentinel());
             $display("ALL TESTS PASSED");

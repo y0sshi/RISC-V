@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.5
+########################################
+# Verilator simulation image
+#   Verilator 5.x (from Ubuntu 24.04) + the host C++ toolchain it needs to
+#   compile the generated model.  Used for the multi-million-cycle Linux/OpenSBI
+#   boot sims where iverilog is too slow (see docs/verilator_sim.md).
+#
+# Build:  docker build -t verilator:5.020 -f Dockerfile.verilator .
+########################################
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    verilator \
+    build-essential \
+    perl \
+    ccache \
+    zlib1g-dev \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# sanity check
+RUN verilator --version && make --version | head -1 && g++ --version | head -1
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

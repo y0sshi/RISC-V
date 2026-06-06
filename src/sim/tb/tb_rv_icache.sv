@@ -206,6 +206,100 @@ module tb_rv_icache;
         fetch(BASE + 0, d);  check(d, 32'hBEEF_1234, "post-FENCE.I refetch");
         check_i(miss_cnt - m0, 1, "FENCE.I -> refill");
 
+        // ---- MMU-gap resume (blocker 1 regression) ------------------------
+        // Under a virtual-memory kernel the MMU briefly withdraws the fetch
+        // request (c_req=0, if_pa=0) while it walks a page table on a TLB miss,
+        // then resumes at a DIFFERENT address.  The cache MUST serve the NEW
+        // address on the first c_ready after the gap -- not the address that was
+        // in flight before the gap.  (Bare/M-mode and every unit test keep c_req
+        // asserted continuously, so this c_req 1->0->1 edge was never exercised;
+        // it is exactly the Linux early-boot I$ wrong-bytes bug.)
+        begin : mmu_gap
+            logic [31:0] gd;
+            // prime two distinct cached lines (A=line0 word1, B=line1 word0);
+            // word0 of line0 was modified by the FENCE.I test, so avoid it.
+            fetch(BASE + 4,      gd); check(gd, 32'hC0DE_0001, "gap: prime A");
+            fetch(BASE + 32'h20, gd); check(gd, 32'hC0DE_0008, "gap: prime B");
+            // settle on A as the last in-flight fetch (addr_q == A)
+            fetch(BASE + 4,      gd); check(gd, 32'hC0DE_0001, "gap: settle A");
+            check_i(int'(u_ic.addr_q), int'(BASE + 4), "gap: addr_q==A before gap");
+            // withdraw the request for a few cycles (PTW emulation); hold the
+            // last address on the bus (the value is don't-care while c_req=0).
+            @(negedge clk); c_req = 0;
+            repeat (3) @(negedge clk);
+            // resume at B; the first c_ready after the gap must serve B
+            c_req = 1; c_addr = BASE + 32'h20;
+            begin : wait_ready
+                integer guard;
+                guard = 0;
+                forever begin
+                    @(negedge clk); #1;
+                    if (c_ready) begin
+                        check(c_rdata, 32'hC0DE_0008,
+                              "gap: resume serves B (not stale pre-gap addr)");
+                        break;
+                    end
+                    guard = guard + 1;
+                    if (guard > 20) begin
+                        fail_cnt = fail_cnt + 1;
+                        $display("[FAIL] gap: no c_ready after resume");
+                        break;
+                    end
+                end
+            end
+            c_req = 0;
+            @(negedge clk);
+        end
+
+        // ---- Translation change mid-fill (Linux MRET-return regression) ----
+        // The MMU can retranslate the SAME held fetch_pc to a different
+        // physical address while the I$ is filling: an MRET/SRET privilege
+        // switch translates the first post-redirect fetch with the stale
+        // privilege (bare physical) for one cycle, the I$ commits to filling
+        // that wrong line, and the corrected translation then appears on
+        // c_addr mid-fill.  The data served after the fill MUST be for the
+        // LIVE c_addr, not the stale fill address (serving the stale line is
+        // how a Linux MRET return executed OpenSBI firmware bytes -> decoded
+        // garbage c.sd -> store fault tval=0x30 -> silent panic).
+        begin : xlate_mid_fill
+            logic [31:0] xd;
+            logic        got;
+            integer      guard;
+            logic [XLEN-1:0] XA, XB;
+            XA = BASE + 'h40;           // idx 2, tag T0
+            XB = BASE + 'h40 + 'h800;   // idx 2, tag T1 (same set, different tag)
+            poke_word('h40,  32'hAAAA_0001);
+            poke_word('h840, 32'hBBBB_0001);
+            // invalidate so XA misses and launches a fill
+            @(negedge clk); flush = 1; @(negedge clk); flush = 0;
+            @(negedge clk);
+            c_req = 1; c_addr = XA;          // present XA: lookup -> miss -> fill
+            repeat (3) @(negedge clk);       // fill of XA's line is now in flight
+            c_addr = XB;                     // translation "changes" mid-fill
+            got = 1'b0; guard = 0;
+            while (!got) begin
+                @(negedge clk); #1;
+                if (c_ready) begin
+                    check(c_rdata, 32'hBBBB_0001,
+                          "xlate: first serve after mid-fill addr change is LIVE addr");
+                    got = 1'b1;
+                end
+                guard = guard + 1;
+                if (guard > 200) begin
+                    fail_cnt = fail_cnt + 1;
+                    $display("[FAIL] xlate: no c_ready after mid-fill addr change");
+                    got = 1'b1;
+                end
+            end
+            c_req = 0;
+            @(negedge clk);
+            // both lines must now be cached under their own tags
+            fetch(XA, xd); check(xd, 32'hAAAA_0001, "xlate: XA line cached correctly");
+            fetch(XB, xd); check(xd, 32'hBBBB_0001, "xlate: XB line cached correctly");
+            c_req = 0;
+            @(negedge clk);
+        end
+
         $display("==================================================");
         $display("rv_icache (XLEN=%0d): %0d passed, %0d failed", XLEN, pass_cnt, fail_cnt);
         $display("hit_cnt=%0d miss_cnt=%0d", hit_cnt, miss_cnt);

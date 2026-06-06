@@ -1,35 +1,42 @@
 // =============================================================================
 // rv_plic.sv - RISC-V Platform-Level Interrupt Controller (PLIC)
 // =============================================================================
-// Simplified PLIC compatible with the RISC-V Privileged Architecture.
-// Supports NSRC interrupt sources and NCTX contexts (M-mode/S-mode).
+// Simplified PLIC compatible with the RISC-V Privileged Architecture and the
+// de-facto SiFive PLIC register map that the Linux `riscv,plic0` driver and
+// OpenSBI assume.  Supports NSRC interrupt sources and NCTX contexts.
 //
-// Register map (12-bit byte offset within 4 KB window at base address):
+// Standard SiFive PLIC memory map (byte offset from the PLIC base address;
+// `addr` here is that offset, 22 bits wide -> up to 4 MiB):
 //
 //   Source priorities  (R/W, one 32-bit word per source):
-//     0x000 : priority[0] = 0  (source 0 reserved)
-//     0x004 : priority[1]
-//     0x008 : priority[2]
+//     0x000000 : priority[0] = 0  (source 0 reserved)
+//     0x000004 : priority[1]
 //       ...
-//     0x020 : priority[8]   (NSRC=8)
+//     0x000020 : priority[8]                 (NSRC=8)
 //
-//   Interrupt pending  (RO, bit n = source n):
-//     0x100 : pending[31:1]
+//   Interrupt pending  (RO, bit n = source n, 32 sources per word):
+//     0x001000 : pending word 0 (sources 0..31)
 //
-//   Interrupt enable per context (R/W):
-//     0x200 : enable[ctx=0][31:1]  (M-mode, bit n = source n)
-//     0x204 : enable[ctx=1][31:1]  (S-mode)
+//   Interrupt enable per context (R/W, 0x80 stride per context):
+//     0x002000 : enable[ctx=0] word 0  (M-mode, bit n = source n)
+//     0x002080 : enable[ctx=1] word 0  (S-mode)
 //
-//   Per-context threshold and claim/complete:
-//     0x300 : threshold[ctx=0]
-//     0x304 : claim_complete[ctx=0]  read=highest-priority ID, write=complete
-//     0x308 : threshold[ctx=1]
-//     0x30C : claim_complete[ctx=1]
+//   Per-context threshold + claim/complete (0x1000 stride per context):
+//     0x200000 : threshold[ctx=0]
+//     0x200004 : claim_complete[ctx=0]  (read=highest-priority ID, write=complete)
+//     0x201000 : threshold[ctx=1]
+//     0x201004 : claim_complete[ctx=1]
+//
+//   NOTE: an earlier revision used a COMPACT custom map (enable @0x200,
+//   threshold/claim @0x300).  That worked for the bare-metal unit test but is
+//   NOT what the upstream `riscv,plic0` driver writes, so Linux could never
+//   enable an S-context source -- the userspace tty TX interrupt was lost.
+//   This map matches the driver; the SoC routes the full PLIC window here.
 //
 // Claim/complete protocol:
-//   1. CPU reads claim reg → returns winning source ID (0 if none).
+//   1. CPU reads claim reg -> returns winning source ID (0 if none).
 //   2. CPU services the interrupt.
-//   3. CPU writes winning source ID to complete reg → clears pending.
+//   3. CPU writes the source ID to complete reg -> clears pending.
 //
 // Author: Naofumi Yoshinaga
 // =============================================================================
@@ -45,8 +52,9 @@ module rv_plic #(
     input  wire         clk,
     input  wire         rst_n,
 
-    // 32-bit memory-mapped bus (12-bit byte offset within 4 KB window)
-    input  wire [11:0]  addr,
+    // 32-bit memory-mapped bus.  `addr` is the byte offset from the PLIC base
+    // (22 bits = 4 MiB, enough for the standard map up to 0x201004).
+    input  wire [21:0]  addr,
     input  wire         req,
     input  wire         we,
     input  wire [31:0]  wdata,
@@ -62,12 +70,9 @@ module rv_plic #(
     // =========================================================================
     // Register declarations (flat, no multi-dim array index tricks)
     // =========================================================================
-    // Priority: PRIO_BITS × NSRC  packed as [NSRC*PRIO_BITS-1:0]
-    // We keep a separate word per source for clarity; use generate if needed.
-    // For NSRC=8, PRIO_BITS=3 → 8 × 3 = 24 bits total.
     logic [PRIO_BITS-1:0] prio [1:8];   // prio[1..8], index 0 unused
 
-    // Pending, enable, claimed as bit vectors (bit 0 unused for source)
+    // Pending, enable as bit vectors (bit 0 unused for source)
     logic [8:1] pending;   // pending[n] = source n pending
     logic [8:1] enable0;   // enable for context 0 (M-mode)
     logic [8:1] enable1;   // enable for context 1 (S-mode)
@@ -82,19 +87,21 @@ module rv_plic #(
     logic [8:1] src_irq_r;
 
     // =========================================================================
-    // Address decode (combinational helpers extracted from always blocks)
+    // Address decode (standard SiFive PLIC map)
     // =========================================================================
-    logic [3:0] grp;          // addr[11:8]
-    logic [5:0] src_sel;      // addr[7:2] : source index for priority
-    logic       ctx_sel;      // addr[2]   : context select for enable
-    logic       reg_sel;      // addr[2]   : 0=threshold, 1=claim for group 3
-    logic       ctx3_sel;     // addr[3]   : context select for group 3
+    //   priority region : [0x000000, 0x001000)
+    //   pending  region : [0x001000, 0x002000)
+    //   enable   region : [0x002000, 0x200000)  (0x80 per context)
+    //   context  region : [0x200000, ...     )  (0x1000 per context)
+    wire is_prio_acc = (addr <  22'h001000);
+    wire is_pend_acc = (addr >= 22'h001000) && (addr < 22'h002000);
+    wire is_en_acc   = (addr >= 22'h002000) && (addr < 22'h200000);
+    wire is_ctx_acc  = (addr >= 22'h200000);
 
-    assign grp      = addr[11:8];
-    assign src_sel  = addr[7:2];
-    assign ctx_sel  = addr[2];
-    assign reg_sel  = addr[2];
-    assign ctx3_sel = addr[3];
+    wire [5:0] prio_id  = addr[7:2];   // source index (priority region word-select)
+    wire       en_ctx   = addr[7];     // 0x2000 -> ctx0, 0x2080 -> ctx1
+    wire       ctx_id   = addr[12];    // 0x200000 -> ctx0, 0x201000 -> ctx1
+    wire       ctx_claim= addr[2];     // +0x0 = threshold, +0x4 = claim/complete
 
     // Complete source (extracted to avoid constant-select in always_ff)
     logic [7:0] complete_src;
@@ -102,15 +109,11 @@ module rv_plic #(
 
     // =========================================================================
     // Priority arbitration for each context (combinational)
-    // =========================================================================
     // Returns the source ID with highest priority that is pending, enabled,
     // and whose priority exceeds the context threshold.
-
-    // Context 0 (M-mode)
+    // =========================================================================
     logic [PRIO_BITS-1:0] best_prio0;
     logic [7:0]            best_id0;
-
-    // Context 1 (S-mode)
     logic [PRIO_BITS-1:0] best_prio1;
     logic [7:0]            best_id1;
 
@@ -165,72 +168,63 @@ module rv_plic #(
 
             // -- Bus writes -------------------------------------------------
             if (req && we) begin
-                case (grp)
-                    4'h0: begin  // Source priority (word-indexed by addr[7:2])
-                        case (src_sel)
-                            6'd1: prio[1] <= wdata[PRIO_BITS-1:0];
-                            6'd2: prio[2] <= wdata[PRIO_BITS-1:0];
-                            6'd3: prio[3] <= wdata[PRIO_BITS-1:0];
-                            6'd4: prio[4] <= wdata[PRIO_BITS-1:0];
-                            6'd5: prio[5] <= wdata[PRIO_BITS-1:0];
-                            6'd6: prio[6] <= wdata[PRIO_BITS-1:0];
-                            6'd7: prio[7] <= wdata[PRIO_BITS-1:0];
-                            6'd8: prio[8] <= wdata[PRIO_BITS-1:0];
-                            default: ;
-                        endcase
-                    end
-                    4'h1: ; // Pending is read-only
-                    4'h2: begin  // Enable (ctx_sel=0 → ctx0, ctx_sel=1 → ctx1)
-                        if (!ctx_sel)
-                            enable0 <= wdata[8:1];
-                        else
-                            enable1 <= wdata[8:1];
-                    end
-                    4'h3: begin
-                        if (!reg_sel) begin   // Threshold
-                            if (!ctx3_sel) thresh0 <= wdata[PRIO_BITS-1:0];
-                            else           thresh1 <= wdata[PRIO_BITS-1:0];
-                        end else begin        // Complete
-                            if (!ctx3_sel && claimed0) begin
-                                claimed0 <= 1'b0;
-                                // Clear pending of completed source
-                                case (complete_src)
-                                    8'd1: pending[1] <= 1'b0;
-                                    8'd2: pending[2] <= 1'b0;
-                                    8'd3: pending[3] <= 1'b0;
-                                    8'd4: pending[4] <= 1'b0;
-                                    8'd5: pending[5] <= 1'b0;
-                                    8'd6: pending[6] <= 1'b0;
-                                    8'd7: pending[7] <= 1'b0;
-                                    8'd8: pending[8] <= 1'b0;
-                                    default: ;
-                                endcase
-                            end
-                            if (ctx3_sel && claimed1) begin
-                                claimed1 <= 1'b0;
-                                case (complete_src)
-                                    8'd1: pending[1] <= 1'b0;
-                                    8'd2: pending[2] <= 1'b0;
-                                    8'd3: pending[3] <= 1'b0;
-                                    8'd4: pending[4] <= 1'b0;
-                                    8'd5: pending[5] <= 1'b0;
-                                    8'd6: pending[6] <= 1'b0;
-                                    8'd7: pending[7] <= 1'b0;
-                                    8'd8: pending[8] <= 1'b0;
-                                    default: ;
-                                endcase
-                            end
+                if (is_prio_acc) begin            // Source priority
+                    case (prio_id)
+                        6'd1: prio[1] <= wdata[PRIO_BITS-1:0];
+                        6'd2: prio[2] <= wdata[PRIO_BITS-1:0];
+                        6'd3: prio[3] <= wdata[PRIO_BITS-1:0];
+                        6'd4: prio[4] <= wdata[PRIO_BITS-1:0];
+                        6'd5: prio[5] <= wdata[PRIO_BITS-1:0];
+                        6'd6: prio[6] <= wdata[PRIO_BITS-1:0];
+                        6'd7: prio[7] <= wdata[PRIO_BITS-1:0];
+                        6'd8: prio[8] <= wdata[PRIO_BITS-1:0];
+                        default: ;
+                    endcase
+                end else if (is_en_acc) begin     // Enable (word 0: sources 1..8)
+                    if (!en_ctx) enable0 <= wdata[8:1];
+                    else         enable1 <= wdata[8:1];
+                end else if (is_ctx_acc) begin
+                    if (!ctx_claim) begin         // Threshold
+                        if (!ctx_id) thresh0 <= wdata[PRIO_BITS-1:0];
+                        else         thresh1 <= wdata[PRIO_BITS-1:0];
+                    end else begin                // Complete
+                        if (!ctx_id && claimed0) begin
+                            claimed0 <= 1'b0;
+                            case (complete_src)
+                                8'd1: pending[1] <= 1'b0;
+                                8'd2: pending[2] <= 1'b0;
+                                8'd3: pending[3] <= 1'b0;
+                                8'd4: pending[4] <= 1'b0;
+                                8'd5: pending[5] <= 1'b0;
+                                8'd6: pending[6] <= 1'b0;
+                                8'd7: pending[7] <= 1'b0;
+                                8'd8: pending[8] <= 1'b0;
+                                default: ;
+                            endcase
+                        end
+                        if (ctx_id && claimed1) begin
+                            claimed1 <= 1'b0;
+                            case (complete_src)
+                                8'd1: pending[1] <= 1'b0;
+                                8'd2: pending[2] <= 1'b0;
+                                8'd3: pending[3] <= 1'b0;
+                                8'd4: pending[4] <= 1'b0;
+                                8'd5: pending[5] <= 1'b0;
+                                8'd6: pending[6] <= 1'b0;
+                                8'd7: pending[7] <= 1'b0;
+                                8'd8: pending[8] <= 1'b0;
+                                default: ;
+                            endcase
                         end
                     end
-                    default: ;
-                endcase
+                end
             end
 
             // -- Claim: mark in-progress on claim read ----------------------
-            if (req && !we && grp == 4'h3 && reg_sel) begin
-                if (!ctx3_sel && !claimed0 && best_id0 != 8'd0)
+            if (req && !we && is_ctx_acc && ctx_claim) begin
+                if (!ctx_id && !claimed0 && best_id0 != 8'd0)
                     claimed0 <= 1'b1;
-                if (ctx3_sel && !claimed1 && best_id1 != 8'd0)
+                if (ctx_id && !claimed1 && best_id1 != 8'd0)
                     claimed1 <= 1'b1;
             end
         end
@@ -242,40 +236,32 @@ module rv_plic #(
     always_comb begin
         rdata = 32'h0;
         if (req && !we) begin
-            case (grp)
-                4'h0: begin  // Priority
-                    case (src_sel)
-                        6'd1: rdata = 32'(prio[1]);
-                        6'd2: rdata = 32'(prio[2]);
-                        6'd3: rdata = 32'(prio[3]);
-                        6'd4: rdata = 32'(prio[4]);
-                        6'd5: rdata = 32'(prio[5]);
-                        6'd6: rdata = 32'(prio[6]);
-                        6'd7: rdata = 32'(prio[7]);
-                        6'd8: rdata = 32'(prio[8]);
-                        default: rdata = 32'h0;
-                    endcase
+            if (is_prio_acc) begin
+                case (prio_id)
+                    6'd1: rdata = 32'(prio[1]);
+                    6'd2: rdata = 32'(prio[2]);
+                    6'd3: rdata = 32'(prio[3]);
+                    6'd4: rdata = 32'(prio[4]);
+                    6'd5: rdata = 32'(prio[5]);
+                    6'd6: rdata = 32'(prio[6]);
+                    6'd7: rdata = 32'(prio[7]);
+                    6'd8: rdata = 32'(prio[8]);
+                    default: rdata = 32'h0;
+                endcase
+            end else if (is_pend_acc) begin
+                rdata = {23'h0, pending[8:1], 1'b0};
+            end else if (is_en_acc) begin
+                if (!en_ctx) rdata = {23'h0, enable0[8:1], 1'b0};
+                else         rdata = {23'h0, enable1[8:1], 1'b0};
+            end else if (is_ctx_acc) begin
+                if (!ctx_claim) begin   // Threshold
+                    if (!ctx_id) rdata = 32'(thresh0);
+                    else         rdata = 32'(thresh1);
+                end else begin          // Claim (returns best source ID)
+                    if (!ctx_id) rdata = 32'(best_id0);
+                    else         rdata = 32'(best_id1);
                 end
-                4'h1: begin  // Pending
-                    rdata = {23'h0, pending[8:1], 1'b0};
-                end
-                4'h2: begin  // Enable
-                    if (!ctx_sel)
-                        rdata = {23'h0, enable0[8:1], 1'b0};
-                    else
-                        rdata = {23'h0, enable1[8:1], 1'b0};
-                end
-                4'h3: begin
-                    if (!reg_sel) begin   // Threshold
-                        if (!ctx3_sel) rdata = 32'(thresh0);
-                        else           rdata = 32'(thresh1);
-                    end else begin        // Claim (returns best source ID)
-                        if (!ctx3_sel) rdata = 32'(best_id0);
-                        else           rdata = 32'(best_id1);
-                    end
-                end
-                default: rdata = 32'h0;
-            endcase
+            end
         end
     end
 

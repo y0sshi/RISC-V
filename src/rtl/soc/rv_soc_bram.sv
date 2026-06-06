@@ -18,7 +18,8 @@ module rv_soc_bram
     parameter              IMEM_FILE  = "",
     parameter              DMEM_FILE  = "",
     parameter int          CLK_FREQ   = 125_000_000,
-    parameter int          BAUD_RATE  = 115_200
+    parameter int          BAUD_RATE  = 115_200,
+    parameter int          MTIME_DIV  = 1            // CLINT mtime prescaler
 )(
     input  wire        clk,
     input  wire        rst_n,
@@ -73,9 +74,9 @@ module rv_soc_bram
     logic            periph_rdata_valid;
     logic            uart_tx_sig;
 
-    rv_periph #(.XLEN (XLEN), .CLK_FREQ (CLK_FREQ), .BAUD_RATE (BAUD_RATE)) u_periph (
+    rv_periph #(.XLEN (XLEN), .CLK_FREQ (CLK_FREQ), .BAUD_RATE (BAUD_RATE), .MTIME_DIV (MTIME_DIV)) u_periph (
         .clk (clk), .rst_n (rst_n),
-        .addr (mmu_dmem_pa), .wdata (core_dmem_wdata),
+        .addr (mmu_dmem_pa), .wdata (core_dmem_wdata), .wstrb (core_dmem_wstrb),
         .req (mmu_dmem_req), .we (mmu_dmem_we),
         .is_periph (periph_is_periph), .rdata (periph_rdata), .rdata_valid (periph_rdata_valid),
         .timer_irq (timer_irq_sig), .sw_irq (sw_irq_sig), .ext_irq (plic_ext_irq), .mtime (periph_mtime),

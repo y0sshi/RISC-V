@@ -22,9 +22,14 @@
 // driver writing DLL/DLM = clock-frequency/(16*baud) yields the right baud rate).
 // Default divisor = max(1, CLK_FREQ/(16*BAUD_RATE)).
 //
-// FIFOs are not implemented (FCR is accepted/ignored; IIR reports no FIFO unless
-// the driver sets FCR.FIFO, in which case the FIFO-enabled bits are echoed so the
-// driver's probe succeeds).  Single-byte THR/RBR; THRE/TEMT both reflect TX idle.
+// TX: a real 16-byte FIFO.  The DT compatible "ns16550a" makes the Linux 8250
+// driver assume PORT_16550A semantics WITHOUT autoconfig: tx_loadsz=16, i.e. it
+// bursts up to 16 bytes into THR after a single LSR.THRE -- with a single-byte
+// THR 15 of every 16 console characters were silently dropped the moment the
+// kernel switched from earlycon(sbi) to ttyS0.  LSR.THRE = FIFO empty (16550
+// semantics: safe to load a full burst), LSR.TEMT = FIFO empty AND shifter idle.
+// RX stays single-byte (console input is unused in the boot harness).
+// FCR is stored; IIR echoes the FIFO-enabled bits when FCR[0] is set.
 //
 // Author: Naofumi Yoshinaga
 // =============================================================================
@@ -75,15 +80,27 @@ module rv_uart #(
     logic        dr;           // RX data ready
     logic        fe;           // framing error
     logic [7:0]  rx_data_reg;
-    logic        txrdy;        // TX idle (THRE/TEMT)
+    logic        txrdy;        // TX shifter idle
 
-    wire  [7:0]  lsr = {1'b0, txrdy /*TEMT*/, txrdy /*THRE*/, 1'b0,
+    // ---- 16-byte TX FIFO -----------------------------------------------------
+    logic [7:0]  tx_fifo [0:15];
+    logic [3:0]  tx_wr, tx_rd;
+    logic [4:0]  tx_count;
+    wire         tx_fifo_empty = (tx_count == 5'd0);
+    wire         tx_fifo_full  = (tx_count == 5'd16);
+
+    // THRE (LSR[5]) = TX FIFO empty: a 16550 driver may burst tx_loadsz(=16)
+    // bytes after seeing it.  TEMT (LSR[6]) = FIFO empty and shifter idle.
+    wire thre = tx_fifo_empty;
+    wire temt = tx_fifo_empty & txrdy;
+
+    wire  [7:0]  lsr = {1'b0, temt /*TEMT*/, thre /*THRE*/, 1'b0,
                         fe /*FE*/, 1'b0, 1'b0, dr /*DR*/};
     wire  [7:0]  msr = 8'hB0;  // DCD|DSR|CTS asserted (no real modem)
 
     // IIR: priority-encoded pending interrupt (bit0=1 -> none)
     wire rx_pending = ier[0] & dr;       // received data available
-    wire tx_pending = ier[1] & txrdy;    // THR empty
+    wire tx_pending = ier[1] & thre;     // TX FIFO empty
     wire [7:0] iir = rx_pending ? 8'h04 :
                      tx_pending ? 8'h02 : 8'h01 | (fcr[0] ? 8'hC0 : 8'h00);
 
@@ -98,8 +115,10 @@ module rv_uart #(
     logic [19:0] tx_cnt;
     logic [2:0]  tx_bit;
     logic [7:0]  tx_shift;
-    logic [7:0]  thr;
-    logic        tx_kick;       // pulse: THR written, start TX
+
+    // FIFO pop: the shifter is idle and a byte is queued.  The same condition
+    // updates rd-pointer/count in the FIFO block below.
+    wire tx_pop = (tx_state == TX_IDLE) && !tx_fifo_empty;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -109,8 +128,8 @@ module rv_uart #(
             case (tx_state)
                 TX_IDLE: begin
                     uart_tx <= 1'b1;
-                    if (tx_kick) begin
-                        tx_shift <= thr; tx_cnt <= bit_clocks - 20'd1;
+                    if (tx_pop) begin
+                        tx_shift <= tx_fifo[tx_rd]; tx_cnt <= bit_clocks - 20'd1;
                         uart_tx <= 1'b0;              // start bit
                         txrdy <= 1'b0; tx_state <= TX_START;
                     end
@@ -187,15 +206,46 @@ module rv_uart #(
     // =========================================================================
     wire [2:0] ridx = addr[4:2];
 
+    // THR push: DLAB=0 write to index 0 with space in the FIFO (full -> drop).
+    // EDGE-qualified: a store to a peripheral is held in MEM (req level HIGH
+    // for many cycles) whenever the pipeline freezes around it (~imem_ready
+    // during an I$ miss, etc.) -- a level-sensitive push then enqueued the same
+    // character once per held cycle (observed: 14 copies of a line's first
+    // char after each inter-line pause).  One THR store can never be followed
+    // by another on the very next cycle (every 8250 driver polls LSR between
+    // THR writes), so the edge qualification loses nothing.
+    wire   thr_wr = req && we && (ridx == 3'd0) && !dlab;
+    logic  thr_wr_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) thr_wr_q <= 1'b0;
+        else        thr_wr_q <= thr_wr;
+    end
+    wire tx_push = thr_wr && !thr_wr_q && !tx_fifo_full;
+
+    // TX FIFO pointers/count (push from the bus, pop from the TX shifter)
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx_wr <= 4'd0; tx_rd <= 4'd0; tx_count <= 5'd0;
+        end else begin
+            if (tx_push) begin
+                tx_fifo[tx_wr] <= wdata[7:0];
+                tx_wr <= tx_wr + 4'd1;
+            end
+            if (tx_pop) tx_rd <= tx_rd + 4'd1;
+            case ({tx_push, tx_pop})
+                2'b10:   tx_count <= tx_count + 5'd1;
+                2'b01:   tx_count <= tx_count - 5'd1;
+                default: ;                        // both or neither: unchanged
+            endcase
+        end
+    end
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             ier <= 8'd0; lcr <= 8'd0; mcr <= 8'd0; scr <= 8'd0; fcr <= 8'd0;
             divisor <= DEF_DIV;
-            thr <= 8'd0; tx_kick <= 1'b0;
             dr <= 1'b0; fe <= 1'b0; rx_data_reg <= 8'd0;
         end else begin
-            tx_kick <= 1'b0;
-
             // RX byte capture
             if (rx_done) begin
                 rx_data_reg <= rx_shift;
@@ -206,10 +256,10 @@ module rv_uart #(
             if (req && we) begin
                 case (ridx)
                     3'd0: if (dlab) divisor[7:0]  <= wdata[7:0];
-                          else begin thr <= wdata[7:0]; if (txrdy) tx_kick <= 1'b1; end
+                          // else: THR write handled by the TX FIFO block above
                     3'd1: if (dlab) divisor[15:8] <= wdata[7:0];
                           else ier <= wdata[7:0];
-                    3'd2: fcr <= wdata[7:0];          // FIFO control (no real FIFO)
+                    3'd2: fcr <= wdata[7:0];          // FIFO control (stored)
                     3'd3: lcr <= wdata[7:0];
                     3'd4: mcr <= wdata[7:0];
                     3'd7: scr <= wdata[7:0];

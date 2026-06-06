@@ -67,3 +67,6 @@ Thumbs.db
 
 # OpenSBI build area (cloned + build artifacts)
 tests/opensbi/work/
+
+# Linux kernel build area (downloaded source + Image + fw_payload)
+tests/linux/work/

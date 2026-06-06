@@ -75,13 +75,17 @@ module rv_icache #(
     localparam int LINEW = LINE_BYTES * 8;            // packed line width
 
     // ---- Storage ------------------------------------------------------------
-    logic               valid [0:SETS-1];
+    logic [SETS-1:0]    valid;
     logic [TAGW-1:0]    tagm  [0:SETS-1];
     logic [LINEW-1:0]   line  [0:SETS-1];
 
     // ---- Registered fetch address (1-cycle, BRAM-equivalent) ----------------
     logic [XLEN-1:0] addr_q;
     logic            req_q;
+    // Raw previous-cycle c_addr (registered unconditionally).  Used only to
+    // detect a mid-flight translation change (addr_q vs the address the core
+    // presented LAST cycle) without a combinational c_ready->c_addr loop.
+    logic [XLEN-1:0] c_addr_q;
 
     wire [OFFW-1:0]  boff = addr_q[OFFW-1:0];
     wire [IDXW-1:0]  idx  = addr_q[OFFW +: IDXW];
@@ -110,7 +114,18 @@ module rv_icache #(
                 c_rdata = window;
             end
             S_BYPASS: begin
-                c_ready = m_done;          // single-beat completion
+                // Serve only if the request still targets the address this
+                // bypass was launched for.  The MMU may retranslate the SAME
+                // fetch_pc to a different physical address mid-flight (e.g. an
+                // MRET privilege change or an SFENCE.VMA retranslation), in
+                // which case this data belongs to a stale translation and must
+                // be dropped; the re-armed lookup below then serves the live
+                // address.  Compares against the REGISTERED previous-cycle
+                // request (req_q/c_addr_q) -- the contract is "data for the
+                // address presented last cycle", and using the live c_addr
+                // would create a combinational c_ready -> stall -> c_addr loop.
+                // No-op while c_addr is held stable (all bare runs).
+                c_ready = m_done & req_q & (addr_q == c_addr_q);
                 c_rdata = m_rdata;         // byte-exact window from memory
             end
             default: begin                 // S_FILL
@@ -132,16 +147,16 @@ module rv_icache #(
     end
 
     // ---- Sequential ---------------------------------------------------------
-    integer i;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state    <= S_LOOKUP;
             addr_q   <= RST_ADDR[XLEN-1:0];
+            c_addr_q <= RST_ADDR[XLEN-1:0];
             req_q    <= 1'b0;
             hit_cnt  <= '0;
             miss_cnt <= '0;
             fill_idx <= '0; fill_tag <= '0; fill_base <= '0;
-            for (i = 0; i < SETS; i = i + 1) valid[i] <= 1'b0;
+            valid <= '0;
         end else begin
             // Track the fetch address with the SAME enable the core uses for
             // fetch_pc (advance only when this fetch completes, c_ready).  This
@@ -149,12 +164,42 @@ module rv_icache #(
             // (a branch/trap redirect) while the I$ holds c_ready=0 during a miss
             // fill -- otherwise addr_q would latch the redirect target and the I$
             // would return its window mis-tagged as the held fetch_pc.
-            if (c_ready) addr_q <= c_addr;
-            req_q  <= c_req;
+            //
+            // EXTRA: also capture on the first cycle a request is (re)presented
+            // after an idle gap (state==S_LOOKUP && c_req && !req_q).  Under a VM
+            // kernel the MMU withdraws c_req for the duration of a TLB-miss page
+            // walk; when it resumes at a new address the c_ready-only enable would
+            // leave addr_q one fetch behind, so the next lookup would serve the
+            // stale pre-gap line.  This term primes addr_q for that resume.  It is
+            // a structural no-op whenever c_req is held continuously (req_q==1
+            // every cycle: bare/M-mode, all unit tests, OpenSBI), and never fires
+            // during a fill/bypass (state!=S_LOOKUP), so the redirect protection
+            // above is preserved.
+            //
+            // EXTRA-2: re-arm addr_q from the live c_addr when a FILL or BYPASS
+            // completes (m_done) with a request still presented.  The physical
+            // address of the SAME held fetch_pc can change underneath a multi-
+            // cycle fill: an MRET/SRET privilege switch translates the first
+            // post-redirect fetch with the stale privilege for one cycle (bare
+            // physical), the I$ commits to filling that wrong-translation line,
+            // and the correct translation appears on c_addr while the fill is
+            // in flight.  Without the re-arm the post-fill re-lookup would serve
+            // the stale addr_q line as if it were the live request (this is how
+            // a Linux MRET return fetched OpenSBI firmware bytes and panicked).
+            // With it, the re-lookup uses the live address: tag mismatch ->
+            // proper refill.  When c_addr is held stable across the fill (every
+            // bare/M-mode run; any VM fetch without an in-flight translation
+            // change) c_addr == addr_q here, so this writes the same value back
+            // -- a structural no-op.
+            if (c_ready || (state == S_LOOKUP && c_req && !req_q)
+                || ((state == S_FILL || state == S_BYPASS) && m_done && c_req))
+                addr_q <= c_addr;
+            req_q    <= c_req;
+            c_addr_q <= c_addr;
 
             // FENCE.I invalidate (cheap: clear all valid bits).
             if (flush)
-                for (i = 0; i < SETS; i = i + 1) valid[i] <= 1'b0;
+                valid <= '0;
 
             unique case (state)
                 S_LOOKUP: begin

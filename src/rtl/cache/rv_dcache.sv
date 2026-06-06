@@ -87,7 +87,7 @@ module rv_dcache #(
     localparam int TAGW  = XLEN - OFFW - IDXW;        // tag bits
 
     // ---- Storage (combinational read) ---------------------------------------
-    logic               valid [0:SETS-1];
+    logic [SETS-1:0]    valid;
     logic [TAGW-1:0]    tagm  [0:SETS-1];
     logic [XLEN-1:0]    data  [0:SETS-1][0:WORDS-1];
 
@@ -148,7 +148,7 @@ module rv_dcache #(
     end
 
     // ---- Sequential ---------------------------------------------------------
-    integer i, w, b;
+    integer w, b;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state    <= S_LOOKUP;
@@ -158,7 +158,7 @@ module rv_dcache #(
             fill_idx <= '0; fill_tag <= '0; fill_base <= '0; fill_wsel <= '0;
             st_hit   <= 1'b0; st_idx <= '0; st_wsel <= '0;
             st_addr  <= '0; st_wdata <= '0; st_wstrb <= '0;
-            for (i = 0; i < SETS; i = i + 1) valid[i] <= 1'b0;
+            valid <= '0;
         end else begin
             unique case (state)
                 S_LOOKUP: begin

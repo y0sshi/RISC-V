@@ -55,6 +55,7 @@ module rv_csr
     input  wire  [2:0]       csr_op,     // funct3
     input  wire              csr_we,     // CSR write enable
     output logic [XLEN-1:0]  csr_rdata,  // Old CSR value (combinational)
+    output logic             csr_access_ok, // csr_addr implemented + privilege OK (combinational)
 
     // ---- Exception trap entry ------------------------------------------------
     input  wire              trap_enter,
@@ -194,12 +195,21 @@ module rv_csr
     // Use 64-bit intermediates and wire assigns to avoid constant-select
     // warnings in always_* with parametric-width signals.
     // =========================================================================
+    // The SoC ORs both PLIC contexts (M ctx0, S ctx1) onto a single ext_irq line
+    // (only one context owns any given source, so the OR is unambiguous).  Route
+    // that shared line by delegation: when external interrupts are delegated to
+    // S (mideleg[9]=1, as Linux sets) it drives SEIP only; otherwise (M-mode-only
+    // firmware owning the PLIC) it drives MEIP.  Without the ~mideleg[9] gate on
+    // MEIP, a delegated external IRQ would ALSO raise MEIP, which a lower-privilege
+    // (kernel in S) takes unconditionally -- stealing the interrupt into M-mode
+    // where OpenSBI has no PLIC handler.  Bare/compliance keep mideleg[9]=0, so
+    // MEIP=ext_irq exactly as before (no-op).
     wire [63:0] mip64 = ({63'b0, sw_irq   & mideleg_reg[1]} << 1)   // SSIP
                       | ({63'b0, sw_irq}                     << 3)   // MSIP
                       | ({63'b0, timer_irq & mideleg_reg[5]} << 5)   // STIP
                       | ({63'b0, timer_irq}                  << 7)   // MTIP
-                      | ({63'b0, ext_irq  & mideleg_reg[9]}  << 9)   // SEIP
-                      | ({63'b0, ext_irq}                    << 11); // MEIP
+                      | ({63'b0, ext_irq  &  mideleg_reg[9]} << 9)   // SEIP
+                      | ({63'b0, ext_irq  & ~mideleg_reg[9]} << 11); // MEIP
     wire [XLEN-1:0] mip_val = mip64[XLEN-1:0];
 
     // Masked views for S-mode
@@ -218,8 +228,14 @@ module rv_csr
     assign s_irq_bits = sip_val & sie_val;
 
     // irq_pending: use assign so wire signals (m_irq_bits, s_irq_bits) are in sensitivity.
-    // M-mode interrupts only taken in M-mode when mstatus.MIE=1
-    wire m_irq_en = (cur_priv == PRIV_M) && mstatus_mie;
+    // M-mode interrupts: taken in M-mode when mstatus.MIE=1, and ALWAYS taken
+    // while executing at a lower privilege (spec: interrupts for a higher
+    // privilege level are globally enabled regardless of that level's xIE when
+    // running at a lower level).  Without the priv<M term, a non-delegated
+    // MTIP never trapped to M-mode while the kernel ran in S-mode -- OpenSBI's
+    // timer (SBI set_timer -> mtimecmp -> MTIP -> M handler -> STIP) never
+    // delivered, so Linux received no timer ticks (idle forever, P0-4).
+    wire m_irq_en = (cur_priv == PRIV_M) ? mstatus_mie : 1'b1;
     // S-mode interrupts: taken in U/S-mode when mstatus.SIE=1
     wire s_irq_en = (cur_priv == PRIV_U) || (cur_priv == PRIV_S && mstatus_sie);
     assign irq_pending = (m_irq_en && |m_irq_bits) || (s_irq_en && |s_irq_bits);
@@ -349,6 +365,55 @@ module rv_csr
     assign sepc_out = {sepc_reg[XLEN-1:1], 1'b0};
 
     // =========================================================================
+    // CSR existence + privilege decode (combinational on csr_addr)
+    // =========================================================================
+    // csr_access_ok = the addressed CSR is implemented AND accessible from the
+    // current privilege level (csr_addr[9:8] encodes the minimum privilege).
+    // The core raises an illegal-instruction exception for a CSR instruction
+    // when this is low.  This is REQUIRED for OpenSBI: its hart-feature
+    // detection probes optional CSRs (stimecmp/menvcfg/mhpmcounters/...) with
+    // trap-and-detect; silently reading 0 made it believe Sstc exists, so it
+    // programmed timers into the nonexistent stimecmp CSR and the Linux tick
+    // never fired (banner falsely listed sscofpmf,smaia,smstateen,sstc).
+    logic csr_implemented;
+    always_comb begin
+        csr_implemented = 1'b0;
+        case (csr_addr)
+            // F/D extension
+            CSR_FFLAGS, CSR_FRM, CSR_FCSR,
+            // Supervisor
+            CSR_SSTATUS, CSR_SIE, CSR_STVEC, CSR_SCOUNTEREN,
+            CSR_SSCRATCH, CSR_SEPC, CSR_SCAUSE, CSR_STVAL, CSR_SIP, CSR_SATP,
+            // Machine
+            CSR_MSTATUS, CSR_MISA, CSR_MEDELEG, CSR_MIDELEG, CSR_MIE, CSR_MTVEC,
+            CSR_MCOUNTEREN, CSR_MSCRATCH, CSR_MEPC, CSR_MCAUSE, CSR_MTVAL, CSR_MIP,
+            CSR_MCYCLE, CSR_MINSTRET, CSR_MHARTID,
+            // Machine information (mandatory; read-as-zero where unimplemented)
+            12'hF11, 12'hF12, 12'hF13, 12'hF15,   // mvendorid/marchid/mimpid/mconfigptr
+            // User counter shadows
+            CSR_CYCLE, CSR_TIME, CSR_INSTRET:
+                csr_implemented = 1'b1;
+            default: ;
+        endcase
+        if (XLEN == 32) begin
+            case (csr_addr)
+                CSR_CYCLEH, CSR_TIMEH, CSR_INSTRETH,
+                12'hB80, 12'hB82:                  // mcycleh / minstreth
+                    csr_implemented = 1'b1;
+                default: ;
+            endcase
+        end
+        // PMP: pmpaddr0..15 + pmpcfg0/2 (RV64) or pmpcfg0..3 (RV32)
+        if (csr_addr[11:4] == 8'h3B)
+            csr_implemented = 1'b1;
+        if (csr_addr == 12'h3A0 || csr_addr == 12'h3A2)
+            csr_implemented = 1'b1;
+        if (XLEN == 32 && (csr_addr == 12'h3A1 || csr_addr == 12'h3A3))
+            csr_implemented = 1'b1;
+    end
+    assign csr_access_ok = csr_implemented && (2'(cur_priv) >= csr_addr[9:8]);
+
+    // =========================================================================
     // CSR Read (combinational — returns old value before write)
     // =========================================================================
     always_comb begin
@@ -430,6 +495,19 @@ module rv_csr
             default: csr_new_val = csr_rdata;
         endcase
     end
+
+    // satp.MODE is WARL: the hardware implements only Bare and one paged mode
+    // (Sv39 on RV64, Sv32 on RV32).  A write that selects an UNSUPPORTED MODE
+    // (e.g. Sv48/Sv57 on RV64) is ignored entirely (satp retains its old value),
+    // matching QEMU/real hardware.  Linux probes the MMU mode by writing a
+    // candidate MODE and reading it back (set_satp_mode); without this WARL
+    // restriction the read-back would falsely confirm Sv48/Sv57, Linux would
+    // install Sv57 page tables, and the Sv39-only MMU would treat satp as Bare
+    // and fetch untranslated garbage.  RV32: both Bare and Sv32 are valid.
+    wire satp_mode_legal =
+        (XLEN == 32) ? 1'b1
+                     : (csr_new_val[XLEN-1 -: 4] == 4'd0 ||
+                        csr_new_val[XLEN-1 -: 4] == 4'd8);
 
     // =========================================================================
     // Sequential CSR updates
@@ -562,7 +640,8 @@ module rv_csr
                     CSR_SCAUSE:   scause_reg   <= csr_new_val;
                     CSR_STVAL:    stval_reg    <= csr_new_val;
                     // SATP: also accessible from S/U mode (handled by privilege check elsewhere)
-                    CSR_SATP:     satp_reg     <= csr_new_val;
+                    // MODE is WARL: ignore writes selecting an unsupported mode.
+                    CSR_SATP:     if (satp_mode_legal) satp_reg <= csr_new_val;
                     // Machine CSRs
                     CSR_MSTATUS: begin
                         mstatus_sie    <= csr_new_val[1];
