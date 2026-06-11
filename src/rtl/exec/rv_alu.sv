@@ -16,7 +16,7 @@ module rv_alu
 ) (
     input  wire  [XLEN-1:0]  op_a,
     input  wire  [XLEN-1:0]  op_b,
-    input  alu_op_t           alu_op,
+    input  wire alu_op_t      alu_op,
 
     output logic [XLEN-1:0]  result,
     output logic              zero

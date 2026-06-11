@@ -19,9 +19,9 @@ module rv_fpu_sqrt (
     input  wire        clk,
     input  wire        rst_n,
 
-    input  logic [31:0] a,
-    input  logic [2:0]  rm,
-    input  logic        valid_in,
+    input  wire  [31:0] a,
+    input  wire  [2:0]  rm,
+    input  wire         valid_in,
 
     output logic [31:0] result,
     output logic [4:0]  fflags,

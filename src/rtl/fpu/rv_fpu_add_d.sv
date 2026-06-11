@@ -17,10 +17,10 @@
 `default_nettype none
 
 module rv_fpu_add_d (
-    input  logic [63:0] a,
-    input  logic [63:0] b,
-    input  logic [2:0]  rm,
-    input  logic        is_sub,
+    input  wire  [63:0] a,
+    input  wire  [63:0] b,
+    input  wire  [2:0]  rm,
+    input  wire         is_sub,
     output logic [63:0] result,
     output logic [4:0]  fflags
 );

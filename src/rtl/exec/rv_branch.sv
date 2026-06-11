@@ -12,7 +12,7 @@ module rv_branch
 #(
     parameter int XLEN = rv_pkg::XLEN
 ) (
-    input  ctrl_signals_t    ctrl,
+    input  wire ctrl_signals_t ctrl,
     input  wire  [2:0]       funct3,
     input  wire  [XLEN-1:0]  rs1_data,
     input  wire  [XLEN-1:0]  rs2_data,

@@ -33,7 +33,7 @@ module rv_amo
 ) (
     input  wire  [XLEN-1:0]  old_data,   // value read from memory
     input  wire  [XLEN-1:0]  rs2_data,   // register operand (store data)
-    input  amo_op_t           op,
+    input  wire amo_op_t      op,
     input  wire  [2:0]        funct3,     // 010 = W (32-bit), 011 = D (XLEN-bit)
     output logic [XLEN-1:0]  new_data    // value to write back to memory
 );

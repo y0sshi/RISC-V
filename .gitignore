@@ -23,6 +23,7 @@ vivado_*.backup*
 *.bit
 *.ltx
 *.dcp
+*.rpt
 # Scripted Vivado project output dirs (boards/<board>/vivado/rv_riscv_*)
 boards/**/vivado/rv_riscv_*/
 

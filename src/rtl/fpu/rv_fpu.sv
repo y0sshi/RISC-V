@@ -37,18 +37,18 @@ module rv_fpu
     input  wire        rst_n,
 
     // Operands (64-bit for D-ext; F-ext uses lower 32 bits)
-    input  logic [63:0]     fa,
-    input  logic [63:0]     fb,
-    input  logic [63:0]     fc,
-    input  logic [XLEN-1:0] int_a,
+    input  wire  [63:0]     fa,
+    input  wire  [63:0]     fb,
+    input  wire  [63:0]     fc,
+    input  wire  [XLEN-1:0] int_a,
 
-    input  fpu_op_t          fpu_op,
-    input  logic             fp_double,  // 0=single, 1=double
-    input  logic [2:0]       fp_rm,
-    input  logic [2:0]       frm_in,
-    input  logic [4:0]       rs2_sel,
+    input  wire fpu_op_t     fpu_op,
+    input  wire              fp_double,  // 0=single, 1=double
+    input  wire  [2:0]       fp_rm,
+    input  wire  [2:0]       frm_in,
+    input  wire  [4:0]       rs2_sel,
 
-    input  logic             valid_in,
+    input  wire              valid_in,
 
     output logic [63:0]      result_f,
     output logic [XLEN-1:0]  result_i,

@@ -21,9 +21,9 @@
 `default_nettype none
 
 module rv_fpu_mul (
-    input  logic [31:0] a,        // Operand A (multiplicand)
-    input  logic [31:0] b,        // Operand B (multiplier)
-    input  logic [2:0]  rm,       // Rounding mode (resolved)
+    input  wire  [31:0] a,        // Operand A (multiplicand)
+    input  wire  [31:0] b,        // Operand B (multiplier)
+    input  wire  [2:0]  rm,       // Rounding mode (resolved)
     output logic [31:0] result,
     output logic [4:0]  fflags
 );

@@ -25,17 +25,17 @@ module rv_hazard
     parameter int XLEN = rv_pkg::XLEN
 ) (
     // ID/EX register: instruction currently in EX stage
-    input  logic          id_ex_valid,
-    input  ctrl_signals_t id_ex_ctrl,
-    input  reg_addr_t     id_ex_rd_addr,
+    input  wire           id_ex_valid,
+    input  wire ctrl_signals_t id_ex_ctrl,
+    input  wire reg_addr_t id_ex_rd_addr,
 
     // Decoded fields of instruction currently in ID stage (from IF/ID)
-    input  reg_addr_t     id_rs1_addr,
-    input  reg_addr_t     id_rs2_addr,
-    input  reg_addr_t     id_rs3_addr,   // FP rs3 for FMADD family
-    input  ctrl_signals_t id_ctrl,       // ID decoded control (for FP hazard)
-    input  logic          id_rs1_used,   // ID instruction actually reads int rs1
-    input  logic          id_rs2_used,   // ID instruction actually reads int rs2
+    input  wire reg_addr_t id_rs1_addr,
+    input  wire reg_addr_t id_rs2_addr,
+    input  wire reg_addr_t id_rs3_addr,   // FP rs3 for FMADD family
+    input  wire ctrl_signals_t id_ctrl,       // ID decoded control (for FP hazard)
+    input  wire           id_rs1_used,   // ID instruction actually reads int rs1
+    input  wire           id_rs2_used,   // ID instruction actually reads int rs2
 
     // Hazard output
     output logic          load_use_hazard

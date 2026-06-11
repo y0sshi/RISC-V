@@ -24,13 +24,13 @@ module rv_fpu_misc_d
 #(
     parameter int XLEN = rv_pkg::XLEN
 ) (
-    input  logic [63:0]     fa,
-    input  logic [63:0]     fb,
-    input  logic [XLEN-1:0] int_a,
+    input  wire  [63:0]     fa,
+    input  wire  [63:0]     fb,
+    input  wire  [XLEN-1:0] int_a,
 
-    input  fpu_op_t         fpu_op,
-    input  logic [2:0]      rm,
-    input  logic [4:0]      rs2_sel,
+    input  wire fpu_op_t    fpu_op,
+    input  wire  [2:0]      rm,
+    input  wire  [4:0]      rs2_sel,
 
     output logic [63:0]     result_f,
     output logic [XLEN-1:0] result_i,

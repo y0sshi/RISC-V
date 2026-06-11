@@ -25,7 +25,7 @@ module rv_muldiv
 ) (
     input  wire  [XLEN-1:0]  rs1_data,
     input  wire  [XLEN-1:0]  rs2_data,
-    input  muldiv_op_t        op,
+    input  wire muldiv_op_t   op,
     output logic [XLEN-1:0]  result
 );
 

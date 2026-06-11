@@ -51,7 +51,7 @@ module rv_mmu
 
     // ---- Translation control (from rv_core / rv_csr) ------------------------
     input  wire  [XLEN-1:0]  satp,           // SATP CSR
-    input  priv_level_t      priv_level,     // current privilege level (IF)
+    input  wire priv_level_t priv_level,     // current privilege level (IF)
     input  wire              mstatus_sum,    // mstatus.SUM
     input  wire              mstatus_mxr,    // mstatus.MXR
     input  wire              mstatus_mprv,   // mstatus.MPRV

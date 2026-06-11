@@ -17,15 +17,15 @@ module rv_regfile
     input  wire              rst_n,
 
     // Read port 1
-    input  reg_addr_t        rs1_addr,
+    input  wire reg_addr_t   rs1_addr,
     output logic [XLEN-1:0]  rs1_data,
 
     // Read port 2
-    input  reg_addr_t        rs2_addr,
+    input  wire reg_addr_t   rs2_addr,
     output logic [XLEN-1:0]  rs2_data,
 
     // Write port
-    input  reg_addr_t        rd_addr,
+    input  wire reg_addr_t   rd_addr,
     input  wire  [XLEN-1:0]  rd_data,
     input  wire              rd_we
 );

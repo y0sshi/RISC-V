@@ -37,19 +37,19 @@ module rv_forward
     parameter int XLEN = rv_pkg::XLEN
 ) (
     // ID/EX register: source register addresses of instruction in EX stage
-    input  reg_addr_t     id_ex_rs1_addr,
-    input  reg_addr_t     id_ex_rs2_addr,
-    input  reg_addr_t     id_ex_rs3_addr,   // FP rs3 for FMADD family
+    input  wire reg_addr_t id_ex_rs1_addr,
+    input  wire reg_addr_t id_ex_rs2_addr,
+    input  wire reg_addr_t id_ex_rs3_addr,   // FP rs3 for FMADD family
 
     // EX/MEM register: destination and write-enable of instruction in MEM stage
-    input  logic          ex_mem_valid,
-    input  ctrl_signals_t ex_mem_ctrl,
-    input  reg_addr_t     ex_mem_rd_addr,
+    input  wire           ex_mem_valid,
+    input  wire ctrl_signals_t ex_mem_ctrl,
+    input  wire reg_addr_t ex_mem_rd_addr,
 
     // MEM/WB register: destination and write-enable of instruction in WB stage
-    input  logic          mem_wb_valid,
-    input  ctrl_signals_t mem_wb_ctrl,
-    input  reg_addr_t     mem_wb_rd_addr,
+    input  wire           mem_wb_valid,
+    input  wire ctrl_signals_t mem_wb_ctrl,
+    input  wire reg_addr_t mem_wb_rd_addr,
 
     // Integer forwarding mux select signals
     output logic [1:0]    fwd_rs1_sel,

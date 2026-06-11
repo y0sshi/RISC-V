@@ -18,10 +18,10 @@ module rv_fpu_div (
     input  wire        clk,
     input  wire        rst_n,
 
-    input  logic [31:0] a,           // Dividend
-    input  logic [31:0] b,           // Divisor
-    input  logic [2:0]  rm,          // Rounding mode
-    input  logic        valid_in,     // Start division (1 cycle pulse)
+    input  wire  [31:0] a,           // Dividend
+    input  wire  [31:0] b,           // Divisor
+    input  wire  [2:0]  rm,          // Rounding mode
+    input  wire         valid_in,     // Start division (1 cycle pulse)
 
     output logic [31:0] result,
     output logic [4:0]  fflags,

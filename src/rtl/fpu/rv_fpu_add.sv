@@ -23,10 +23,10 @@
 `default_nettype none
 
 module rv_fpu_add (
-    input  logic [31:0] a,        // Operand A
-    input  logic [31:0] b,        // Operand B
-    input  logic [2:0]  rm,       // Rounding mode (resolved, no DYN)
-    input  logic        is_sub,   // 0=FADD, 1=FSUB (negates b sign)
+    input  wire  [31:0] a,        // Operand A
+    input  wire  [31:0] b,        // Operand B
+    input  wire  [2:0]  rm,       // Rounding mode (resolved, no DYN)
+    input  wire         is_sub,   // 0=FADD, 1=FSUB (negates b sign)
     output logic [31:0] result,
     output logic [4:0]  fflags    // {NV, DZ, OF, UF, NX}
 );
