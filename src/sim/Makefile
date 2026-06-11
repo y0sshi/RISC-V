@@ -256,6 +256,16 @@ sim_mext64: dirs
 wave_mext64: sim_mext64
 	$(GTKWAVE) $(WAVE_DIR)/tb_rv_mext64.vcd &
 
+sim_mdrand: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_muldiv_rand.vvp \
+		$(MEXT_SRC) $(TB_DIR)/tb_rv_muldiv_rand.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_muldiv_rand.vvp
+
+sim_mdrand64: dirs
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 -o $(OUT_DIR)/tb_rv_muldiv_rand64.vvp \
+		$(MEXT_SRC) $(TB_DIR)/tb_rv_muldiv_rand.sv
+	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_muldiv_rand64.vvp
+
 sim_amo: dirs
 	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -o $(OUT_DIR)/tb_rv_amo.vvp \
 		$(AMO_SRC) $(TB_DIR)/tb_rv_amo.sv
@@ -605,6 +615,13 @@ BOOT_MTIME_FLAG = -DBOOT_MTIME_DIV=$(BOOT_MTIME_DIV)
 else
 BOOT_MTIME_FLAG =
 endif
+# Diagnostic: drive mtime from RETIRED-INSTRUCTION count instead of cycles, so a
+# baseline (single-cycle divide) and C-2a (multi-cycle divide) run get IDENTICAL
+# rdtime entropy + timer-interrupt instants -> identical execution iff no real HW
+# bug (separates a HW bug from benign RNG-divergence/roulette).
+ifneq ($(BOOT_MTIME_INSTR),)
+BOOT_MTIME_FLAG += -DMTIME_INSTR
+endif
 
 # Optional: -DBOOT_TRACE early divergence trace (make sim_boot BOOT_TRACE=1)
 ifneq ($(BOOT_TRACE),)
@@ -637,6 +654,13 @@ BOOT_TRACE_FLAG += -DBOOT_PTWLO=$(BOOT_PTWLO)
 endif
 ifneq ($(BOOT_DCWIN),)
 BOOT_TRACE_FLAG += -DBOOT_DCWIN=$(BOOT_DCWIN)
+endif
+# Differential store-sequence hash (baseline vs C-2a corruption hunt)
+ifneq ($(BOOT_STHASH),)
+BOOT_TRACE_FLAG += -DBFM_STORE_HASH
+endif
+ifneq ($(BOOT_STLO),)
+BOOT_TRACE_FLAG += -DSTLO=$(BOOT_STLO)
 endif
 # Physical-address write watch (one 8-byte word), e.g. BOOT_WATCH_PA="64'h818690e8"
 ifneq ($(BOOT_WATCH_PA),)

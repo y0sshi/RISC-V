@@ -119,7 +119,48 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello boot stack_test atomic_test lrsc_irq_test
+.PHONY: hello sim_hello boot stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test
+
+# ----- div_cachemiss_test: divide starting while a prior load/store dmem_waits -
+div_cachemiss_test: boot/div_cachemiss_test.hex
+
+boot/div_cachemiss_test.elf: boot/div_cachemiss_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/div_cachemiss_test.S -o boot/div_cachemiss_test.elf
+
+boot/div_cachemiss_test.hex: boot/div_cachemiss_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/div_cachemiss_test.elf boot/div_cachemiss_test.hex
+	@echo "  div_cachemiss_test hex: $@"
+
+# ----- div_mem_irq_test: loads/stores adjacent to divides vs timer IRQ -----
+div_mem_irq_test: boot/div_mem_irq_test.hex
+
+boot/div_mem_irq_test.elf: boot/div_mem_irq_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/div_mem_irq_test.S -o boot/div_mem_irq_test.elf
+
+boot/div_mem_irq_test.hex: boot/div_mem_irq_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/div_mem_irq_test.elf boot/div_mem_irq_test.hex
+	@echo "  div_mem_irq_test hex: $@"
+
+# ----- div_irq_test: multi-cycle divide vs timer interrupt (C-2a) -----
+# Timer interrupt sweeps into a divide loop; the handler runs its own divide
+# (dirtying the shared div_result register).  Every quotient/remainder must
+# stay correct.  Fails if the interrupt-at-divide interaction corrupts a result.
+#   make div_irq_test  &&  (cd ../sim && make vl_boot \
+#     BOOT_HEX=../software/boot/div_irq_test.hex)
+div_irq_test: boot/div_irq_test.hex
+
+boot/div_irq_test.elf: boot/div_irq_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/div_irq_test.S -o boot/div_irq_test.elf
+
+boot/div_irq_test.hex: boot/div_irq_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/div_irq_test.elf boot/div_irq_test.hex
+	@echo "  div_irq_test hex: $@"
 
 # ----- lrsc_irq_test: LR/SC reservation vs trap/interrupt (lost update) -----
 # Timer interrupt lands between LR and SC; the handler AMOs the same address.

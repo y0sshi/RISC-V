@@ -145,6 +145,12 @@ module rv_axi_dualport_mem_bfm #(
     logic [7:0]           d_wcnt;
     logic [ADDR_WIDTH-1:0] d_waddr_q;
     logic [ID_WIDTH-1:0]  d_wid_q;
+`ifdef BFM_STORE_HASH
+    logic [31:0] st_cnt = 32'd0, st_hash = 32'd0;  // differential store-seq trace
+`ifndef STLO
+`define STLO 32'hFFFF_FFFF
+`endif
+`endif
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -156,6 +162,37 @@ module rv_axi_dualport_mem_bfm #(
                           if (d_wvalid) begin
                               for (int i=0;i<DNB;i++) if (d_wstrb[i]) mem_b[base_off(d_waddr_q,1'b1,DNB)+i] <= d_wdata[i*8 +: 8];
                               d_wcnt<=b_delay; d_wstate<=W_LAT;
+`ifdef BFM_STORE_HASH
+                              // Differential store trace: cumulative hash over the
+                              // (addr,strobe,data) write SEQUENCE, printed every N
+                              // stores BY INDEX (timing-independent so baseline vs
+                              // C-2a are comparable).  First divergent index = the
+                              // corrupting store.
+                              // Count/hash ONLY stores that actually CHANGE memory
+                              // (filter idempotent re-issues of a held store, which
+                              // diverge in the transaction stream but not in content).
+                              begin
+                                  automatic logic changed = 1'b0;
+                                  for (int i=0;i<DNB;i++)
+                                      if (d_wstrb[i] &&
+                                          mem_b[base_off(d_waddr_q,1'b1,DNB)+i] != d_wdata[i*8 +: 8])
+                                          changed = 1'b1;
+                                  // Pointer filter: only kernel-VA-valued stores
+                                  // (d[63:40]==0xffffff) -- skips timing-dependent
+                                  // small values (cycle/jiffy counts) that diverge
+                                  // benignly under different divide timing.
+                                  if (changed && (d_wdata[63:40] == 24'hffffff)) begin
+                                      st_cnt  <= st_cnt + 1;
+                                      st_hash <= (st_hash ^ {d_waddr_q[31:0], d_wstrb}
+                                                  ^ d_wdata[31:0] ^ d_wdata[63:32]) * 32'h01000193;
+                                      if (st_cnt % 32'd20000 == 0)
+                                          $display("[STHASH] n=%0d hash=%08h", st_cnt, st_hash);
+                                      if (st_cnt >= `STLO && st_cnt <= `STLO + 22000)
+                                          $display("[ST] n=%0d a=%08h strb=%02h d=%016h",
+                                                   st_cnt, d_waddr_q[31:0], d_wstrb, d_wdata);
+                                  end
+                              end
+`endif
                           end
                       end else d_wcnt<=d_wcnt-8'd1;
             W_LAT:    if (d_wcnt==0) d_wstate<=W_RESP; else d_wcnt<=d_wcnt-8'd1;

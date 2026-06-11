@@ -160,6 +160,63 @@ module tb_rv_boot_soc;
                 u_bfm.mem_b[TOHOST_OFF+1], u_bfm.mem_b[TOHOST_OFF+0]};
     endfunction
 
+    // ---- In-context divide-result checker (C-2a regression hunt) -------------
+    // At each integer-divide retire, recompute the golden result from the live
+    // forwarded operands and compare to the multi-cycle divider output.  Catches
+    // any divide whose result is wrong in the real Linux pipeline context
+    // (operand mismatch, mis-capture, etc.) that the unit/random tests miss.
+    import rv_pkg::*;
+    localparam int CKW = 64;
+    function automatic logic [CKW-1:0] dgolden(input muldiv_op_t o,
+                                               input logic [CKW-1:0] a, b);
+        logic dz, dzw, ov, ovw;
+        dz = (b=='0); dzw = (b[31:0]=='0);
+        ov  = (a=={1'b1,{(CKW-1){1'b0}}}) && (b=='1);
+        ovw = (a[31:0]==32'h8000_0000) && (b[31:0]==32'hFFFF_FFFF);
+        unique case (o)
+          MDU_DIV:  dgolden = dz?'1 : ov?a : CKW'($signed(a)/$signed(b));
+          MDU_DIVU: dgolden = dz?'1 : a/b;
+          MDU_REM:  dgolden = dz?a  : ov?'0 : CKW'($signed(a)%$signed(b));
+          MDU_REMU: dgolden = dz?a  : a%b;
+          MDU_DIVW: dgolden = dzw?'1 : ovw?CKW'($signed(32'h8000_0000))
+                            : CKW'($signed($signed(a[31:0])/$signed(b[31:0])));
+          MDU_DIVUW:dgolden = dzw?'1 : CKW'($signed(a[31:0]/b[31:0]));
+          MDU_REMW: dgolden = dzw?CKW'($signed(a[31:0])) : ovw?'0
+                            : CKW'($signed($signed(a[31:0])%$signed(b[31:0])));
+          MDU_REMUW:dgolden = dzw?CKW'($signed(a[31:0])) : CKW'($signed(a[31:0]%b[31:0]));
+          default:  dgolden = 'x;
+        endcase
+    endfunction
+
+`ifdef BOOT_DIVCHK
+    integer div_check_fails = 0;
+    always @(posedge clk) if (rst_n) begin : div_chk
+        automatic logic is_d;
+        is_d = u_soc.u_cpu.u_core.id_ex_ctrl.is_muldiv
+               && u_soc.u_cpu.u_core.muldiv_is_divide
+               && u_soc.u_cpu.u_core.id_ex_valid
+               && !u_soc.u_cpu.u_core.muldiv_busy_int
+               && !u_soc.u_cpu.u_core.muldiv_start_stall
+               && !u_soc.u_cpu.u_core.stall_ex;   // divide retiring this cycle
+        if (is_d) begin
+            automatic logic [63:0] g, got;
+            g   = dgolden(u_soc.u_cpu.u_core.id_ex_ctrl.muldiv_op,
+                          u_soc.u_cpu.u_core.fwd_rs1_data,
+                          u_soc.u_cpu.u_core.fwd_rs2_data);
+            got = u_soc.u_cpu.u_core.muldiv_result;
+            if (got !== g) begin
+                div_check_fails = div_check_fails + 1;
+                if (div_check_fails <= 30)
+                    $display("[DIVCHK @%0t] MISMATCH pc=%h op=%0d a=%h b=%h got=%h exp=%h",
+                        $time, u_soc.u_cpu.u_core.id_ex_pc,
+                        u_soc.u_cpu.u_core.id_ex_ctrl.muldiv_op,
+                        u_soc.u_cpu.u_core.fwd_rs1_data,
+                        u_soc.u_cpu.u_core.fwd_rs2_data, got, g);
+            end
+        end
+    end
+`endif
+
     // diagnostics
     integer if_ar = 0, d_ar = 0;
     integer nvpe = 0;        // TEMP-DIAG vprintk_emit entry count (BOOT_TRACE only)
@@ -195,6 +252,31 @@ module tb_rv_boot_soc;
             endcase
         end
     end
+
+`ifdef MTIME_INSTR
+    // ===== Entropy-determinism harness (HW-bug vs RNG-roulette discriminator) =====
+    // Override the CLINT mtime with a RETIRED-INSTRUCTION counter (>> 6, i.e. an
+    // instruction-based 1/64 prescaler) so rdtime (kernel get_cycles entropy) AND
+    // timer-interrupt instants become a function of ARCHITECTURAL progress, not
+    // cycles.  A baseline (single-cycle divide) and a C-2a (multi-cycle divide)
+    // run then see IDENTICAL mtime at the same retired instruction, so they must
+    // execute identically unless a real (cycle-level) HW bug perturbs data.
+    // retire_en = mem_wb_valid & csr_commit (the exact minstret increment).
+    longint unsigned arch_clk = 0;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) arch_clk <= 0;
+        else if (u_soc.u_cpu.u_core.mem_wb_valid && u_soc.u_cpu.u_core.csr_commit)
+            arch_clk <= arch_clk + 1;
+    end
+    // Re-drive the override every cycle (force holds until re-evaluated).
+    always @(posedge clk)
+        force u_soc.u_periph.u_timer.gen_bus64.mtime = (arch_clk >> 6);
+    // Also neutralize rdcycle (CSR_CYCLE returns mcycle_cnt, +1/cycle): pin it to
+    // the retired-instruction count so ANY cycle-based entropy the kernel might
+    // read becomes instruction-based & identical across baseline/C-2a too.
+    always @(posedge clk)
+        force u_soc.u_cpu.u_core.u_csr.mcycle_cnt = u_soc.u_cpu.u_core.u_csr.minstret_cnt;
+`endif
 
 `ifdef BOOT_TRACE
     // --- divergence trace: ring buffer of distinct fetch_pc, dumped on first X ---
@@ -289,10 +371,37 @@ module tb_rv_boot_soc;
     always @(posedge clk) if (rst_n) begin
         tcyc <= tcyc + 1;
 `ifdef BOOT_DCWIN
+        // IF AXI channel state in the wedge window (why does a fill never finish?).
+        if (tcyc >= `BOOT_DCWIN && tcyc <= `BOOT_DCWIN + 160)
+            $display("   [IFAXI c%0d] brst=%0d arv=%b arr=%b araddr=%h arlen=%0d rv=%b rr=%b rlast=%b s_req=%b s_done=%b s_busy=%b",
+                tcyc, u_soc.gen_icache.u_axi_if.state,
+                i_arvalid, i_arready, i_araddr, i_arlen,
+                i_rvalid, i_rready, i_rlast,
+                u_soc.gen_icache.ic_m_req, u_soc.gen_icache.ic_m_done,
+                u_soc.gen_icache.ic_m_busy);
+        // All pipeline stall sources per cycle (wedge/livelock dissection).
+        if (tcyc >= `BOOT_DCWIN && tcyc <= `BOOT_DCWIN + 160)
+            $display("[STALL c%0d] sif=%b sid=%b sex=%b | imrdy=%b dwait=%b amo=%b mal=%b mems=%b mmus=%b fpub=%b fpus=%b mdb=%b mds=%b luh=%b rds=%b | idexpc=%h idexv=%b mret=%b fpc=%h iaddr=%h | ic_st=%0d c_req=%b c_rdy=%b aq=%h mreq=%b mdone=%b ifpa=%h ifreq=%b priv=%0d",
+                tcyc, u_soc.u_cpu.u_core.stall_if, u_soc.u_cpu.u_core.stall_id,
+                u_soc.u_cpu.u_core.stall_ex,
+                u_soc.imem_ready, u_soc.core_dmem_wait,
+                u_soc.u_cpu.u_core.amo_stall, u_soc.u_cpu.u_core.mal_stall,
+                u_soc.u_cpu.u_core.mem_stall, u_soc.u_cpu.u_core.mmu_stall,
+                u_soc.u_cpu.u_core.fpu_busy_int, u_soc.u_cpu.u_core.fpu_start_stall,
+                u_soc.u_cpu.u_core.muldiv_busy_int, u_soc.u_cpu.u_core.muldiv_start_stall,
+                u_soc.u_cpu.u_core.load_use_hazard, u_soc.u_cpu.u_core.redirect_stall,
+                u_soc.u_cpu.u_core.id_ex_pc, u_soc.u_cpu.u_core.id_ex_valid,
+                u_soc.u_cpu.u_core.ex_mret_en,
+                u_soc.u_cpu.u_core.fetch_pc, u_soc.u_cpu.u_core.imem_addr,
+                u_soc.gen_icache.u_ic.state, u_soc.gen_icache.u_ic.c_req,
+                u_soc.gen_icache.u_ic.c_ready, u_soc.gen_icache.u_ic.addr_q,
+                u_soc.gen_icache.u_ic.m_req, u_soc.gen_icache.u_ic.m_done,
+                u_soc.u_cpu.mmu_imem_pa, u_soc.u_cpu.mmu_imem_req,
+                u_soc.u_cpu.priv_out);
         // Cycle-by-cycle D-cache + core MEM/WB state around a target cycle, to see
         // why a load's rdata_q goes stale / byte_offset desyncs under IF latency.
         if (tcyc >= `BOOT_DCWIN && tcyc <= `BOOT_DCWIN + 160)
-            $display("[dc c%0d] st=%0d creq=%b cwe=%b caddr=%h hit=%b cwait=%b mdone=%b mrv=%b rdq=%h cwd=%h | imrdy=%b sex=%b dwait=%b memrd=%b exmpc=%h exmpa=%h exmv=%b mwv=%b fresh=%b ddr@a=%h",
+            $display("[dc c%0d] st=%0d creq=%b cwe=%b caddr=%h hit=%b cwait=%b mdone=%b mrv=%b rdq=%h cwd=%h | imrdy=%b sex=%b dwait=%b memrd=%b exmpc=%h exmpa=%h va=%h exmv=%b mwv=%b fresh=%b ddr@a=%h",
                 tcyc, u_soc.gen_dcache.u_dc.state, u_soc.gen_dcache.u_dc.c_req,
                 u_soc.gen_dcache.u_dc.c_we, u_soc.gen_dcache.u_dc.c_addr,
                 u_soc.gen_dcache.u_dc.hit, u_soc.gen_dcache.u_dc.c_wait,
@@ -300,7 +409,7 @@ module tb_rv_boot_soc;
                 u_soc.gen_dcache.u_dc.rdata_q, u_soc.gen_dcache.u_dc.c_wdata,
                 u_soc.imem_ready, u_soc.u_cpu.u_core.stall_ex, u_soc.core_dmem_wait,
                 u_soc.u_cpu.u_core.ex_mem_ctrl.mem_read, u_soc.u_cpu.u_core.ex_mem_pc,
-                u_soc.mmu_dmem_pa,
+                u_soc.mmu_dmem_pa, u_soc.u_cpu.u_core.ex_mem_alu_result,
                 u_soc.u_cpu.u_core.ex_mem_valid, u_soc.u_cpu.u_core.mem_wb_valid,
                 u_soc.u_cpu.u_core.mem_wb_fresh,
                 ((^u_soc.mmu_dmem_pa !== 1'bx && u_soc.mmu_dmem_pa >= MEM_BASE)
@@ -452,11 +561,49 @@ module tb_rv_boot_soc;
         if (`BOOT_PTWLO != 0 && tcyc >= `BOOT_PTWLO && tcyc <= `BOOT_PTWLO + 400
             && !u_soc.u_cpu.u_mmu.ptw_for_if
             && u_soc.u_cpu.u_mmu.ptw_state != 0)
-            $display("[PTW @%0d] st=%0d wait=%b rdy=%b paddr=%h rdata=%h vpn=%h ppncur=%h",
+            $display("[PTW @%0d] st=%0d wait=%b rdy=%b paddr=%h rdata=%h vpn=%h ppncur=%h | ddr@paddr=%h owptw=%b brbusy=%b brdone=%b brrv=%b",
                 tcyc, u_soc.u_cpu.u_mmu.ptw_state, u_soc.u_cpu.u_mmu.ptw_wait,
                 u_soc.u_cpu.ptw_ready, u_soc.u_cpu.u_mmu.ptw_paddr,
                 u_soc.u_cpu.u_mmu.ptw_rdata, u_soc.u_cpu.u_mmu.ptw_vpn,
-                u_soc.u_cpu.u_mmu.ptw_ppn_cur);
+                u_soc.u_cpu.u_mmu.ptw_ppn_cur,
+                ((^u_soc.u_cpu.u_mmu.ptw_paddr !== 1'bx
+                  && u_soc.u_cpu.u_mmu.ptw_paddr >= MEM_BASE)
+                    ? mem_win64(u_soc.u_cpu.u_mmu.ptw_paddr) : 64'hX),
+                u_soc.owner_ptw, u_soc.br_busy, u_soc.br_done, u_soc.br_rvalid);
+        // ---- Lost-store hunt: trace the lifecycle of `sw zero, dev_boot_phase`
+        // (PC 0xffffffff80a35fba in net_dev_init).  Fires while the store is in EX
+        // (ID/EX) or MEM (EX/MEM), printing every signal that could drop it.
+        if (u_soc.u_cpu.u_core.id_ex_valid
+            && u_soc.u_cpu.u_core.id_ex_pc == 64'hffffffff80a35fba)
+            $display("[STEX @%0d] id_ex(store) sif=%b sid=%b sex=%b | imrdy=%b dwait=%b mems=%b mmus=%b luh=%b rds=%b flushex=%b trapen=%b sret=%b",
+                tcyc, u_soc.u_cpu.u_core.stall_if, u_soc.u_cpu.u_core.stall_id,
+                u_soc.u_cpu.u_core.stall_ex, u_soc.imem_ready, u_soc.core_dmem_wait,
+                u_soc.u_cpu.u_core.mem_stall, u_soc.u_cpu.u_core.mmu_stall,
+                u_soc.u_cpu.u_core.load_use_hazard, u_soc.u_cpu.u_core.redirect_stall,
+                u_soc.u_cpu.u_core.flush_ex_mem, u_soc.u_cpu.u_core.ex_trap_enter,
+                u_soc.u_cpu.u_core.ex_sret_en);
+        if (u_soc.u_cpu.u_core.ex_mem_valid
+            && u_soc.u_cpu.u_core.ex_mem_pc == 64'hffffffff80a35fba)
+            $display("[STMEM @%0d] ex_mem(store) we=%b mem_w=%b dmem_pa=%h dmem_req=%b dmem_we=%b | sex=%b dwait=%b mems=%b mmus=%b flushex=%b | dc_st=%0d dc_creq=%b dc_cwe=%b dc_caddr=%h dc_cwait=%b dc_mreq=%b dc_mdone=%b | word=%h",
+                tcyc, u_soc.u_cpu.u_core.ex_mem_ctrl.mem_write,
+                u_soc.u_cpu.u_core.ex_mem_ctrl.mem_write,
+                u_soc.mmu_dmem_pa, u_soc.mmu_dmem_req, u_soc.mmu_dmem_we,
+                u_soc.u_cpu.u_core.stall_ex, u_soc.core_dmem_wait,
+                u_soc.u_cpu.u_core.mem_stall, u_soc.u_cpu.u_core.mmu_stall,
+                u_soc.u_cpu.u_core.flush_ex_mem,
+                u_soc.gen_dcache.u_dc.state, u_soc.gen_dcache.u_dc.c_req,
+                u_soc.gen_dcache.u_dc.c_we, u_soc.gen_dcache.u_dc.c_addr,
+                u_soc.gen_dcache.u_dc.c_wait, u_soc.gen_dcache.u_dc.m_req,
+                u_soc.gen_dcache.u_dc.m_done, mem_win64(64'h0000000081719ae0));
+        // Catch the first divergent store (init_thread_union slot 0x81603a40,
+        // C-2a value 0xecb5a897) -> reveals the producing PC + cycle for provenance.
+        if (u_soc.mmu_dmem_req && u_soc.core_dmem_we && !u_soc.periph_is_periph
+            && (u_soc.mmu_dmem_pa[31:3] == 29'(64'h81603a40 >> 3))
+            && (u_soc.core_dmem_wdata[31:0] == 32'hecb5a897 ||
+                u_soc.core_dmem_wdata[31:0] == 32'ha38c3727))
+            $display("[DIVST @%0d] pa=%h wdata=%h wstrb=%h ex_mem_pc=%h id_ex_pc=%h",
+                tcyc, u_soc.mmu_dmem_pa, u_soc.core_dmem_wdata, u_soc.core_dmem_wstrb,
+                u_soc.u_cpu.u_core.ex_mem_pc, u_soc.u_cpu.u_core.id_ex_pc);
         if (u_soc.u_cpu.u_core.trap_or_mret || u_soc.u_cpu.u_core.ifpf_take)
             $display("[trap @%0d] tgt=%h te=%b mte=%b ifpf=%b mret=%b sret=%b | LIVE cause=%h epc=%h tval=%h priv=%0d a7=%h a6=%h a0=%h",
                 tcyc, u_soc.u_cpu.u_core.redir_tgt,

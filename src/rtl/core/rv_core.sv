@@ -184,6 +184,43 @@ module rv_core
     logic fpu_valid_in;    // forward-declared; driven below
     logic fpu_start_stall; // forward-declared; driven below
 
+    // muldiv_busy_int: multi-cycle integer divide (DIV/REM, sequential radix-2) in
+    // progress.  Exactly mirrors the FPU FDIV/FSQRT busy protocol above so the EX
+    // stage holds the divide instruction until its result is ready.  Multiply ops
+    // (DSP, single-cycle) never assert these signals (no-op path).
+    logic muldiv_busy_int;     // forward-declared; driven by rv_muldiv below
+    logic muldiv_valid_in;     // forward-declared; driven below (divide start)
+    logic muldiv_start_stall;  // forward-declared; driven below
+    // muldiv_was_busy: 1-cycle delayed muldiv_busy_int, prevents re-triggering the
+    // divider on the cycle busy falls (before ID/EX advances past the divide).
+    logic muldiv_was_busy;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) muldiv_was_busy <= 1'b0;
+        else        muldiv_was_busy <= muldiv_busy_int;
+    end
+
+    // muldiv_done: a divide produced its result but could not retire on its
+    // completion cycle because stall_ex was held by an UNRELATED source (e.g.
+    // ~imem_ready -- an in-flight IF fetch).  muldiv_was_busy masks only ONE
+    // cycle, so without this the completed divide would RE-FIRE muldiv_valid_in
+    // the next cycle and restart from scratch.  Recomputing is idempotent (same
+    // operands -> same result), but if that stall recurs deterministically at
+    // every completion the divide restarts forever and never retires -- a
+    // LIVELOCK (observed: a trap-handler divide under a periodic I$ not-ready
+    // pattern hung Linux boot / div_irq_test).  muldiv_done latches "computed,
+    // waiting to retire": it suppresses the restart and holds the registered
+    // result until the divide advances out of EX (~stall_ex).  Strict no-op when
+    // a divide always completes with stall_ex=0 (BRAM: ~imem_ready never asserts).
+    logic muldiv_done;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            muldiv_done <= 1'b0;
+        else if (muldiv_was_busy && !muldiv_busy_int && stall_ex)
+            muldiv_done <= 1'b1;   // completed this cycle but held in EX
+        else if (!stall_ex)
+            muldiv_done <= 1'b0;   // EX advances -> the divide retires/leaves
+    end
+
     // Number of address bits that select a byte lane within one DMEM data word.
     // RV32: 2 bits (addr[1:0]) -> 4-byte word, wstrb is 4 bits
     // RV64: 3 bits (addr[2:0]) -> 8-byte logical word (two 32-bit BRAM halves), wstrb is 8 bits
@@ -192,8 +229,8 @@ module rv_core
 
     // redirect_stall holds IF/ID only (not EX) so the redirecting branch/trap can
     // still complete; it must NOT be added to stall_ex.
-    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall | redirect_stall | dmem_wait;
-    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | mal_stall | redirect_stall | dmem_wait;
+    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | muldiv_busy_int | muldiv_start_stall | mal_stall | redirect_stall | dmem_wait;
+    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | muldiv_busy_int | muldiv_start_stall | mal_stall | redirect_stall | dmem_wait;
     // mem_stall freezes EX/MEM: a load/store in MEM whose data translation is
     // still pending must remain in MEM (re-issuing its access) until the TLB is
     // filled.  Without this the access leaves MEM unwritten.  Note: IF-port PTW
@@ -207,7 +244,7 @@ module rv_core
     // completes.  Unlike mmu_stall, the IF fetch uses its OWN AXI master, so
     // freezing EX/MEM does not conflict with the data port.  NO-OP for a 1-cycle
     // IF (imem_ready=1 every cycle): ~imem_ready=0.
-    assign stall_ex = amo_stall | fpu_busy_int | mal_stall | mem_stall | dmem_wait | ~imem_ready;
+    assign stall_ex = amo_stall | fpu_busy_int | muldiv_busy_int | mal_stall | mem_stall | dmem_wait | ~imem_ready;
     // Traps/MRET flush the same stages as branch (instructions after the trap insn).
     // With the variable-length fetch (see IF stage), the redirect target address is
     // presented to IMEM combinationally on the cycle the redirect resolves, so the
@@ -715,15 +752,41 @@ module rv_core
     );
 
     // =========================================================================
-    // M-Extension: Multiply / Divide unit (combinational, single-cycle)
+    // M-Extension: Multiply (combinational) / Divide (multi-cycle) unit
     // =========================================================================
     logic [XLEN-1:0] muldiv_result;
 
+    // Detect DIVIDE ops (DIV/DIVU/REM/REMU + W-types).  Multiply ops execute in
+    // one combinational cycle and must NOT stall.  Mirrors the FPU FDIV protocol:
+    //   muldiv_valid_in : a divide entering EX that may start (gated by busy/was).
+    //   muldiv_start_stall : holds IF/ID for the start cycle (busy is still low,
+    //     it goes high on the next edge) so the divide is not lost from ID/EX.
+    logic muldiv_is_divide;
+    always_comb begin
+        unique case (id_ex_ctrl.muldiv_op)
+            MDU_DIV, MDU_DIVU, MDU_REM, MDU_REMU,
+            MDU_DIVW, MDU_DIVUW, MDU_REMW, MDU_REMUW: muldiv_is_divide = 1'b1;
+            default:                                  muldiv_is_divide = 1'b0;
+        endcase
+    end
+
+    assign muldiv_valid_in    = id_ex_valid
+                                && id_ex_ctrl.is_muldiv
+                                && muldiv_is_divide
+                                && !muldiv_busy_int
+                                && !muldiv_was_busy
+                                && !muldiv_done;
+    assign muldiv_start_stall = muldiv_valid_in;
+
     rv_muldiv #(.XLEN(XLEN)) u_muldiv (
+        .clk      (clk),
+        .rst_n    (rst_n),
         .rs1_data (fwd_rs1_data),
         .rs2_data (fwd_rs2_data),
         .op       (id_ex_ctrl.muldiv_op),
-        .result   (muldiv_result)
+        .valid_in (muldiv_valid_in),
+        .result   (muldiv_result),
+        .div_busy (muldiv_busy_int)
     );
 
     // EX-stage result: muldiv overrides ALU for M-extension instructions
@@ -1267,9 +1330,15 @@ module rv_core
             ex_mem_pc4        <= id_ex_pc + (id_ex_ctrl.is_compressed ? XLEN'(2) : XLEN'(4));
             ex_mem_funct3     <= id_ex_funct3;
             ex_mem_csr_fwd    <= csr_rdata_ex;
+            // Insert a bubble on the start cycle of a multi-cycle op (FDIV/FSQRT
+            // or an integer divide): stall_ex is still 0 here (busy goes high next
+            // edge) and the result is not yet ready, so EX/MEM must not capture a
+            // valid instruction.  The op is held in ID/EX by *_start_stall and is
+            // captured for real on the cycle busy drops.
             ex_mem_valid      <= id_ex_valid && !(fpu_valid_in &&
                                      (id_ex_ctrl.fpu_op == FPU_DIV ||
-                                      id_ex_ctrl.fpu_op == FPU_SQRT));
+                                      id_ex_ctrl.fpu_op == FPU_SQRT))
+                                 && !muldiv_start_stall;
             // Only capture FPU result for actual compute ops (not FLW/FLD/FSW/FSD).
             ex_mem_fpu_result_f     <= (id_ex_ctrl.is_fp && !id_ex_ctrl.fp_load
                                         && !id_ex_ctrl.fp_store)

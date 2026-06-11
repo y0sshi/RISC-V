@@ -1,17 +1,33 @@
 // =============================================================================
 // rv_muldiv.sv - M-Extension Multiply/Divide Unit
 // =============================================================================
-// Implements RV32M / RV64M operations as single-cycle combinational logic.
-// For FPGA targets, synthesis tools map MUL to DSP blocks and DIV to LUT-based
-// dividers (slow, large). A pipelined/multi-cycle variant can be substituted
-// later without changing the interface.
+// Implements RV32M / RV64M operations.
 //
-// All RISC-V M-extension corner cases are handled:
-//   div/rem by zero : result per spec (-1 / dividend)
+//   * Multiply (MUL/MULH/MULHSU/MULHU/MULW) : single-cycle COMBINATIONAL.
+//     Synthesis maps these to DSP blocks.  (Pipelining is future work C-2c.)
+//
+//   * Divide  (DIV/DIVU/REM/REMU + W-types) : MULTI-CYCLE radix-2 restoring
+//     divider.  A single-cycle combinational 64-bit divider was the #1 FPGA
+//     timing bottleneck (WNS = -226 ns on xc7z020-1; the DIV/REM ripple-carry
+//     chain dominated all top critical paths, capping Fmax at ~4 MHz).  The
+//     sequential divider trades latency for a short logic path.
+//
+// All RISC-V M-extension corner cases are handled (same results as before):
+//   div/rem by zero  : result per spec (-1 / dividend)
 //   signed overflow  : DIV(INT_MIN,-1)=INT_MIN, REM(INT_MIN,-1)=0
 //
-// Interface: purely combinational — no clock, no enables.
-// The calling stage (rv_core EX) gates the output via ctrl.is_muldiv.
+// Divider handshake (mirrors rv_fpu's FDIV/FSQRT busy protocol):
+//   valid_in : 1 when a DIVIDE op is in EX and may start (the caller gates this
+//              with !div_busy && !div_was_busy and a one-cycle start stall so the
+//              instruction is held in ID/EX).  Asserted only for divide ops.
+//   div_busy : high while the iteration is in progress.  The EX-stage pipeline
+//              register captures `result` on the cycle div_busy DROPS.
+// For multiply ops valid_in stays 0, div_busy stays 0, and `result` is the
+// purely combinational product (1-cycle, as before).
+//
+// Interface note: a divide held in EX past completion by an UNRELATED stall may
+// re-trigger (caller's div_was_busy only masks one cycle).  A restart recomputes
+// the SAME quotient from the same (frozen) operands, so it is idempotent.
 //
 // Author: Naofumi Yoshinaga
 // =============================================================================
@@ -23,16 +39,44 @@ module rv_muldiv
 #(
     parameter int XLEN = rv_pkg::XLEN
 ) (
+    input  wire              clk,
+    input  wire              rst_n,
     input  wire  [XLEN-1:0]  rs1_data,
     input  wire  [XLEN-1:0]  rs2_data,
-    input  wire muldiv_op_t   op,
-    output logic [XLEN-1:0]  result
+    input  wire  muldiv_op_t op,
+    input  wire              valid_in,   // start a DIVIDE op (caller-gated)
+    output logic [XLEN-1:0]  result,
+    output logic             div_busy    // iteration in progress
 );
 
+    localparam int WBITS = 32;                 // W-type operand width
+    localparam int CW    = $clog2(XLEN + 1);   // iteration counter width
+
     // =========================================================================
-    // Operand extension (2*XLEN bits) for MULH variants
-    // Using wire assigns (not inside always_*) to avoid iverilog limitations
-    // with parameterised types in procedural blocks.
+    // Op classification (combinational; `op` is stable while the instruction
+    // is held in EX, so these are also valid during the finalize cycle).
+    // =========================================================================
+    logic is_div_op, is_w_op, is_signed_op, is_rem_op;
+    always_comb begin
+        is_div_op    = 1'b0;
+        is_w_op      = 1'b0;
+        is_signed_op = 1'b0;
+        is_rem_op    = 1'b0;
+        unique case (op)
+            MDU_DIV:    begin is_div_op=1; is_signed_op=1;                  end
+            MDU_DIVU:   begin is_div_op=1;                                  end
+            MDU_REM:    begin is_div_op=1; is_signed_op=1; is_rem_op=1;     end
+            MDU_REMU:   begin is_div_op=1;                 is_rem_op=1;     end
+            MDU_DIVW:   begin is_div_op=1; is_signed_op=1; is_w_op=1;       end
+            MDU_DIVUW:  begin is_div_op=1;                 is_w_op=1;       end
+            MDU_REMW:   begin is_div_op=1; is_signed_op=1; is_rem_op=1; is_w_op=1; end
+            MDU_REMUW:  begin is_div_op=1;                 is_rem_op=1; is_w_op=1; end
+            default:    ; // multiply ops: all flags 0
+        endcase
+    end
+
+    // =========================================================================
+    // Multiply (combinational, single-cycle)
     // =========================================================================
     logic [2*XLEN-1:0] rs1_sx, rs2_sx;  // sign-extended
     logic [2*XLEN-1:0] rs1_ux, rs2_ux;  // zero-extended
@@ -42,148 +86,172 @@ module rv_muldiv
     assign rs1_ux = {{XLEN{1'b0}},              rs1_data};
     assign rs2_ux = {{XLEN{1'b0}},              rs2_data};
 
-    // =========================================================================
-    // Products (2*XLEN-bit combinational — captures the full exact product
-    // because |A_signed × B_unsigned| < 2^(2*XLEN-1) for any XLEN-bit inputs)
-    // =========================================================================
-    logic [2*XLEN-1:0] prod_ss;   // signed   × signed
-    logic [2*XLEN-1:0] prod_su;   // signed   × unsigned  (MULHSU)
-    logic [2*XLEN-1:0] prod_uu;   // unsigned × unsigned
+    logic [2*XLEN-1:0] prod_ss;   // signed   x signed
+    logic [2*XLEN-1:0] prod_su;   // signed   x unsigned (MULHSU)
+    logic [2*XLEN-1:0] prod_uu;   // unsigned x unsigned
 
     assign prod_ss = $signed(rs1_sx) * $signed(rs2_sx);
-    assign prod_su = $signed(rs1_sx) * $signed(rs2_ux);  // rs2_ux MSB=0 → non-neg
+    assign prod_su = $signed(rs1_sx) * $signed(rs2_ux);  // rs2_ux MSB=0 -> non-neg
     assign prod_uu = rs1_ux * rs2_ux;
 
-    // =========================================================================
-    // Special-case flags
-    // =========================================================================
-    // Base-XLEN
-    wire              div_by_zero     = (rs2_data == '0);
-    wire              signed_overflow = (rs1_data == {1'b1, {(XLEN-1){1'b0}}}   // INT_MIN
-                                         && rs2_data == '1);                      // -1
-    // W-type (32-bit operands regardless of XLEN)
-    wire              div_by_zero_w     = (rs2_data[31:0] == '0);
-    wire              signed_overflow_w = (rs1_data[31:0] == 32'h8000_0000
-                                           && rs2_data[31:0] == 32'hFFFF_FFFF);
-
-    // =========================================================================
-    // Result mux
-    // =========================================================================
+    logic [XLEN-1:0] mul_result;
     always_comb begin
-        result = '0;
+        mul_result = '0;
         unique case (op)
-
-            // ------------------------------------------------------------------
-            // Multiply
-            // ------------------------------------------------------------------
-            // MUL: lower XLEN bits of signed×signed product
-            // (same lower bits as unsigned×unsigned, so rs1*rs2 is sufficient)
-            MDU_MUL:    result = rs1_data * rs2_data;
-
-            // MULH: upper XLEN bits of signed×signed product
-            MDU_MULH:   result = prod_ss[2*XLEN-1:XLEN];
-
-            // MULHSU: upper XLEN bits of signed×unsigned product
-            MDU_MULHSU: result = prod_su[2*XLEN-1:XLEN];
-
-            // MULHU: upper XLEN bits of unsigned×unsigned product
-            MDU_MULHU:  result = prod_uu[2*XLEN-1:XLEN];
-
-            // ------------------------------------------------------------------
-            // Divide (signed)
-            //   div-by-zero  → all-ones (-1 signed)
-            //   INT_MIN / -1 → INT_MIN  (overflow)
-            // ------------------------------------------------------------------
-            MDU_DIV: begin
-                if (div_by_zero)
-                    result = '1;
-                else if (signed_overflow)
-                    result = rs1_data;   // INT_MIN
-                else
-                    result = xlen_t'($signed(rs1_data) / $signed(rs2_data));
-            end
-
-            // Divide (unsigned)
-            //   div-by-zero  → all-ones (2^XLEN - 1)
-            MDU_DIVU: begin
-                if (div_by_zero)
-                    result = '1;
-                else
-                    result = rs1_data / rs2_data;
-            end
-
-            // ------------------------------------------------------------------
-            // Remainder (signed)
-            //   div-by-zero  → dividend unchanged
-            //   INT_MIN % -1 → 0  (consistent with DIV overflow result)
-            // ------------------------------------------------------------------
-            MDU_REM: begin
-                if (div_by_zero)
-                    result = rs1_data;
-                else if (signed_overflow)
-                    result = '0;
-                else
-                    result = xlen_t'($signed(rs1_data) % $signed(rs2_data));
-            end
-
-            // Remainder (unsigned)
-            //   div-by-zero  → dividend unchanged
-            MDU_REMU: begin
-                if (div_by_zero)
-                    result = rs1_data;
-                else
-                    result = rs1_data % rs2_data;
-            end
-
-            // ------------------------------------------------------------------
-            // W-type (RV64M): 32-bit operation, result sign-extended to XLEN
-            // ------------------------------------------------------------------
-
-            // MULW: lower 32 bits of rs1[31:0]×rs2[31:0], sign-extended
-            MDU_MULW:
-                result = XLEN'($signed(rs1_data[31:0] * rs2_data[31:0]));
-
-            // DIVW: signed 32-bit division, sign-extended
-            MDU_DIVW: begin
-                if (div_by_zero_w)
-                    result = '1;
-                else if (signed_overflow_w)
-                    result = XLEN'($signed(32'h8000_0000));  // INT32_MIN sign-ext
-                else
-                    result = XLEN'($signed($signed(rs1_data[31:0]) /
-                                           $signed(rs2_data[31:0])));
-            end
-
-            // DIVUW: unsigned 32-bit division, result sign-extended
-            MDU_DIVUW: begin
-                if (div_by_zero_w)
-                    result = '1;
-                else
-                    result = XLEN'($signed(rs1_data[31:0] / rs2_data[31:0]));
-            end
-
-            // REMW: signed 32-bit remainder, sign-extended
-            MDU_REMW: begin
-                if (div_by_zero_w)
-                    result = XLEN'($signed(rs1_data[31:0]));
-                else if (signed_overflow_w)
-                    result = '0;
-                else
-                    result = XLEN'($signed($signed(rs1_data[31:0]) %
-                                           $signed(rs2_data[31:0])));
-            end
-
-            // REMUW: unsigned 32-bit remainder, sign-extended
-            MDU_REMUW: begin
-                if (div_by_zero_w)
-                    result = XLEN'($signed(rs1_data[31:0]));
-                else
-                    result = XLEN'($signed(rs1_data[31:0] % rs2_data[31:0]));
-            end
-
-            default: result = '0;
+            MDU_MUL:    mul_result = rs1_data * rs2_data;
+            MDU_MULH:   mul_result = prod_ss[2*XLEN-1:XLEN];
+            MDU_MULHSU: mul_result = prod_su[2*XLEN-1:XLEN];
+            MDU_MULHU:  mul_result = prod_uu[2*XLEN-1:XLEN];
+            MDU_MULW:   mul_result = XLEN'($signed(rs1_data[31:0] * rs2_data[31:0]));
+            default:    mul_result = '0;  // divide ops use div_result mux below
         endcase
     end
+
+    // =========================================================================
+    // Sequential radix-2 restoring divider
+    // =========================================================================
+    typedef enum logic [1:0] { D_IDLE, D_RUN, D_CORR, D_DONE } div_state_t;
+    div_state_t      state;
+
+    logic [XLEN-1:0] rem_q;    // partial remainder (always < divisor magnitude)
+    logic [XLEN-1:0] quot_q;   // quotient bits accumulate from LSB
+    logic [XLEN-1:0] divd_q;   // dividend magnitude, left-justified, shifts left
+    logic [XLEN-1:0] dvsr_q;   // divisor magnitude
+    logic [CW-1:0]   count_q;  // remaining iterations
+    logic [XLEN-1:0] div_result;
+
+    // Latched op/operand attributes captured at start (operands are frozen while
+    // the instruction is held in EX, but latching makes the finalize independent).
+    logic            a_sign_q, b_sign_q, is_rem_q, is_w_q, special_q;
+    logic [XLEN-1:0] special_res_q;
+
+    assign div_busy = (state == D_RUN) || (state == D_CORR);
+
+    // ---- Start-cycle operand/special preparation (combinational) ----
+    logic [XLEN-1:0] a_ext, b_ext, a_mag, b_mag, divd_init, dvsr_init;
+    logic            a_sgn, b_sgn, dz, ov;
+    logic [XLEN-1:0] special_res;
+    always_comb begin
+        // Width-appropriate sign/zero extension to XLEN.
+        a_ext = is_w_op ? (is_signed_op ? XLEN'($signed (rs1_data[WBITS-1:0]))
+                                        : XLEN'($unsigned(rs1_data[WBITS-1:0])))
+                        : rs1_data;
+        b_ext = is_w_op ? (is_signed_op ? XLEN'($signed (rs2_data[WBITS-1:0]))
+                                        : XLEN'($unsigned(rs2_data[WBITS-1:0])))
+                        : rs2_data;
+        a_sgn = is_signed_op & a_ext[XLEN-1];
+        b_sgn = is_signed_op & b_ext[XLEN-1];
+        a_mag = a_sgn ? (~a_ext + 1'b1) : a_ext;
+        b_mag = b_sgn ? (~b_ext + 1'b1) : b_ext;
+        // For W-type, process the high 32 bits: left-justify the 32-bit magnitude
+        // so divd[XLEN-1] is its MSB and a 32-iteration run consumes it MSB-first.
+        divd_init = is_w_op ? (a_mag << (XLEN - WBITS)) : a_mag;
+        dvsr_init = b_mag;
+
+        // Special cases (override the iterated result; match spec / prior logic).
+        dz = is_w_op ? (rs2_data[WBITS-1:0] == '0) : (rs2_data == '0);
+        ov = is_signed_op &&
+             (is_w_op ? (rs1_data[WBITS-1:0] == 32'h8000_0000 &&
+                         rs2_data[WBITS-1:0] == 32'hFFFF_FFFF)
+                      : (rs1_data == {1'b1, {(XLEN-1){1'b0}}} && rs2_data == '1));
+        if (dz)
+            special_res = is_rem_op ? (is_w_op ? XLEN'($signed(rs1_data[WBITS-1:0]))
+                                               : rs1_data)
+                                    : {XLEN{1'b1}};                 // DIV x/0 = -1
+        else // ov (signed overflow)
+            special_res = is_rem_op ? '0
+                                    : (is_w_op ? XLEN'($signed(32'h8000_0000))
+                                               : {1'b1, {(XLEN-1){1'b0}}}); // INT_MIN
+    end
+
+    // ---- Iteration step (combinational) ----
+    logic [XLEN:0]   rem_sh;   // {rem, next dividend bit}  (XLEN+1 bits)
+    logic            q_bit;
+    logic [XLEN-1:0] rem_nx;
+    always_comb begin
+        rem_sh = {rem_q, divd_q[XLEN-1]};
+        q_bit  = (rem_sh >= {1'b0, dvsr_q});
+        rem_nx = q_bit ? (rem_sh - {1'b0, dvsr_q}) : rem_sh; // < divisor, fits XLEN
+    end
+
+    // ---- Finalize (combinational): sign-correct magnitudes / apply special ----
+    logic [XLEN-1:0] q_fixed, r_fixed, mag, fin_res;
+    always_comb begin
+        q_fixed = (a_sign_q ^ b_sign_q) ? (~quot_q + 1'b1) : quot_q;
+        r_fixed =  a_sign_q             ? (~rem_q  + 1'b1) : rem_q;
+        mag     = is_rem_q ? r_fixed : q_fixed;
+        if (special_q)      fin_res = special_res_q;
+        else if (is_w_q)    fin_res = XLEN'($signed(mag[WBITS-1:0]));
+        else                fin_res = mag;
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state         <= D_IDLE;
+            rem_q         <= '0;
+            quot_q        <= '0;
+            divd_q        <= '0;
+            dvsr_q        <= '0;
+            count_q       <= '0;
+            div_result    <= '0;
+            a_sign_q      <= 1'b0;
+            b_sign_q      <= 1'b0;
+            is_rem_q      <= 1'b0;
+            is_w_q        <= 1'b0;
+            special_q     <= 1'b0;
+            special_res_q <= '0;
+        end else begin
+            unique case (state)
+                D_IDLE: begin
+                    if (valid_in) begin
+                        // Latch operands/attributes and start iterating.
+                        rem_q         <= '0;
+                        quot_q        <= '0;
+                        divd_q        <= divd_init;
+                        dvsr_q        <= dvsr_init;
+                        count_q       <= is_w_op ? CW'(WBITS) : CW'(XLEN);
+                        a_sign_q      <= a_sgn;
+                        b_sign_q      <= b_sgn;
+                        is_rem_q      <= is_rem_op;
+                        is_w_q        <= is_w_op;
+                        special_q     <= dz | ov;
+                        special_res_q <= special_res;
+                        state         <= D_RUN;
+                    end
+                end
+
+                D_RUN: begin
+                    // One restoring step per cycle.  (For special cases the
+                    // iteration runs harmlessly; the result is overridden.)
+                    rem_q   <= rem_nx;
+                    quot_q  <= {quot_q[XLEN-2:0], q_bit};
+                    divd_q  <= {divd_q[XLEN-2:0], 1'b0};
+                    count_q <= count_q - 1'b1;
+                    if (count_q == CW'(1))
+                        state <= D_CORR;  // last iteration done -> finalize
+                end
+
+                D_CORR: begin
+                    // Registers now hold final magnitudes; latch corrected result.
+                    div_result <= fin_res;
+                    state      <= D_DONE;
+                end
+
+                D_DONE: begin
+                    // div_busy is low here; the EX/MEM register captures `result`.
+                    state <= D_IDLE;
+                end
+
+                default: state <= D_IDLE;
+            endcase
+        end
+    end
+
+    // =========================================================================
+    // Output mux: divide ops return the registered quotient/remainder (valid on
+    // the D_DONE cycle); multiply ops return the combinational product.
+    // =========================================================================
+    assign result = is_div_op ? div_result : mul_result;
 
 endmodule
 
