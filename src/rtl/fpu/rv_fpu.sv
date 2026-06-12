@@ -132,6 +132,8 @@ module rv_fpu
     );
 
     rv_fpu_mul u_mul (
+        .clk    (clk),
+        .rst_n  (rst_n),
         .a      (fa_s),
         .b      (fb_s),
         .rm     (rm),
@@ -253,6 +255,8 @@ module rv_fpu
     );
 
     rv_fpu_mul_d u_mul_d (
+        .clk    (clk),
+        .rst_n  (rst_n),
         .a      (fa),
         .b      (fb),
         .rm     (rm),
@@ -337,18 +341,37 @@ module rv_fpu
     // no-op (combinational ops now occupy EX for extra cycles), validated by
     // result equivalence.  Mutually exclusive with FDIV/FSQRT (their own units).
     //
-    // Timeline (start cycle T): T raises busy on the next edge (NBA) and latches
-    // the product; T+1 holds busy=1 (EX stalled, add executes from the registered
-    // product); T+2 busy drops -> rv_core captures result_f/fflags, comb_done
-    // pulses once for the fflags accumulate.  Operands are frozen in ID/EX across
-    // the stall, so the non-FMADD result mux (combinational from fa/fb) is stable.
+    // C-2c third step: the multipliers (rv_fpu_mul / rv_fpu_mul_d) are now
+    // 1-cycle pipelined too, so the FMADD serial chain is 3 register deep --
+    //   multiply internal reg (T+1) -> mul_result_q (T+2) -> adder internal reg
+    //   (T+3) -> add stage-1 result (T+3) --
+    // and the combinational op must occupy EX for 2 busy cycles, with the result
+    // captured at T+3 (busy falling).  A counter (COMB_LAT busy cycles) replaces
+    // the old single-busy-cycle flop.
+    //
+    // mul_result_q / mul_d_result_q are now FREE-RUNNING (latched every cycle):
+    // because the multiply result is only valid at T+1 (it is registered), the
+    // old start-cycle (T) latch would capture a stale product.  Free-running, the
+    // FMADD add reads mul_result_q at T+2 = multiply result(T+1) = correct.  Stale
+    // fills on the non-capture cycles are harmless: rv_core only captures on the
+    // T+3 (busy-falling) cycle, by which time the correct product has propagated.
+    //
+    // Timeline (start cycle T): T raises busy on the next edge (NBA); T+1,T+2 hold
+    // busy=1 (EX stalled, multiply then add execute from registered operands);
+    // T+3 busy drops -> rv_core captures result_f/fflags, comb_done pulses once.
+    // Operands are frozen in ID/EX across the stall, so every sub-unit's pipelined
+    // result is stable by its respective cycle.
     logic comb_op_in;
     assign comb_op_in = valid_in && (fpu_op != FPU_DIV) && (fpu_op != FPU_SQRT);
 
-    logic comb_busy, comb_busy_q, comb_done;
+    localparam int unsigned COMB_LAT = 2;  // busy cycles (capture at T+1+COMB_LAT)
+    logic [1:0] comb_cnt;
+    logic       comb_busy, comb_busy_q, comb_done;
+    assign comb_busy = (comb_cnt != 2'd0);
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            comb_busy      <= 1'b0;
+            comb_cnt       <= 2'd0;
             comb_busy_q    <= 1'b0;
             mul_result_q   <= '0;
             mul_fflags_q   <= '0;
@@ -356,16 +379,16 @@ module rv_fpu
             mul_d_fflags_q <= '0;
         end else begin
             comb_busy_q <= comb_busy;
-            if (comb_op_in && !comb_busy) begin
-                // Start cycle: latch the FMADD product, raise busy on next edge.
-                comb_busy      <= 1'b1;
-                mul_result_q   <= mul_result;
-                mul_fflags_q   <= mul_fflags;
-                mul_d_result_q <= mul_d_result;
-                mul_d_fflags_q <= mul_d_fflags;
-            end else begin
-                comb_busy <= 1'b0;  // single busy cycle
-            end
+            // Free-running capture of the pipelined multiply product / flags.
+            mul_result_q   <= mul_result;
+            mul_fflags_q   <= mul_fflags;
+            mul_d_result_q <= mul_d_result;
+            mul_d_fflags_q <= mul_d_fflags;
+
+            if (comb_op_in && comb_cnt == 2'd0)
+                comb_cnt <= COMB_LAT[1:0];      // start: span COMB_LAT busy cycles
+            else if (comb_cnt != 2'd0)
+                comb_cnt <= comb_cnt - 2'd1;    // count down to capture cycle
         end
     end
     // Result ready / capture cycle: busy was high last cycle and is now low.

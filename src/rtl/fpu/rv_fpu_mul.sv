@@ -1,6 +1,6 @@
 // =============================================================================
 /// @file rv_fpu_mul.sv
-/// @brief IEEE 754 Single-Precision Multiplier (combinational)
+/// @brief IEEE 754 Single-Precision Multiplier (1-cycle pipelined)
 ///
 /// Implements FMUL.S.  Also used internally by rv_fpu.sv to implement the
 /// FMADD / FMSUB / FNMADD / FNMSUB family (non-fused: multiply then add).
@@ -15,12 +15,20 @@
 ///
 /// fflags: {NV, DZ, OF, UF, NX}
 ///
+/// C-2c third step: 1-cycle PIPELINED multiplier (mirrors rv_fpu_mul_d.sv).
+/// A pipeline register at the post-product boundary splits stage 0 (extract/
+/// classify, 24x24 product, exponent sum) from stage 1 (normalize/round/assemble).
+/// `result`/`fflags` are valid 1 cycle after stable inputs; rv_fpu's
+/// combinational-op handshake budgets for it.  Pure latency change, bit-identical.
+///
 /// @author Naofumi Yoshinaga
 // =============================================================================
 
 `default_nettype none
 
 module rv_fpu_mul (
+    input  wire         clk,
+    input  wire         rst_n,
     input  wire  [31:0] a,        // Operand A (multiplicand)
     input  wire  [31:0] b,        // Operand B (multiplier)
     input  wire  [2:0]  rm,       // Rounding mode (resolved)
@@ -84,7 +92,31 @@ module rv_fpu_mul (
     logic signed [10:0] exp_sum;
     assign exp_sum = {1'b0, ea_eff} + {1'b0, eb_eff} - 11'd127;
 
+    // =========================================================================
+    // Pipeline register (stage 0 -> stage 1).  Free-running; rv_fpu's handshake
+    // captures the stage-1 result on the correct cycle (stale fills uncaptured).
+    // Registers the 24x24 product plus the light exponent sum / sign / special-
+    // case flags so stage 1 is pure normalize/round/assemble.
+    // =========================================================================
+    logic [47:0]        prod_q;
+    logic signed [10:0] exp_sum_q;
+    logic               sr_q;
+    logic               a_nan_q, b_nan_q, a_snan_q, b_snan_q;
+    logic               a_inf_q, b_inf_q, a_zero_q, b_zero_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            prod_q  <= '0; exp_sum_q <= '0; sr_q <= 1'b0;
+            a_nan_q <= 1'b0; b_nan_q <= 1'b0; a_snan_q <= 1'b0; b_snan_q <= 1'b0;
+            a_inf_q <= 1'b0; b_inf_q <= 1'b0; a_zero_q <= 1'b0; b_zero_q <= 1'b0;
+        end else begin
+            prod_q  <= prod; exp_sum_q <= exp_sum; sr_q <= sr;
+            a_nan_q <= a_nan; b_nan_q <= b_nan; a_snan_q <= a_snan; b_snan_q <= b_snan;
+            a_inf_q <= a_inf; b_inf_q <= b_inf; a_zero_q <= a_zero; b_zero_q <= b_zero;
+        end
+    end
+
     // -------------------------------------------------------------------------
+    // Stage 1: normalize / round / assemble (reads registered *_q).
     // Normalize: locate the leading 1 of the 48-bit product and left-align it
     // to bit 47.  For two normalized inputs the leading 1 sits at bit 47 or 46
     // (1-bit shift), but a subnormal operand has no implicit leading 1, so its
@@ -99,15 +131,15 @@ module rv_fpu_mul (
     // Exponent: leading 1 originally at bit (47 - prod_lzc), so relative to the
     // bit-46 reference used by exp_sum the bias is +1 - prod_lzc.
     // -------------------------------------------------------------------------
-    logic [5:0] prod_lzc;   // leading-zero count of prod[47:0] (0..47)
+    logic [5:0] prod_lzc;   // leading-zero count of prod_q[47:0] (0..47)
     always_comb begin
         prod_lzc = 6'd47;
         for (int i = 0; i <= 47; i++)
-            if (prod[i]) prod_lzc = 6'(47 - i);   // prod[47]->0 ... prod[0]->47
+            if (prod_q[i]) prod_lzc = 6'(47 - i);   // prod_q[47]->0 ... prod_q[0]->47
     end
 
     logic [47:0] prod_norm;
-    assign prod_norm = prod << prod_lzc;   // leading 1 left-aligned to bit 47
+    assign prod_norm = prod_q << prod_lzc;   // leading 1 left-aligned to bit 47
 
     logic [22:0] norm_frac;
     logic        G, R, S_bit;
@@ -119,7 +151,7 @@ module rv_fpu_mul (
         R         = prod_norm[22];
         S_bit     = |prod_norm[21:0];
         // exp_sum references the bit-46 leading position; shift moves it to 47
-        norm_exp  = exp_sum[10:0] + 11'd1 - {5'd0, prod_lzc};
+        norm_exp  = exp_sum_q[10:0] + 11'd1 - {5'd0, prod_lzc};
     end
 
     // -------------------------------------------------------------------------
@@ -130,8 +162,8 @@ module rv_fpu_mul (
         case (rm)
             3'b000: round_up = G & (R | S_bit | norm_frac[0]);  // RNE
             3'b001: round_up = 1'b0;                              // RTZ
-            3'b010: round_up = (G | R | S_bit) & sr;             // RDN
-            3'b011: round_up = (G | R | S_bit) & !sr;            // RUP
+            3'b010: round_up = (G | R | S_bit) & sr_q;           // RDN
+            3'b011: round_up = (G | R | S_bit) & !sr_q;          // RUP
             3'b100: round_up = G;                                  // RMM
             default: round_up = 1'b0;
         endcase
@@ -159,17 +191,17 @@ module rv_fpu_mul (
         result = 32'h0;
         fflags = 5'h0;
 
-        if (a_nan || b_nan) begin
+        if (a_nan_q || b_nan_q) begin
             result    = CANONICAL_NAN;
-            fflags[4] = a_snan | b_snan;
-        end else if ((a_inf && (b_zero)) || (b_inf && (a_zero))) begin
+            fflags[4] = a_snan_q | b_snan_q;
+        end else if ((a_inf_q && (b_zero_q)) || (b_inf_q && (a_zero_q))) begin
             // inf * 0 = NaN
             result    = CANONICAL_NAN;
             fflags[4] = 1'b1;
-        end else if (a_inf || b_inf) begin
-            result = {sr, 8'hFF, 23'h0};
-        end else if (a_zero || b_zero) begin
-            result = {sr, 31'h0};
+        end else if (a_inf_q || b_inf_q) begin
+            result = {sr_q, 8'hFF, 23'h0};
+        end else if (a_zero_q || b_zero_q) begin
+            result = {sr_q, 31'h0};
         end else begin
             // Normal multiplication
             if ($signed(final_exp) >= 11'sd255) begin
@@ -177,18 +209,18 @@ module rv_fpu_mul (
                 fflags[2] = 1'b1;
                 fflags[0] = 1'b1;
                 case (rm)
-                    3'b001: result = {sr, 8'hFE, 23'h7FFFFF};
-                    3'b010: result = sr ? {1'b1,8'hFF,23'h0} : {1'b0,8'hFE,23'h7FFFFF};
-                    3'b011: result = sr ? {1'b1,8'hFE,23'h7FFFFF} : {1'b0,8'hFF,23'h0};
-                    default: result = {sr, 8'hFF, 23'h0};
+                    3'b001: result = {sr_q, 8'hFE, 23'h7FFFFF};
+                    3'b010: result = sr_q ? {1'b1,8'hFF,23'h0} : {1'b0,8'hFE,23'h7FFFFF};
+                    3'b011: result = sr_q ? {1'b1,8'hFE,23'h7FFFFF} : {1'b0,8'hFF,23'h0};
+                    default: result = {sr_q, 8'hFF, 23'h0};
                 endcase
             end else if ($signed(final_exp) <= 11'sd0) begin
                 // Underflow -> zero (simplified: flush to zero)
-                result    = {sr, 31'h0};
+                result    = {sr_q, 31'h0};
                 fflags[1] = 1'b1;
                 fflags[0] = 1'b1;
             end else begin
-                result    = {sr, final_exp[7:0], final_frac};
+                result    = {sr_q, final_exp[7:0], final_frac};
                 fflags[0] = G | R | S_bit;
             end
         end

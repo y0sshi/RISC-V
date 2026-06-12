@@ -1,10 +1,18 @@
 // =============================================================================
 /// @file rv_fpu_mul_d.sv
-/// @brief IEEE 754 Double-Precision Multiplier (combinational)
+/// @brief IEEE 754 Double-Precision Multiplier (1-cycle pipelined)
 ///
 /// Implements FMUL.D.  Also used internally by rv_fpu.sv for FMADD.D family.
 ///
 /// Format: s(1) | e(11) | f(52), bias=1023
+///
+/// C-2c third step: 1-cycle PIPELINED multiplier (mirrors rv_fpu_add_d.sv).
+/// A pipeline register at the post-product boundary splits the IEEE multiply
+/// into stage 0 (extract/classify, 53x53 DSP product, exponent sum) and stage 1
+/// (normalize/round/assemble).  This removes the DSP-product + normalize/round ->
+/// fflags chain (the C-2c second-step critical path) from a single combinational
+/// stage.  `result`/`fflags` are valid 1 cycle after stable inputs; rv_fpu's
+/// combinational-op handshake budgets for it.  Pure latency change, bit-identical.
 ///
 /// @author Naofumi Yoshinaga
 // =============================================================================
@@ -12,6 +20,8 @@
 `default_nettype none
 
 module rv_fpu_mul_d (
+    input  wire         clk,
+    input  wire         rst_n,
     input  wire  [63:0] a,
     input  wire  [63:0] b,
     input  wire  [2:0]  rm,
@@ -64,6 +74,30 @@ module rv_fpu_mul_d (
     logic signed [13:0] exp_sum;
     assign exp_sum = {1'b0, ea_eff} + {1'b0, eb_eff} - 14'sd1023;
 
+    // =========================================================================
+    // Pipeline register (stage 0 -> stage 1).  Free-running; rv_fpu's handshake
+    // captures the stage-1 result on the correct cycle (stale fills uncaptured).
+    // Registers the heavy 53x53 DSP product plus the light exponent sum / sign /
+    // special-case flags so stage 1 is pure normalize/round/assemble.
+    // =========================================================================
+    logic [105:0]       prod_q;
+    logic signed [13:0] exp_sum_q;
+    logic               sr_q;
+    logic               a_nan_q, b_nan_q, a_snan_q, b_snan_q;
+    logic               a_inf_q, b_inf_q, a_zero_q, b_zero_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            prod_q    <= '0; exp_sum_q <= '0; sr_q <= 1'b0;
+            a_nan_q   <= 1'b0; b_nan_q  <= 1'b0; a_snan_q <= 1'b0; b_snan_q <= 1'b0;
+            a_inf_q   <= 1'b0; b_inf_q  <= 1'b0; a_zero_q <= 1'b0; b_zero_q <= 1'b0;
+        end else begin
+            prod_q    <= prod; exp_sum_q <= exp_sum; sr_q <= sr;
+            a_nan_q   <= a_nan;  b_nan_q  <= b_nan;  a_snan_q <= a_snan; b_snan_q <= b_snan;
+            a_inf_q   <= a_inf;  b_inf_q  <= b_inf;  a_zero_q <= a_zero; b_zero_q <= b_zero;
+        end
+    end
+
+    // ---- Stage 1: normalize / round / assemble (reads registered *_q) ----
     // Normalize: product in [1.0, 4.0)
     // If prod[105]=1: leading 1 at bit 105 -> fraction = prod[104:53], GRS = prod[52:50]|...
     // If prod[104]=1: leading 1 at bit 104 -> fraction = prod[103:52], GRS = prod[51:49]|...
@@ -78,18 +112,18 @@ module rv_fpu_mul_d (
         R         = 1'b0;
         S_bit     = 1'b0;
 
-        if (prod[105]) begin
-            norm_frac = prod[104:53];
-            G         = prod[52];
-            R         = prod[51];
-            S_bit     = |prod[50:0];
-            norm_exp  = exp_sum[13:0] + 14'd1;
+        if (prod_q[105]) begin
+            norm_frac = prod_q[104:53];
+            G         = prod_q[52];
+            R         = prod_q[51];
+            S_bit     = |prod_q[50:0];
+            norm_exp  = exp_sum_q[13:0] + 14'd1;
         end else begin
-            norm_frac = prod[103:52];
-            G         = prod[51];
-            R         = prod[50];
-            S_bit     = |prod[49:0];
-            norm_exp  = exp_sum[13:0];
+            norm_frac = prod_q[103:52];
+            G         = prod_q[51];
+            R         = prod_q[50];
+            S_bit     = |prod_q[49:0];
+            norm_exp  = exp_sum_q[13:0];
         end
     end
 
@@ -99,8 +133,8 @@ module rv_fpu_mul_d (
         case (rm)
             3'b000: round_up = G & (R | S_bit | norm_frac[0]);
             3'b001: round_up = 1'b0;
-            3'b010: round_up = (G | R | S_bit) & sr;
-            3'b011: round_up = (G | R | S_bit) & !sr;
+            3'b010: round_up = (G | R | S_bit) & sr_q;
+            3'b011: round_up = (G | R | S_bit) & !sr_q;
             3'b100: round_up = G;
             default: round_up = 1'b0;
         endcase
@@ -125,32 +159,32 @@ module rv_fpu_mul_d (
         result = 64'h0;
         fflags = 5'h0;
 
-        if (a_nan || b_nan) begin
+        if (a_nan_q || b_nan_q) begin
             result    = CANONICAL_NAN;
-            fflags[4] = a_snan | b_snan;
-        end else if ((a_inf && b_zero) || (b_inf && a_zero)) begin
+            fflags[4] = a_snan_q | b_snan_q;
+        end else if ((a_inf_q && b_zero_q) || (b_inf_q && a_zero_q)) begin
             result    = CANONICAL_NAN;
             fflags[4] = 1'b1;
-        end else if (a_inf || b_inf) begin
-            result = {sr, 11'h7FF, 52'h0};
-        end else if (a_zero || b_zero) begin
-            result = {sr, 63'h0};
+        end else if (a_inf_q || b_inf_q) begin
+            result = {sr_q, 11'h7FF, 52'h0};
+        end else if (a_zero_q || b_zero_q) begin
+            result = {sr_q, 63'h0};
         end else begin
             if ($signed(final_exp) >= 14'sd2047) begin
                 fflags[2] = 1'b1;
                 fflags[0] = 1'b1;
                 case (rm)
-                    3'b001: result = {sr, 11'h7FE, 52'hFFFFFFFFFFFFF};
-                    3'b010: result = sr ? {1'b1,11'h7FF,52'h0} : {1'b0,11'h7FE,52'hFFFFFFFFFFFFF};
-                    3'b011: result = sr ? {1'b1,11'h7FE,52'hFFFFFFFFFFFFF} : {1'b0,11'h7FF,52'h0};
-                    default: result = {sr, 11'h7FF, 52'h0};
+                    3'b001: result = {sr_q, 11'h7FE, 52'hFFFFFFFFFFFFF};
+                    3'b010: result = sr_q ? {1'b1,11'h7FF,52'h0} : {1'b0,11'h7FE,52'hFFFFFFFFFFFFF};
+                    3'b011: result = sr_q ? {1'b1,11'h7FE,52'hFFFFFFFFFFFFF} : {1'b0,11'h7FF,52'h0};
+                    default: result = {sr_q, 11'h7FF, 52'h0};
                 endcase
             end else if ($signed(final_exp) <= 14'sd0) begin
-                result    = {sr, 63'h0};
+                result    = {sr_q, 63'h0};
                 fflags[1] = 1'b1;
                 fflags[0] = 1'b1;
             end else begin
-                result    = {sr, final_exp[10:0], final_frac};
+                result    = {sr_q, final_exp[10:0], final_frac};
                 fflags[0] = G | R | S_bit;
             end
         end

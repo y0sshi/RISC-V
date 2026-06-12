@@ -98,7 +98,10 @@ module tb_rv_fpu_d;
         end
     endtask
 
-    // Single-cycle operation (combinational result)
+    // Combinational-class operation.  C-2c: every FP compute op (FADD/FMUL/FMADD
+    // family/FMISC/FCVT) is now multi-cycle (pipelined sub-units), so wait for the
+    // result_valid pulse before sampling -- the FMADD chain in particular is now
+    // captured at T+3, not the next cycle.
     task automatic run_op_comb(
         input fpu_op_t op,
         input logic    dbl,
@@ -120,6 +123,9 @@ module tb_rv_fpu_d;
         valid_in  = 1'b1;
         @(posedge clk); #1;
         valid_in = 1'b0;
+        // wait for result_valid (multi-cycle combinational-op handshake)
+        while (!result_valid) @(posedge clk);
+        #1;
     endtask
 
     // Multi-cycle operation: wait for result_valid
