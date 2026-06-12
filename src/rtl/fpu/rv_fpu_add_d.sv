@@ -16,7 +16,14 @@
 
 `default_nettype none
 
+// C-2c second step: 1-cycle PIPELINED adder (see rv_fpu_add.sv for the rationale).
+// A pipeline register at the post-add `sum` boundary splits the IEEE add into
+// stage 0 (extract/classify/align/add) and stage 1 (LZC/normalize/round/assemble).
+// `result`/`fflags` are valid 1 cycle after stable inputs; rv_fpu's 2-cycle
+// combinational-op handshake budgets for it.  Pure latency change, bit-identical.
 module rv_fpu_add_d (
+    input  wire         clk,
+    input  wire         rst_n,
     input  wire  [63:0] a,
     input  wire  [63:0] b,
     input  wire  [2:0]  rm,
@@ -121,36 +128,62 @@ module rv_fpu_add_d (
         else
             sum = {1'b0, sig_l} - {1'b0, sig_s_shifted};
         sum_sign = sl;
+    end
 
-        // ---- Leading-zero count of sum[55:3] (loop-based priority encoder) ----
+    // =========================================================================
+    // Pipeline register (stage 0 -> stage 1).  Free-running; rv_fpu's handshake
+    // captures the stage-1 result on the correct cycle (stale fills uncaptured).
+    // =========================================================================
+    logic [56:0] sum_q;
+    logic        sum_sign_q;
+    logic [11:0] el_q;
+    logic        sa_q, sb_q;
+    logic        a_nan_q, b_nan_q, a_snan_q, b_snan_q, a_inf_q, b_inf_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sum_q <= '0; sum_sign_q <= 1'b0; el_q <= '0;
+            sa_q <= 1'b0; sb_q <= 1'b0;
+            a_nan_q <= 1'b0; b_nan_q <= 1'b0; a_snan_q <= 1'b0;
+            b_snan_q <= 1'b0; a_inf_q <= 1'b0; b_inf_q <= 1'b0;
+        end else begin
+            sum_q <= sum; sum_sign_q <= sum_sign; el_q <= el;
+            sa_q <= sa; sb_q <= sb;
+            a_nan_q <= a_nan; b_nan_q <= b_nan; a_snan_q <= a_snan;
+            b_snan_q <= b_snan; a_inf_q <= a_inf; b_inf_q <= b_inf;
+        end
+    end
+
+    // ---- Stage 1: normalize / round / assemble (reads registered *_q) ----
+    always_comb begin
+        // ---- Leading-zero count of sum_q[55:3] (loop-based priority encoder) ----
         // Scan LSB->MSB so the last (highest) set bit wins; all-zero -> 53.
         lzc = 6'd53;
         for (int i = 0; i <= 52; i++)
-            if (sum[3 + i]) lzc = 6'(52 - i);   // sum[55]->0 ... sum[3]->52
+            if (sum_q[3 + i]) lzc = 6'(52 - i);   // sum_q[55]->0 ... sum_q[3]->52
 
         // ---- Normalize ----
-        norm_exp      = el;
-        norm_sig      = sum[55:0];
+        norm_exp      = el_q;
+        norm_sig      = sum_q[55:0];
         is_exact_zero = 1'b0;
         shift_amt     = 6'd0;
         lzc_ext       = {6'b0, lzc};
 
-        if (sum[56]) begin
+        if (sum_q[56]) begin
             // Overflow: shift right 1, increment exponent
-            norm_sig = {1'b0, sum[56:4], sum[3], sum[2], sum[1] | sum[0]};
-            norm_exp = el + 12'd1;
-        end else if (sum[55:0] == 56'h0) begin
+            norm_sig = {1'b0, sum_q[56:4], sum_q[3], sum_q[2], sum_q[1] | sum_q[0]};
+            norm_exp = el_q + 12'd1;
+        end else if (sum_q[55:0] == 56'h0) begin
             is_exact_zero = 1'b1;
-        end else if (!sum[55]) begin
-            // Compare against full el (not truncated el[5:0]); el can be 1024
-            if (lzc_ext >= el) begin
-                shift_amt = (el > 0) ? el[5:0] - 6'd1 : 6'd0;
+        end else if (!sum_q[55]) begin
+            // Compare against full el_q (not truncated el_q[5:0]); el_q can be 1024
+            if (lzc_ext >= el_q) begin
+                shift_amt = (el_q > 0) ? el_q[5:0] - 6'd1 : 6'd0;
                 norm_exp  = 12'd0;
             end else begin
                 shift_amt = lzc;
-                norm_exp  = el - lzc_ext;
+                norm_exp  = el_q - lzc_ext;
             end
-            norm_sig = sum[55:0] << shift_amt;
+            norm_sig = sum_q[55:0] << shift_amt;
         end
 
         // ---- Round ----
@@ -160,8 +193,8 @@ module rv_fpu_add_d (
         case (rm)
             3'b000: round_up = G & (R | S_bit | norm_sig[3]);
             3'b001: round_up = 1'b0;
-            3'b010: round_up = (G | R | S_bit) & sum_sign;
-            3'b011: round_up = (G | R | S_bit) & !sum_sign;
+            3'b010: round_up = (G | R | S_bit) & sum_sign_q;
+            3'b011: round_up = (G | R | S_bit) & !sum_sign_q;
             3'b100: round_up = G;
             default: round_up = 1'b0;
         endcase
@@ -180,16 +213,16 @@ module rv_fpu_add_d (
         result = 64'h0;
         fflags = 5'h0;
 
-        if (a_nan || b_nan) begin
+        if (a_nan_q || b_nan_q) begin
             result    = CANONICAL_NAN;
-            fflags[4] = a_snan | b_snan;
-        end else if (a_inf && b_inf && (sa != sb)) begin
+            fflags[4] = a_snan_q | b_snan_q;
+        end else if (a_inf_q && b_inf_q && (sa_q != sb_q)) begin
             result    = CANONICAL_NAN;
             fflags[4] = 1'b1;
-        end else if (a_inf) begin
-            result = {sa, 11'h7FF, 52'h0};
-        end else if (b_inf) begin
-            result = {sb, 11'h7FF, 52'h0};
+        end else if (a_inf_q) begin
+            result = {sa_q, 11'h7FF, 52'h0};
+        end else if (b_inf_q) begin
+            result = {sb_q, 11'h7FF, 52'h0};
         end else if (is_exact_zero) begin
             result = {(rm == 3'b010) ? 1'b1 : 1'b0, 63'h0};
         end else begin
@@ -197,17 +230,17 @@ module rv_fpu_add_d (
                 fflags[2] = 1'b1;
                 fflags[0] = 1'b1;
                 case (rm)
-                    3'b001: result = {sum_sign, 11'h7FE, 52'hFFFFFFFFFFFFF};
-                    3'b010: result = sum_sign ? {1'b1,11'h7FF,52'h0} : {1'b0,11'h7FE,52'hFFFFFFFFFFFFF};
-                    3'b011: result = sum_sign ? {1'b1,11'h7FE,52'hFFFFFFFFFFFFF} : {1'b0,11'h7FF,52'h0};
-                    default: result = {sum_sign, 11'h7FF, 52'h0};
+                    3'b001: result = {sum_sign_q, 11'h7FE, 52'hFFFFFFFFFFFFF};
+                    3'b010: result = sum_sign_q ? {1'b1,11'h7FF,52'h0} : {1'b0,11'h7FE,52'hFFFFFFFFFFFFF};
+                    3'b011: result = sum_sign_q ? {1'b1,11'h7FE,52'hFFFFFFFFFFFFF} : {1'b0,11'h7FF,52'h0};
+                    default: result = {sum_sign_q, 11'h7FF, 52'h0};
                 endcase
             end else if (final_exp == 0 && norm_exp == 0) begin
-                result    = {sum_sign, 11'h000, final_frac};
+                result    = {sum_sign_q, 11'h000, final_frac};
                 fflags[1] = (G | R | S_bit);
                 fflags[0] = (G | R | S_bit);
             end else begin
-                result    = {sum_sign, final_exp[10:0], final_frac};
+                result    = {sum_sign_q, final_exp[10:0], final_frac};
                 fflags[0] = G | R | S_bit;
             end
         end

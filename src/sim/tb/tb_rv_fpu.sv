@@ -108,6 +108,10 @@ module tb_rv_fpu;
         valid_in = 1'b1;
         @(posedge clk);
         valid_in = 1'b0;
+        // C-2c: every FP compute op is now multi-cycle (busy/result_valid
+        // handshake).  Wait for the result and drain the pipeline so the next
+        // op's wait_result does not see this op's leftover result_valid pulse.
+        wait_result(60);
         if (result_f[31:0] === exp_f && fflags === exp_flags) begin
             $display("  PASS: %s -> f=%h flags=%b", name, result_f[31:0], fflags);
             pass_cnt++;
@@ -140,6 +144,7 @@ module tb_rv_fpu;
         valid_in = 1'b1;
         @(posedge clk);
         valid_in = 1'b0;
+        wait_result(60);   // C-2c: multi-cycle handshake (see check_f)
         if (result_i[31:0] === exp_i && fflags === exp_flags) begin
             $display("  PASS: %s -> i=%h flags=%b", name, result_i[31:0], fflags);
             pass_cnt++;
@@ -167,6 +172,7 @@ module tb_rv_fpu;
         valid_in = 1'b1;
         @(posedge clk);
         valid_in = 1'b0;
+        wait_result(60);   // C-2c: multi-cycle handshake (see check_f)
         if (result_f[31:0] === exp_f) begin
             $display("  PASS: %s -> f=%h", name, result_f[31:0]);
             pass_cnt++;

@@ -177,6 +177,26 @@ module rv_core
         else        fpu_was_busy <= fpu_busy_int;
     end
 
+    // fpu_done: an FP op produced its result but could not retire on its
+    // completion cycle because stall_ex was held by an UNRELATED source (e.g.
+    // ~imem_ready from an in-flight IF fetch).  Exactly mirrors muldiv_done
+    // (see below): fpu_was_busy masks only ONE cycle, so without this a
+    // completed FP op would RE-FIRE fpu_valid_in the next cycle and restart.
+    // Idempotent (same operands -> same result), but a deterministically
+    // recurring stall at completion would restart forever = LIVELOCK.  Now that
+    // ALL FP compute ops are multi-cycle (C-2c), not just the rare FDIV/FSQRT,
+    // this guard is load-bearing.  Strict no-op when an FP op always completes
+    // with stall_ex=0 (BRAM: ~imem_ready never asserts).
+    logic fpu_done;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            fpu_done <= 1'b0;
+        else if (fpu_was_busy && !fpu_busy_int && stall_ex)
+            fpu_done <= 1'b1;   // completed this cycle but held in EX
+        else if (!stall_ex)
+            fpu_done <= 1'b0;   // EX advances -> the FP op retires/leaves
+    end
+
     // fpu_start_stall: stall IF/ID for the one cycle when FDIV/FSQRT first enters EX.
     // Declared here (before stall assigns); driven after fpu_valid_in assignment below.
     // Without this, the instruction after FDIV advances into ID/EX on the same cycle
@@ -808,11 +828,14 @@ module rv_core
                           && !id_ex_ctrl.fp_load
                           && !id_ex_ctrl.fp_store
                           && !fpu_busy_int
-                          && !fpu_was_busy;
+                          && !fpu_was_busy
+                          && !fpu_done;
 
-    assign fpu_start_stall = fpu_valid_in
-                             && (id_ex_ctrl.fpu_op == FPU_DIV ||
-                                 id_ex_ctrl.fpu_op == FPU_SQRT);
+    // Every FP compute op is now multi-cycle (C-2c: FDIV/FSQRT plus the newly
+    // pipelined combinational ops all assert fpu_busy), so the start-cycle stall
+    // that holds the op in ID/EX (busy is still low this cycle, rising on the
+    // next edge) applies to all of them -- no longer just FDIV/FSQRT.
+    assign fpu_start_stall = fpu_valid_in;
 
     rv_fpu #(.XLEN(XLEN)) u_fpu (
         .clk         (clk),
@@ -1330,14 +1353,12 @@ module rv_core
             ex_mem_pc4        <= id_ex_pc + (id_ex_ctrl.is_compressed ? XLEN'(2) : XLEN'(4));
             ex_mem_funct3     <= id_ex_funct3;
             ex_mem_csr_fwd    <= csr_rdata_ex;
-            // Insert a bubble on the start cycle of a multi-cycle op (FDIV/FSQRT
-            // or an integer divide): stall_ex is still 0 here (busy goes high next
-            // edge) and the result is not yet ready, so EX/MEM must not capture a
-            // valid instruction.  The op is held in ID/EX by *_start_stall and is
-            // captured for real on the cycle busy drops.
-            ex_mem_valid      <= id_ex_valid && !(fpu_valid_in &&
-                                     (id_ex_ctrl.fpu_op == FPU_DIV ||
-                                      id_ex_ctrl.fpu_op == FPU_SQRT))
+            // Insert a bubble on the start cycle of a multi-cycle op (any FP
+            // compute op now -- C-2c -- or an integer divide): stall_ex is still 0
+            // here (busy goes high next edge) and the result is not yet ready, so
+            // EX/MEM must not capture a valid instruction.  The op is held in ID/EX
+            // by *_start_stall and is captured for real on the cycle busy drops.
+            ex_mem_valid      <= id_ex_valid && !fpu_start_stall
                                  && !muldiv_start_stall;
             // Only capture FPU result for actual compute ops (not FLW/FLD/FSW/FSD).
             ex_mem_fpu_result_f     <= (id_ex_ctrl.is_fp && !id_ex_ctrl.fp_load

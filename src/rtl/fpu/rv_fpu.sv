@@ -84,6 +84,12 @@ module rv_fpu
     logic [31:0] mul_result;
     logic [4:0]  mul_fflags;
 
+    // FMADD pipeline register (C-2c): the S-precision multiply product is
+    // registered so the FMADD multiply lands in pipeline stage 0 and the add
+    // (u_fma_add) in stage 1, splitting the long serial mul->add->round path.
+    logic [31:0] mul_result_q;
+    logic [4:0]  mul_fflags_q;
+
     // FDIV
     logic [31:0] div_result;
     logic [4:0]  div_fflags;
@@ -115,6 +121,8 @@ module rv_fpu
     assign add_d_is_sub = (fpu_op == FPU_SUB);
 
     rv_fpu_add u_add (
+        .clk    (clk),
+        .rst_n  (rst_n),
         .a      (fa_s),
         .b      (fb_s),
         .rm     (rm),
@@ -131,17 +139,21 @@ module rv_fpu
         .fflags (mul_fflags)
     );
 
+    // FMADD add reads the REGISTERED product (mul_result_q) so the multiply and
+    // the add+round execute in separate pipeline stages (C-2c).
     always @(*) begin
         case (fpu_op)
-            FPU_MADD:  begin fma_add_a = mul_result;                          fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
-            FPU_MSUB:  begin fma_add_a = mul_result;                          fma_add_b = fc_s; fma_add_is_sub = 1'b1; end
-            FPU_NMSUB: begin fma_add_a = {!mul_result[31], mul_result[30:0]}; fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
-            FPU_NMADD: begin fma_add_a = {!mul_result[31], mul_result[30:0]}; fma_add_b = fc_s; fma_add_is_sub = 1'b1; end
-            default:   begin fma_add_a = mul_result;                          fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
+            FPU_MADD:  begin fma_add_a = mul_result_q;                            fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
+            FPU_MSUB:  begin fma_add_a = mul_result_q;                            fma_add_b = fc_s; fma_add_is_sub = 1'b1; end
+            FPU_NMSUB: begin fma_add_a = {!mul_result_q[31], mul_result_q[30:0]}; fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
+            FPU_NMADD: begin fma_add_a = {!mul_result_q[31], mul_result_q[30:0]}; fma_add_b = fc_s; fma_add_is_sub = 1'b1; end
+            default:   begin fma_add_a = mul_result_q;                            fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
         endcase
     end
 
     rv_fpu_add u_fma_add (
+        .clk    (clk),
+        .rst_n  (rst_n),
         .a      (fma_add_a),
         .b      (fma_add_b),
         .rm     (rm),
@@ -199,6 +211,11 @@ module rv_fpu
     logic [63:0] mul_d_result;
     logic [4:0]  mul_d_fflags;
 
+    // FMADD.D pipeline register (C-2c): D-precision multiply product, see the
+    // S-precision mul_result_q note above.
+    logic [63:0] mul_d_result_q;
+    logic [4:0]  mul_d_fflags_q;
+
     // FDIV.D
     logic [63:0] div_d_result;
     logic [4:0]  div_d_fflags;
@@ -225,6 +242,8 @@ module rv_fpu
     logic [4:0]  fma_d_add_fflags;
 
     rv_fpu_add_d u_add_d (
+        .clk    (clk),
+        .rst_n  (rst_n),
         .a      (fa),
         .b      (fb),
         .rm     (rm),
@@ -241,17 +260,20 @@ module rv_fpu
         .fflags (mul_d_fflags)
     );
 
+    // FMADD.D add reads the REGISTERED product (mul_d_result_q), see S-prec note.
     always @(*) begin
         case (fpu_op)
-            FPU_MADD:  begin fma_d_add_a = mul_d_result;                            fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
-            FPU_MSUB:  begin fma_d_add_a = mul_d_result;                            fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end
-            FPU_NMSUB: begin fma_d_add_a = {!mul_d_result[63], mul_d_result[62:0]}; fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
-            FPU_NMADD: begin fma_d_add_a = {!mul_d_result[63], mul_d_result[62:0]}; fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end
-            default:   begin fma_d_add_a = mul_d_result;                            fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
+            FPU_MADD:  begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
+            FPU_MSUB:  begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end
+            FPU_NMSUB: begin fma_d_add_a = {!mul_d_result_q[63], mul_d_result_q[62:0]}; fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
+            FPU_NMADD: begin fma_d_add_a = {!mul_d_result_q[63], mul_d_result_q[62:0]}; fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end
+            default:   begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
         endcase
     end
 
     rv_fpu_add_d u_fma_add_d (
+        .clk    (clk),
+        .rst_n  (rst_n),
         .a      (fma_d_add_a),
         .b      (fma_d_add_b),
         .rm     (rm),
@@ -298,12 +320,65 @@ module rv_fpu
     );
 
     // =========================================================================
+    // Combinational-op pipeline (C-2c, 2-stage)
+    //
+    // FADD/FSUB, FMUL, the FMADD family, and the misc ops (FSGNJ/FMINMAX/FCMP/
+    // FCLASS/FMV/FCVT) were a single-cycle combinational path whose IEEE
+    // significand align/normalize/round -- and for FMADD a serial multiply->add
+    // -- dominated the FPGA critical path (WNS -54 ns; all top failing paths end
+    // in this FPU).  Give every such op a fixed extra-cycle latency so a pipeline
+    // register can split the path: the FMADD product is registered above
+    // (mul_result_q / mul_d_result_q), placing the multiply in stage 0 and the
+    // add+round in stage 1.  The busy / start-stall / done handshake MIRRORS the
+    // FDIV/FSQRT (and integer-divide) protocol, so rv_core stalls EX while the
+    // op is in flight and captures the result on the cycle busy drops.
+    //
+    // This is a LATENCY-only change (results stay bit-identical); it is NOT a
+    // no-op (combinational ops now occupy EX for extra cycles), validated by
+    // result equivalence.  Mutually exclusive with FDIV/FSQRT (their own units).
+    //
+    // Timeline (start cycle T): T raises busy on the next edge (NBA) and latches
+    // the product; T+1 holds busy=1 (EX stalled, add executes from the registered
+    // product); T+2 busy drops -> rv_core captures result_f/fflags, comb_done
+    // pulses once for the fflags accumulate.  Operands are frozen in ID/EX across
+    // the stall, so the non-FMADD result mux (combinational from fa/fb) is stable.
+    logic comb_op_in;
+    assign comb_op_in = valid_in && (fpu_op != FPU_DIV) && (fpu_op != FPU_SQRT);
+
+    logic comb_busy, comb_busy_q, comb_done;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            comb_busy      <= 1'b0;
+            comb_busy_q    <= 1'b0;
+            mul_result_q   <= '0;
+            mul_fflags_q   <= '0;
+            mul_d_result_q <= '0;
+            mul_d_fflags_q <= '0;
+        end else begin
+            comb_busy_q <= comb_busy;
+            if (comb_op_in && !comb_busy) begin
+                // Start cycle: latch the FMADD product, raise busy on next edge.
+                comb_busy      <= 1'b1;
+                mul_result_q   <= mul_result;
+                mul_fflags_q   <= mul_fflags;
+                mul_d_result_q <= mul_d_result;
+                mul_d_fflags_q <= mul_d_fflags;
+            end else begin
+                comb_busy <= 1'b0;  // single busy cycle
+            end
+        end
+    end
+    // Result ready / capture cycle: busy was high last cycle and is now low.
+    assign comb_done = comb_busy_q && !comb_busy;
+
+    // =========================================================================
     // Output mux
     // =========================================================================
-    assign fpu_busy     = div_busy | sqrt_busy | div_d_busy | sqrt_d_busy;
+    assign fpu_busy     = div_busy | sqrt_busy | div_d_busy | sqrt_d_busy |
+                          comb_busy;
     assign result_valid = div_result_valid | sqrt_result_valid |
                           div_d_result_valid | sqrt_d_result_valid |
-                          (valid_in && fpu_op != FPU_DIV && fpu_op != FPU_SQRT);
+                          comb_done;
 
     // Single-precision result/flags mux
     logic [31:0] sp_result_f;
@@ -322,7 +397,7 @@ module rv_fpu
             FPU_SQRT:         begin sp_result_f = sqrt_result; sp_fflags = sqrt_fflags; end
             FPU_MADD, FPU_MSUB, FPU_NMSUB, FPU_NMADD: begin
                 sp_result_f = fma_add_result;
-                sp_fflags   = mul_fflags | fma_add_fflags;
+                sp_fflags   = mul_fflags_q | fma_add_fflags;
             end
             FPU_SGNJ, FPU_MINMAX: begin
                 sp_result_f = misc_result_f;
@@ -380,7 +455,7 @@ module rv_fpu
                 end
                 FPU_MADD, FPU_MSUB, FPU_NMSUB, FPU_NMADD: begin
                     result_f = fma_d_add_result;
-                    fflags   = mul_d_fflags | fma_d_add_fflags;
+                    fflags   = mul_d_fflags_q | fma_d_add_fflags;
                 end
                 FPU_SGNJ, FPU_MINMAX: begin
                     result_f = misc_d_result_f;
