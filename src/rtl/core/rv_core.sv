@@ -146,8 +146,12 @@ module rv_core
     logic [XLEN-1:0] trap_vector; // mtvec — used on trap_enter
     logic [XLEN-1:0] mepc_out;    // mepc  — used on mret_en
 
-    logic stall_if;      // freeze PC and IF/ID register
-    logic stall_id;      // freeze IF/ID register
+    // stall_if/stall_id fan out to the whole front-end (~200 loads each) and sit
+    // mid-way on the worst timing path (dmem_wait -> stall_if -> imem_addr mux ->
+    // I-side translation -> I$ read-enable).  max_fanout lets synthesis replicate
+    // the driver to bound each copy's load; pure physical hint, functional no-op.
+    (* max_fanout = 64 *) logic stall_if;      // freeze PC and IF/ID register
+    (* max_fanout = 64 *) logic stall_id;      // freeze IF/ID register
     logic stall_ex;      // freeze EX/MEM register (AMO 2-phase stall)
     logic flush_id;      // clear IF/ID   -> insert bubble into ID
     logic flush_ex;      // clear ID/EX   -> insert bubble into EX

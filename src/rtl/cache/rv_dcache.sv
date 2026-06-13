@@ -105,6 +105,13 @@ module rv_dcache #(
     logic [XLEN-1:0]    data  [0:DEPTH-1];
 
     // ---- Address decode (current request) -----------------------------------
+    // The set index is the LSBs of the translated physical data address
+    // (mmu_dmem_pa).  In RV64 it drove ~880 loads (valid[idx]/tagm[idx] 64:1
+    // muxes + the BRAM word address), which Vivado synthesis flagged as the
+    // single highest-fanout net on the worst timing path.  max_fanout lets the
+    // tool replicate the index buffer so each copy drives a bounded subset --
+    // a pure physical hint, functionally a no-op (ignored by iverilog/Verilator).
+    (* max_fanout = 64 *)
     wire [IDXW-1:0]  idx  = c_addr[OFFW +: IDXW];
     wire [TAGW-1:0]  tg   = c_addr[OFFW+IDXW +: TAGW];
     wire [WIDXW-1:0] wsel = c_addr[BYTEW +: WIDXW];
