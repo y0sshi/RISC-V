@@ -16,12 +16,24 @@
 ///     freezes IF on @c ~imem_ready), after which the held address re-looks-up
 ///     and hits.
 ///
+/// Storage: the line data array is a true **synchronous-read block RAM** so it
+/// maps to Xilinx RAMB36/RAMB18 rather than LUTRAM / fabric flip-flops.  The
+/// registered read output (@c line_q) is clocked with the SAME enable the fetch
+/// address register (@c addr_q) uses, so @c line_q tracks @c addr_q in lockstep:
+/// in the serve cycle @c line_q == line[set(addr_q)], identical to the previous
+/// combinational read.  Tag/valid stay in fabric (small, combinational lookup).
+/// After a line fill the requested word cannot be read out of the BRAM on the
+/// same cycle its last beat is written, so a one-cycle SETTLE state (@c S_FILL2)
+/// re-reads the freshly filled line before the held address re-looks-up; this
+/// adds a single MISS cycle and leaves the hit path untouched.
+///
 /// Variable-length (RVC) fetch: @c fetch_pc may be 2-byte aligned, so the 32-bit
 /// window can span two 32-bit words.  Within a line the window is extracted with
-/// a byte-granular part-select of the packed line.  The single offset whose
-/// window would cross the LINE boundary (@c byte_off == LINE_BYTES-2) is served
-/// UNCACHED via a direct single-beat read (rare; preserves the byte-addressable
-/// fetch the AXI path already supported, without a two-line buffer).
+/// a byte-granular part-select of the registered line read.  The single offset
+/// whose window would cross the LINE boundary (@c byte_off == LINE_BYTES-2) is
+/// served UNCACHED via a direct single-beat read (rare; preserves the
+/// byte-addressable fetch the AXI path already supported, without a two-line
+/// buffer).
 ///
 /// @c flush (FENCE.I) invalidates the whole cache so self-modified / newly loaded
 /// code is re-fetched from memory.
@@ -70,13 +82,17 @@ module rv_icache #(
     // ---- Geometry -----------------------------------------------------------
     localparam int OFFW  = $clog2(LINE_BYTES);        // byte-within-line bits
     localparam int WORDS = LINE_BYTES / 4;            // 32-bit words per line
+    localparam int WIDXW = $clog2(WORDS);             // word-within-line bits
     localparam int IDXW  = $clog2(SETS);              // set index bits
     localparam int TAGW  = XLEN - OFFW - IDXW;        // tag bits
     localparam int LINEW = LINE_BYTES * 8;            // packed line width
 
-    // ---- Storage ------------------------------------------------------------
+    // ---- Tag / valid (fabric, combinational lookup) -------------------------
     logic [SETS-1:0]    valid;
     logic [TAGW-1:0]    tagm  [0:SETS-1];
+
+    // ---- Line data: synchronous-read block RAM (one R port + one W port) -----
+    (* ram_style = "block" *)
     logic [LINEW-1:0]   line  [0:SETS-1];
 
     // ---- Registered fetch address (1-cycle, BRAM-equivalent) ----------------
@@ -95,16 +111,57 @@ module rv_icache #(
     wire             straddle = (boff == OFFW'(LINE_BYTES-2));
     wire [XLEN-1:0]  line_base = {addr_q[XLEN-1:OFFW], {OFFW{1'b0}}};
 
-    // Combinational 32-bit window extract from the packed line (within a line)
-    wire [31:0]      window = line[idx][boff*8 +: 32];
-
     // ---- FSM ----------------------------------------------------------------
-    typedef enum logic [1:0] { S_LOOKUP, S_FILL, S_BYPASS } state_t;
+    typedef enum logic [1:0] { S_LOOKUP, S_FILL, S_FILL2, S_BYPASS } state_t;
     state_t state;
 
     logic [IDXW-1:0] fill_idx;
     logic [TAGW-1:0] fill_tag;
     logic [XLEN-1:0] fill_base;
+
+    // ---- Fetch-address register enable --------------------------------------
+    // addr_q advances when this fetch completes (c_ready), when a request is
+    // (re)presented after an idle gap (resume priming), or when a fill/bypass
+    // completes with a request still presented (mid-flight translation re-arm).
+    wire addr_q_en = c_ready
+                   || (state == S_LOOKUP && c_req && !req_q)
+                   || ((state == S_FILL || state == S_BYPASS) && m_done && c_req);
+
+    // ---- BRAM read port (registered output = line_q) ------------------------
+    // Hit path: clocked with addr_q_en reading set(c_addr) -- the line being
+    // latched into addr_q -- so line_q tracks addr_q in lockstep.  Settle path
+    // (S_FILL2): re-read set(addr_q) after a fill, when the written line is
+    // readable and addr_q already holds the (re-armed) fill address.
+    logic [IDXW-1:0]  rd_set;
+    logic             rd_en;
+    logic [LINEW-1:0] line_q;
+
+    always_comb begin
+        if (state == S_FILL2) begin
+            rd_en  = 1'b1;
+            rd_set = idx;                       // = addr_q set
+        end else begin
+            rd_en  = addr_q_en;
+            rd_set = c_addr[OFFW +: IDXW];      // set being latched into addr_q
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (rd_en) line_q <= line[rd_set];
+    end
+
+    // Combinational 32-bit window extract from the registered line read
+    wire [31:0] window = line_q[boff*8 +: 32];
+
+    // ---- BRAM write port (line fill beats) ----------------------------------
+    integer w;
+    always_ff @(posedge clk) begin
+        if (state == S_FILL && m_rvalid) begin
+            for (w = 0; w < WORDS; w = w + 1)
+                if (m_rbeat[WIDXW-1:0] == w[WIDXW-1:0])
+                    line[fill_idx][w*32 +: 32] <= m_rdata;
+        end
+    end
 
     // ---- Outputs (combinational) --------------------------------------------
     always_comb begin
@@ -128,7 +185,7 @@ module rv_icache #(
                 c_ready = m_done & req_q & (addr_q == c_addr_q);
                 c_rdata = m_rdata;         // byte-exact window from memory
             end
-            default: begin                 // S_FILL
+            default: begin                 // S_FILL / S_FILL2
                 c_ready = 1'b0;
                 c_rdata = window;
             end
@@ -146,7 +203,7 @@ module rv_icache #(
         endcase
     end
 
-    // ---- Sequential ---------------------------------------------------------
+    // ---- Sequential (FSM / tag / valid / addr / counters) -------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state    <= S_LOOKUP;
@@ -191,8 +248,7 @@ module rv_icache #(
             // bare/M-mode run; any VM fetch without an in-flight translation
             // change) c_addr == addr_q here, so this writes the same value back
             // -- a structural no-op.
-            if (c_ready || (state == S_LOOKUP && c_req && !req_q)
-                || ((state == S_FILL || state == S_BYPASS) && m_done && c_req))
+            if (addr_q_en)
                 addr_q <= c_addr;
             req_q    <= c_req;
             c_addr_q <= c_addr;
@@ -219,14 +275,20 @@ module rv_icache #(
                 end
 
                 S_FILL: begin
-                    if (m_rvalid)
-                        line[fill_idx][m_rbeat[$clog2(WORDS)-1:0]*32 +: 32] <= m_rdata;
+                    // Beats stream into the BRAM write port (above).
                     if (m_done) begin
                         // FENCE.I during a fill must not validate a stale line.
                         valid[fill_idx] <= ~flush;
                         tagm[fill_idx]  <= fill_tag;
-                        state           <= S_LOOKUP;
+                        state           <= S_FILL2;   // settle: re-read filled line
                     end
+                end
+
+                S_FILL2: begin
+                    // BRAM read of the freshly filled line is issued this cycle
+                    // (rd_en/rd_set above); line_q is valid next cycle, when the
+                    // held address re-looks-up in S_LOOKUP and hits.
+                    state <= S_LOOKUP;
                 end
 
                 S_BYPASS: begin

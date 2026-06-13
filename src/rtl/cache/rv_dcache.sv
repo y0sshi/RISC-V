@@ -8,18 +8,26 @@
 /// this module (handled in @ref rv_soc) -- only cacheable DDR loads/stores reach
 /// the cache.
 ///
-/// Design (first, provably-correct version):
+/// Design (BRAM-backed data array):
 ///   - **Direct-mapped**, parameterized SETS x LINE_BYTES.
-///   - **Combinational tag/data lookup** (LUTRAM-style arrays) so a HIT is
-///     resolved in the access cycle: a load HIT presents data the next cycle
-///     (BRAM-identical 1-cycle latency, @c c_wait stays low); a MISS asserts
-///     @c c_wait while a whole line is fetched in one AXI burst, then the held
-///     access re-looks-up and hits.
+///   - The DATA array is a true **synchronous-read block RAM** (one read port +
+///     one byte-write port) so it maps to Xilinx RAMB36/RAMB18 instead of LUTRAM
+///     / fabric flip-flops.  Tag/valid stay in fabric (small, combinational
+///     lookup).
+///   - **Load HIT**: tag/valid are checked combinationally in the access cycle;
+///     @c c_wait stays low and the BRAM read register presents the word the NEXT
+///     cycle (BRAM-identical 1-cycle latency).
+///   - **Load MISS**: @c c_wait is held while a whole line is fetched in one AXI
+///     burst, then a one-cycle RE-LOOKUP reads the requested word out of the BRAM
+///     (the write port cannot be read on the same cycle it is written, so the
+///     read is deferred one cycle past the fill -- a single extra MISS cycle; the
+///     hit path is unaffected).
 ///   - **Write-through, write-no-allocate**: every store is forwarded to memory
 ///     (single-beat AXI write) and, IF the line is currently cached, the cached
-///     word is updated in place (keeps cache == memory).  A store that misses
-///     does NOT allocate.  Memory therefore always holds the latest value, so the
-///     cache is always coherent with it (single hart).
+///     word is updated in place via the BRAM byte-write port (keeps cache ==
+///     memory).  A store that misses does NOT allocate.  Memory therefore always
+///     holds the latest value, so the cache is always coherent with it (single
+///     hart).
 ///
 /// The cache is transparent to AMO / LR-SC and misaligned 2-phase accesses: the
 /// core decomposes those into ordinary word loads/stores at this interface, each
@@ -29,9 +37,9 @@
 ///   - @c c_wait rises combinationally the cycle a miss/store is presented and
 ///     drops on the completion cycle; the core freezes the access in MEM while
 ///     @c c_wait is high (drives this onto @c dmem_wait).
-///   - @c c_rdata is REGISTERED and held until the next load completes, so the WB
-///     stage (which samples one cycle after the access) and the misaligned
-///     phase-0 capture both see stable data.
+///   - @c c_rdata is the REGISTERED BRAM read output, held until the next load
+///     completes, so the WB stage (which samples one cycle after the access) and
+///     the misaligned phase-0 capture both see stable data.
 ///
 /// @param XLEN       Data path width (32 or 64).
 /// @param LINE_BYTES Cache line size in bytes (power of two, >= 2*(XLEN/8)).
@@ -85,11 +93,16 @@ module rv_dcache #(
     localparam int WIDXW = $clog2(WORDS);             // word-within-line bits
     localparam int IDXW  = $clog2(SETS);              // set index bits
     localparam int TAGW  = XLEN - OFFW - IDXW;        // tag bits
+    localparam int DEPTH = SETS * WORDS;              // BRAM depth (one word/entry)
+    localparam int AW    = IDXW + WIDXW;              // BRAM address width
 
-    // ---- Storage (combinational read) ---------------------------------------
+    // ---- Tag / valid (fabric, combinational lookup) -------------------------
     logic [SETS-1:0]    valid;
     logic [TAGW-1:0]    tagm  [0:SETS-1];
-    logic [XLEN-1:0]    data  [0:SETS-1][0:WORDS-1];
+
+    // ---- Data array: synchronous-read block RAM (one R port + one W port) ----
+    (* ram_style = "block" *)
+    logic [XLEN-1:0]    data  [0:DEPTH-1];
 
     // ---- Address decode (current request) -----------------------------------
     wire [IDXW-1:0]  idx  = c_addr[OFFW +: IDXW];
@@ -99,7 +112,7 @@ module rv_dcache #(
     wire [XLEN-1:0]  line_base = {c_addr[XLEN-1:OFFW], {OFFW{1'b0}}};
 
     // ---- FSM ----------------------------------------------------------------
-    typedef enum logic [1:0] { S_LOOKUP, S_FILL, S_WRITE } state_t;
+    typedef enum logic [1:0] { S_LOOKUP, S_FILL, S_RELOOKUP, S_WRITE } state_t;
     state_t state;
 
     // Latched miss/store context
@@ -114,16 +127,17 @@ module rv_dcache #(
     logic [XLEN-1:0]   st_wdata;
     logic [XLEN/8-1:0] st_wstrb;
 
-    logic [XLEN-1:0]   rdata_q;
-    assign c_rdata = rdata_q;
-
     // ---- c_wait (combinational) ---------------------------------------------
+    // A load HIT keeps c_wait low (1-cycle BRAM read).  A store or load MISS
+    // raises it until the access (and, for a load miss, the post-fill re-lookup)
+    // completes.
     always_comb begin
         unique case (state)
-            S_LOOKUP: c_wait = c_req & (c_we | ~hit);  // store, or load miss
-            S_FILL:   c_wait = ~m_done;                // drop on the line-fill completion
-            S_WRITE:  c_wait = ~m_done;                // drop on the write response
-            default:  c_wait = 1'b0;
+            S_LOOKUP:   c_wait = c_req & (c_we | ~hit);  // store, or load miss
+            S_FILL:     c_wait = 1'b1;                   // held; re-lookup ends it
+            S_RELOOKUP: c_wait = 1'b0;                   // requested word read this cycle
+            S_WRITE:    c_wait = ~m_done;                // drop on the write response
+            default:    c_wait = 1'b0;
         endcase
     end
 
@@ -147,12 +161,69 @@ module rv_dcache #(
         endcase
     end
 
-    // ---- Sequential ---------------------------------------------------------
-    integer w, b;
+    // ---- BRAM read port (registered output = c_rdata) -----------------------
+    // Read on a load HIT (in the access cycle) or on the post-fill RE-LOOKUP.
+    // The address is the live request word for a hit, or the filled word for the
+    // re-lookup.  rdata_q is the BRAM output register; held when not enabled, so
+    // it satisfies the "data stable until the next load completes" contract.
+    logic            rd_en;
+    logic [AW-1:0]   rd_addr;
+    logic [XLEN-1:0] rdata_q;
+
+    always_comb begin
+        if (state == S_RELOOKUP) begin
+            rd_en   = 1'b1;
+            rd_addr = {fill_idx, fill_wsel};
+        end else begin
+            rd_en   = (state == S_LOOKUP) & c_req & ~c_we & hit;
+            rd_addr = {idx, wsel};
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (rd_en) rdata_q <= data[rd_addr];
+    end
+    assign c_rdata = rdata_q;
+
+    // ---- BRAM write port (line fill beats + write-through hit updates) -------
+    // Mutually exclusive in time: fill beats arrive only in S_FILL; a store
+    // update commits only on the S_WRITE completion cycle.
+    logic              wr_en;
+    logic [AW-1:0]     wr_addr;
+    logic [XLEN-1:0]   wr_data;
+    logic [XLEN/8-1:0] wr_be;
+
+    always_comb begin
+        wr_en   = 1'b0;
+        wr_addr = {fill_idx, fill_wsel};
+        wr_data = m_rdata;
+        wr_be   = '1;
+        if (state == S_FILL && m_rvalid) begin
+            wr_en   = 1'b1;
+            wr_addr = {fill_idx, m_rbeat[WIDXW-1:0]};
+            wr_data = m_rdata;
+            wr_be   = '1;                         // full word per beat
+        end else if (state == S_WRITE && m_done && st_hit) begin
+            wr_en   = 1'b1;
+            wr_addr = {st_idx, st_wsel};
+            wr_data = st_wdata;
+            wr_be   = st_wstrb;                   // byte-enabled store update
+        end
+    end
+
+    integer b;
+    always_ff @(posedge clk) begin
+        if (wr_en) begin
+            for (b = 0; b < XLEN/8; b = b + 1)
+                if (wr_be[b])
+                    data[wr_addr][b*8 +: 8] <= wr_data[b*8 +: 8];
+        end
+    end
+
+    // ---- FSM / tag / valid / counters (fabric) ------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state    <= S_LOOKUP;
-            rdata_q  <= '0;
             hit_cnt  <= '0;
             miss_cnt <= '0;
             fill_idx <= '0; fill_tag <= '0; fill_base <= '0; fill_wsel <= '0;
@@ -165,8 +236,7 @@ module rv_dcache #(
                     if (c_req && !c_we) begin
                         // Load
                         if (hit) begin
-                            rdata_q <= data[idx][wsel];
-                            hit_cnt <= hit_cnt + 32'd1;
+                            hit_cnt <= hit_cnt + 32'd1;  // word read by BRAM port
                         end else begin
                             // Miss: start a line fill
                             fill_idx  <= idx;
@@ -191,28 +261,26 @@ module rv_dcache #(
                 end
 
                 S_FILL: begin
-                    if (m_rvalid) begin
-                        data[fill_idx][m_rbeat[WIDXW-1:0]] <= m_rdata;
-                        // Capture the requested word as its beat streams by, so the
-                        // load result is ready when the fill completes (no re-lookup).
-                        if (m_rbeat[WIDXW-1:0] == fill_wsel)
-                            rdata_q <= m_rdata;
-                    end
+                    // Beats stream into the BRAM write port (above).  On the
+                    // completion cycle the line is valid; defer the load result to
+                    // a one-cycle re-lookup (the just-written word cannot be read
+                    // out of the same BRAM on the cycle it is written).
                     if (m_done) begin
                         valid[fill_idx] <= 1'b1;
                         tagm[fill_idx]  <= fill_tag;
-                        state           <= S_LOOKUP;
+                        state           <= S_RELOOKUP;
                     end
+                end
+
+                S_RELOOKUP: begin
+                    // BRAM read of {fill_idx,fill_wsel} is issued this cycle; the
+                    // word lands in rdata_q next cycle.  c_wait is already low.
+                    state <= S_LOOKUP;
                 end
 
                 S_WRITE: begin
                     if (m_done) begin
-                        // Update cached word on a write-through hit
-                        if (st_hit) begin
-                            for (b = 0; b < XLEN/8; b = b + 1)
-                                if (st_wstrb[b])
-                                    data[st_idx][st_wsel][b*8 +: 8] <= st_wdata[b*8 +: 8];
-                        end
+                        // Cached word is updated by the BRAM write port (above).
                         state <= S_LOOKUP;
                     end
                 end

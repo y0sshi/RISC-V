@@ -59,6 +59,17 @@ the fetch address is registered (`addr_q`) so the lookup result corresponds to
 -> `c_ready=1` with the window combinationally; MISS -> `c_ready=0` while a line
 is fetched in one AXI burst, after which the held address re-looks-up and hits.
 
+- **BRAM-backed line array (C-2b, 2026-06-14)**: the line data array is a true
+  synchronous-read block RAM (`(* ram_style="block" *)`), read into a registered
+  output `line_q` whose clock-enable matches the `addr_q` update enable, so
+  `line_q` tracks `addr_q` in lockstep (= `line[set(addr_q)]` in the serve cycle,
+  bit-identical to the old combinational read). The window is a part-select of
+  `line_q`. After a fill the freshly written line cannot be read out of the BRAM
+  on the same cycle, so a one-cycle settle state (`S_FILL2`) re-reads it before
+  the held address re-looks-up (+1 MISS cycle; hit path unchanged). Tag/valid stay
+  in fabric. This moves ~20k FF + the address-control LUTs out of fabric into 4
+  RAMB36; the `addr_q` hold/re-arm semantics (bug #5 stale-PA fix) are unchanged.
+
 - **RVC variable-length fetch**: `fetch_pc` may be 2-byte aligned, so the 32-bit
   window can span two 32-bit words. Within a line the window is extracted with a
   byte-granular part-select of the packed line (`line[idx][boff*8 +: 32]`). The
@@ -70,14 +81,18 @@ is fetched in one AXI burst, after which the held address re-looks-up and hits.
   is re-fetched.
 
 ### `src/rtl/cache/rv_dcache.sv` (write-through, write-no-allocate)
-Direct-mapped, parameterized. **Combinational tag/data lookup** so a hit is
-resolved in the access cycle.
+Direct-mapped, parameterized. **Combinational tag lookup** so a hit/miss is
+resolved (and `c_wait` driven) in the access cycle; the **data array is a
+synchronous-read block RAM** (C-2b, 2026-06-14) -- the 2-D `data[SETS][WORDS]` is
+flattened to a 1-D byte-write BRAM `data[SETS*WORDS]` (`(* ram_style="block" *)`,
+one RAMB36) addressed by `{set,word}`. Tag/valid stay in fabric.
 
-- **Load HIT**: `c_wait` stays low; data is registered and presented the next
-  cycle (BRAM-identical 1-cycle latency).
-- **Load MISS**: `c_wait` high while a whole line is fetched in one AXI burst; the
-  requested word is captured as its beat streams by, so the result is ready when
-  the fill completes (no re-lookup).
+- **Load HIT**: `c_wait` stays low; the BRAM read register presents the word the
+  next cycle (BRAM-identical 1-cycle latency).
+- **Load MISS**: `c_wait` high while a whole line is fetched in one AXI burst.
+  The requested word can no longer be captured from the beat stream (it now lives
+  in the BRAM), so a one-cycle re-lookup state (`S_RELOOKUP`) reads it out after
+  the fill (+1 MISS cycle; hit path unchanged).
 - **STORE**: write-through -- every store is forwarded to memory (single-beat AXI
   write) and, if the line is currently cached, the cached word is updated in place
   (write-no-allocate: a store miss does not allocate). Memory therefore always
