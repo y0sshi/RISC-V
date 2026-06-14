@@ -605,6 +605,17 @@ else
 BOOT_MAX_FLAG =
 endif
 
+# Optional: shared-DDR base (= RST_ADDR = BFM BASE_ADDR), decimal.  Default
+# 0x8000_0000 (= 2147483648).  Set to 2097152 (= 0x0020_0000) together with a
+# firmware linked at that base (src/software: make boot_lo -> sbi_boot_lo.hex) to
+# sanity-check the Zybo PS-DDR re-link in sim:
+#   make vl_boot BOOT_HEX=../software/boot/sbi_boot_lo.hex BOOT_MEM_BASE=2097152
+ifneq ($(BOOT_MEM_BASE),)
+BOOT_MEMBASE_FLAG = -DBOOT_MEM_BASE=$(BOOT_MEM_BASE)
+else
+BOOT_MEMBASE_FLAG =
+endif
+
 # CLINT mtime prescaler (1 = +1/cycle).  Linux boots should use
 # BOOT_MTIME_DIV=64: with mtime at +1/cycle the 250 Hz tick fires every 4000
 # cycles, which is LESS than the tick handler costs -> the kernel livelocks in
@@ -696,7 +707,7 @@ BOOT_DBG_FLAG += -DBOOT_VCD
 endif
 
 sim_boot: dirs
-	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
 		-o $(OUT_DIR)/tb_rv_boot_soc.vvp \
 		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
 	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_boot_soc.vvp
@@ -730,7 +741,7 @@ image_verilator:
 
 vl_boot: dirs
 	$(VL_DOCKER_RUN) verilator $(VL_FLAGS) -DRV_XLEN_64 \
-		$(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
+		$(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
 		-I$(INC_DIR) --top-module tb_rv_boot_soc --Mdir $(VL_BOOT_MDIR) -o tb_rv_boot_soc \
 		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
 	$(VL_DOCKER_RUN) ./$(VL_BOOT_MDIR)/tb_rv_boot_soc

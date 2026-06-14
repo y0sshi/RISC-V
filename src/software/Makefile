@@ -119,7 +119,7 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello boot stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test
+.PHONY: hello sim_hello boot boot_lo stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test
 
 # ----- mal_cachemiss_test: misaligned 8-byte access retiring while I$ not ready
 # Reproducer for RTL bug #15 (mal_state restart-livelock): a misaligned 8-byte
@@ -255,15 +255,37 @@ boot/stack_test.hex: boot/stack_test.elf
 # RV64, linked at the DDR base 0x8000_0000, emitted as a base-relative verilog
 # hex (objcopy --adjust-vma) so rv_axi_dualport_mem_bfm can $readmemh it.
 #   make boot   ->  boot/sbi_boot.hex   ;   then:  (cd ../sim && make sim_boot)
+# FW_LINK_BASE = the DDR link/entry base (== RST_ADDR).  Defaults to the sim base
+# 0x8000_0000; the `boot_lo` target overrides it to the Zybo PS-DDR base
+# 0x0020_0000 so the SAME mini-SBI can be sanity-checked at the HW base in sim
+# (run with: cd ../sim && make vl_boot BOOT_HEX=../software/boot/sbi_boot_lo.hex
+#  VL_FLAGS="<defaults> -DBOOT_MEM_BASE=2097152").  FW_BASE (-> TOHOST), the link
+# base (--defsym __BASE) and objcopy --adjust-vma all follow it.
+FW_LINK_BASE ?= 0x80000000
+
 boot: boot/sbi_boot.hex
 
 boot/sbi_boot.elf: boot/sbi_boot.S boot/boot.ld
 	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
-	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/sbi_boot.S -o boot/sbi_boot.elf
+	    -nostdlib -nostartfiles -ffreestanding -DFW_BASE=$(FW_LINK_BASE) \
+	    -Wl,--defsym,__BASE=$(FW_LINK_BASE) -T boot/boot.ld boot/sbi_boot.S -o boot/sbi_boot.elf
 
 boot/sbi_boot.hex: boot/sbi_boot.elf
 	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
-	    --adjust-vma=-0x80000000 boot/sbi_boot.elf boot/sbi_boot.hex
+	    --adjust-vma=-$(FW_LINK_BASE) boot/sbi_boot.elf boot/sbi_boot.hex
+
+# Same mini-SBI re-linked to the Zybo PS-DDR base (0x0020_0000) -> sbi_boot_lo.hex.
+boot_lo: boot/sbi_boot_lo.hex
+
+boot/sbi_boot_lo.elf: boot/sbi_boot.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -DFW_BASE=0x00200000 \
+	    -Wl,--defsym,__BASE=0x00200000 -T boot/boot.ld boot/sbi_boot.S -o boot/sbi_boot_lo.elf
+
+boot/sbi_boot_lo.hex: boot/sbi_boot_lo.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x00200000 boot/sbi_boot_lo.elf boot/sbi_boot_lo.hex
+	@echo "  boot firmware hex (Zybo DDR base 0x00200000): $@"
 	@echo "  boot firmware hex: $@"
 
 

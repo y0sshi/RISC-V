@@ -20,7 +20,15 @@ module rv_soc_wrap #(
 `else
     parameter integer XLEN         = 32,
 `endif
-    parameter integer AXI_ID_WIDTH = 4
+    parameter integer AXI_ID_WIDTH = 4,
+    // Core reset (firmware entry) address.  On Zynq-7000 the PS DDR lives at
+    // 0x0000_0000..0x3FFF_FFFF and the S_AXI_HP port forwards addresses straight
+    // into the PS map, so the firmware (and hence RST_ADDR) must sit inside DDR --
+    // the repo sim default 0x8000_0000 is OUTSIDE the HP0-mapped range and would
+    // DECERR.  2 MiB-aligned (OpenSBI FW_TEXT_START requirement), clear of the low
+    // 2 MiB (OCM-remap / vector area), inside the BD-assigned HP0 window (0..512M).
+    // The OpenSBI fw_payload + DTB for the board must be re-linked to this base.
+    parameter [63:0]  RST_ADDR     = 64'h0000_0000_0020_0000
 ) (
     input  wire                    clk,
     input  wire                    rst_n,
@@ -95,7 +103,8 @@ module rv_soc_wrap #(
 
     rv_soc #(
         .XLEN         (XLEN),
-        .AXI_ID_WIDTH (AXI_ID_WIDTH)
+        .AXI_ID_WIDTH (AXI_ID_WIDTH),
+        .RST_ADDR     (RST_ADDR)
     ) u_rv_soc (
         .clk            (clk),
         .rst_n          (rst_n),

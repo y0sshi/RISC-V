@@ -39,6 +39,14 @@ set PL_FREQMHZ 25
 create_project $proj_name $proj_dir -part $PART -force
 set_property target_language Verilog [current_project]
 
+# ---- Digilent Zybo Z7-20 board part (vendored; no Vivado-install pollution) ----
+# The board files (DDR3/MIO/clock preset) live in the repo and are referenced via
+# board_part_repo_paths so apply_board_preset configures the PS7 to match the real
+# board.  Required for the PS to boot and for PS DDR to be reachable over S_AXI_HP.
+set board_repo "$repo/boards/zybo_z720/board_files"
+set_property board_part_repo_paths [list $board_repo] [current_project]
+set_property board_part digilentinc.com:zybo-z7-20:part0:1.2 [current_project]
+
 set src_files [list \
     "$rtl/include/rv_pkg.sv" \
     "$rtl/core/rv_regfile.sv" \
@@ -84,6 +92,10 @@ set_property file_type {SystemVerilog} [get_files *.sv]
 # SystemVerilog top file in a module reference; see rv_soc_wrap.v).
 add_files -norecurse "$script_dir/rv_soc_wrap.v"
 
+# Physical pin constraints (UART console on Pmod JC).  PS DDR/MIO/FIXED_IO are
+# auto-constrained by the board preset, so only the PL UART pins are listed here.
+add_files -norecurse -fileset constrs_1 "$script_dir/zybo_uart.xdc"
+
 if {$XLEN64} { set_property verilog_define {RV_XLEN_64} [get_filesets sources_1] }
 set_property include_dirs "$rtl/include" [get_filesets sources_1]
 
@@ -101,7 +113,16 @@ create_bd_design $bd_name
 
 # ---- Zynq-7000 PS (PS7) ----
 set ps [create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:* zynq_ps]
-# Enable one HP slave port, a PL clock (FCLK_CLK0) and PL reset.
+# Apply the Zybo Z7-20 board preset (DDR3 controller + MIO map + clocks) and make
+# the PS dedicated I/O external: FIXED_IO (MIO/JTAG/clk/reset) and the DDR pins
+# become top-level ports.  Without this the PS7 keeps a generic default config that
+# does not match the board -> the PS will not boot and PS DDR is unusable.
+apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
+    -config { make_external "FIXED_IO, DDR" apply_board_preset "1" \
+              Master "Disable" Slave "Disable" } $ps
+# On top of the board preset: enable one 64-bit HP slave port for the PL master,
+# a PL clock (FCLK_CLK0) at PL_FREQMHZ and a PL reset; the board preset leaves
+# M_AXI_GP0 on, which we do not use.
 set_property -dict [list \
     CONFIG.PCW_USE_S_AXI_HP0 {1} \
     CONFIG.PCW_S_AXI_HP0_DATA_WIDTH {64} \
@@ -110,10 +131,6 @@ set_property -dict [list \
     CONFIG.PCW_EN_CLK0_PORT {1} \
     CONFIG.PCW_EN_RST0_PORT {1} \
 ] $ps
-# (If the Zybo board files are installed you may instead run:
-#   apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
-#       -config {make_external "FIXED_IO, DDR" apply_board_preset 1 } $ps
-#  then enable S_AXI_HP0.)
 
 # ---- RISC-V SoC (RTL module reference; AXI master inferred from m_axi_*) ----
 set riscv [create_bd_cell -type module -reference rv_soc_wrap rv_soc_0]
@@ -124,12 +141,23 @@ set riscv [create_bd_cell -type module -reference rv_soc_wrap rv_soc_0]
 # generated wrapper passes the intended width regardless of the define.
 set XLEN_VAL [expr {$XLEN64 ? 64 : 32}]
 set_property CONFIG.XLEN $XLEN_VAL $riscv
+# RST_ADDR (core reset / firmware entry) is carried by the rv_soc_wrap default
+# (0x0020_0000, a PS-DDR-resident, 2 MiB-aligned base inside the HP0 window).  It is
+# NOT set via CONFIG here on purpose: a 64-bit param through the BD module-ref can be
+# truncated, and the wrapper default is small (fits 32 bits) and unconditional, so the
+# BD bakes it correctly.  The OpenSBI fw_payload + DTB must be re-linked to this base
+# for the HW DDR boot flow (see CLAUDE.md "C-3" / docs/axi_ddr.md address map).
+# GPIO input is still tied off (no board wiring yet); GPIO output is left open.
 set c0 [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:* const_gpio_in]
 set_property -dict [list CONFIG.CONST_WIDTH {4} CONFIG.CONST_VAL {0}] $c0
-set c1 [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:* const_uart_rx]
-set_property -dict [list CONFIG.CONST_WIDTH {1} CONFIG.CONST_VAL {1}] $c1
 connect_bd_net [get_bd_pins $c0/dout] [get_bd_pins rv_soc_0/gpio_in]
-connect_bd_net [get_bd_pins $c1/dout] [get_bd_pins rv_soc_0/uart_rx]
+
+# ---- UART -> external top-level ports (constrained to Pmod JC in zybo_uart.xdc) ----
+# uart_tx is an FPGA output, uart_rx an FPGA input.  Making them external BD ports
+# (named uart_tx / uart_rx) lets the .xdc pin them to physical Pmod pins so the real
+# OpenSBI/Linux console is observable on a USB-UART adapter.
+make_bd_pins_external  -name uart_tx [get_bd_pins rv_soc_0/uart_tx]
+make_bd_pins_external  -name uart_rx [get_bd_pins rv_soc_0/uart_rx]
 
 # ---- AXI SmartConnect (2 masters [data, instruction] -> 1 slave) ----
 set smc [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* axi_smc]

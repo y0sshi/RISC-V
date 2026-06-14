@@ -20,10 +20,18 @@
 #       sbi_boot.elf sbi_boot.hex
 # =============================================================================
 
+# FW_BASE = the DDR link/entry base (== RST_ADDR).  Defaults to the sim base
+# 0x8000_0000; override with -DFW_BASE=0x00200000 (and a matching link base /
+# --adjust-vma) to re-link for the Zybo PS-DDR boot.  Only TOHOST depends on it
+# (UART is the fixed peripheral 0xC001_0000; all code is PC-relative via `la`).
+#ifndef FW_BASE
+#define FW_BASE 0x80000000
+#endif
+
     .equ UART_BASE,   0xC0010000      # NS16550: THR=+0, LSR=+0x14
     .equ UART_LSR,    0x14            # line status register offset
     .equ LSR_THRE,    0x20            # TX holding empty (bit5)
-    .equ TOHOST,      0x80002000      # completion sentinel word
+    .equ TOHOST,      (FW_BASE + 0x2000)   # completion sentinel (DDR base-relative)
     .equ DONE_MAGIC,  0x00C0FFEE
     .equ SBI_PUTCHAR, 1
     .equ SBI_DONE,    2

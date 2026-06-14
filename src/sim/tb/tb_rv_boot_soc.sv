@@ -27,7 +27,15 @@ module tb_rv_boot_soc;
     import rv_pkg::*;
     localparam int XLEN = rv_pkg::XLEN;
     localparam int IDW  = 4;
+    // Shared-DDR base = RST_ADDR = BFM BASE_ADDR.  Defaults to the sim base
+    // 0x8000_0000; override with -DBOOT_MEM_BASE=<decimal> to mirror a re-linked
+    // firmware (e.g. 2097152 = 0x0020_0000 for the Zybo PS-DDR boot sanity check).
+    // Decimal avoids quoting a 64'h literal on the Verilator command line.
+`ifdef BOOT_MEM_BASE
+    localparam logic [63:0] MEM_BASE = `BOOT_MEM_BASE;
+`else
     localparam logic [63:0] MEM_BASE = 64'h8000_0000;
+`endif
 
     // NS16550 16x oversampling: bit period = 16 * divisor.  Pick CLK so the
     // default divisor = CLK/(16*BAUD) = 1 -> 16 clocks/bit (small, fast sim).
