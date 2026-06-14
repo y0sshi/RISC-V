@@ -28,7 +28,13 @@ set proj_dir   "$script_dir/$proj_name"
 
 # Zybo Z7-20: Zynq-7000 XC7Z020-1CLG400C
 set PART  "xc7z020clg400-1"
-set XLEN64 0           ;# Zynq-7000 HP ports are 64-bit; RV32 (XLEN=32) shown here.
+set XLEN64 1           ;# 1 = RV64 (target for Linux); HP ports are 64-bit.
+
+# PL clock (FCLK_CLK0) target.  OOC est (C-2d) WNS -20.246 ns @100 MHz => path
+# ~30.2 ns => max Fmax ~33 MHz.  Start conservative at 25 MHz (40 ns period,
+# ~10 ns OOC margin) to close on the first P&R pass; raise (30 -> ...) once routed
+# timing is confirmed positive.  See CLAUDE.md "C-3" / memory linux-boot-roadmap.
+set PL_FREQMHZ 25
 
 create_project $proj_name $proj_dir -part $PART -force
 set_property target_language Verilog [current_project]
@@ -74,8 +80,18 @@ set src_files [list \
 add_files -norecurse $src_files
 set_property file_type {SystemVerilog} [get_files *.sv]
 
+# Plain-Verilog top wrapper so the BD can reference the SoC (Vivado forbids a
+# SystemVerilog top file in a module reference; see rv_soc_wrap.v).
+add_files -norecurse "$script_dir/rv_soc_wrap.v"
+
 if {$XLEN64} { set_property verilog_define {RV_XLEN_64} [get_filesets sources_1] }
 set_property include_dirs "$rtl/include" [get_filesets sources_1]
+
+# Parse/elaborate the SV sources so the module hierarchy (rv_soc) is known to the
+# BD before referencing it.  Without this, create_bd_cell -reference rv_soc fails
+# with "[filemgmt 56-195] ... SystemVerilog ... not allowed as the top file in the
+# reference" because the compile order has not yet identified rv_soc as a module.
+update_compile_order -fileset sources_1
 
 # =============================================================================
 # Block design
@@ -90,7 +106,7 @@ set_property -dict [list \
     CONFIG.PCW_USE_S_AXI_HP0 {1} \
     CONFIG.PCW_S_AXI_HP0_DATA_WIDTH {64} \
     CONFIG.PCW_USE_M_AXI_GP0 {0} \
-    CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {100} \
+    CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ $PL_FREQMHZ \
     CONFIG.PCW_EN_CLK0_PORT {1} \
     CONFIG.PCW_EN_RST0_PORT {1} \
 ] $ps
@@ -100,7 +116,14 @@ set_property -dict [list \
 #  then enable S_AXI_HP0.)
 
 # ---- RISC-V SoC (RTL module reference; AXI master inferred from m_axi_*) ----
-set riscv [create_bd_cell -type module -reference rv_soc rv_soc_0]
+set riscv [create_bd_cell -type module -reference rv_soc_wrap rv_soc_0]
+# The BD discovers the module-reference parameters by elaborating rv_soc_wrap
+# WITHOUT the fileset's RV_XLEN_64 define, so the wrapper's `ifdef defaults XLEN
+# to 32 and the generated IP wrapper bakes XLEN=32 (forcing 32 down the whole
+# SoC and breaking RV64 part-selects).  Pin XLEN on the cell explicitly so the
+# generated wrapper passes the intended width regardless of the define.
+set XLEN_VAL [expr {$XLEN64 ? 64 : 32}]
+set_property CONFIG.XLEN $XLEN_VAL $riscv
 set c0 [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:* const_gpio_in]
 set_property -dict [list CONFIG.CONST_WIDTH {4} CONFIG.CONST_VAL {0}] $c0
 set c1 [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:* const_uart_rx]
@@ -142,6 +165,16 @@ if {$build_to eq "bd"} {
 }
 
 set bd_file [get_files "$bd_name.bd"]
+
+# Synthesize the BD in GLOBAL (flat) mode rather than per-IP out-of-context.
+# The rv_soc_wrap module reference selects RV64 via the RV_XLEN_64 `ifdef, and
+# rv_pkg::XLEN depends on the same define.  That define is set only on the
+# sources_1 fileset (the top synth_1 run); a per-IP OOC synth run for the BD
+# cell does NOT inherit it, leaving XLEN=32 inside the SoC and breaking RV64-only
+# part-selects (e.g. int_a[63:0] in rv_fpu_misc).  Global mode folds the BD into
+# synth_1 so the fileset define applies uniformly.
+set_property synth_checkpoint_mode None $bd_file
+
 make_wrapper -files $bd_file -top
 set wrapper "$proj_dir/$proj_name.gen/sources_1/bd/$bd_name/hdl/${bd_name}_wrapper.v"
 add_files -norecurse $wrapper

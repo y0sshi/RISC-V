@@ -82,10 +82,20 @@ set src_files [list \
 add_files -norecurse $src_files
 set_property file_type {SystemVerilog} [get_files *.sv]
 
+# Plain-Verilog top wrapper so the BD can reference the SoC (Vivado forbids a
+# SystemVerilog top file in a module reference).  Shared with the Zybo build;
+# see boards/zybo_z720/vivado/rv_soc_wrap.v for the rationale (single source).
+add_files -norecurse "$repo/boards/zybo_z720/vivado/rv_soc_wrap.v"
+
 # ---- Verilog defines: RV64 (rv_soc is the AXI/DDR SoC by module choice; no
 #      build-mode define needed since the file split) ----
 if {$XLEN64} { set_property verilog_define {RV_XLEN_64} [get_filesets sources_1] }
 set_property include_dirs "$rtl/include" [get_filesets sources_1]
+
+# Parse/elaborate the SV sources so the module hierarchy (rv_soc) is known to the
+# BD before referencing the wrapper (otherwise create_bd_cell -reference fails to
+# resolve the module source).
+update_compile_order -fileset sources_1
 
 # =============================================================================
 # Block design
@@ -101,6 +111,7 @@ set hp_dw [expr {$XLEN64 ? 64 : 32}]
 set_property -dict [list \
     CONFIG.PSU__USE__M_AXI_GP0 {0} \
     CONFIG.PSU__USE__M_AXI_GP1 {0} \
+    CONFIG.PSU__USE__M_AXI_GP2 {0} \
     CONFIG.PSU__USE__S_AXI_GP2 {1} \
     CONFIG.PSU__SAXIGP2__DATA_WIDTH $hp_dw \
     CONFIG.PSU__FPGA_PL0_ENABLE {1} \
@@ -111,7 +122,12 @@ set_property -dict [list \
 #                 -config {apply_board_preset 1} $ps  then enable S_AXI_HP0.)
 
 # ---- RISC-V SoC (RTL module reference; AXI master inferred from m_axi_* ports)
-set riscv [create_bd_cell -type module -reference rv_soc rv_soc_0]
+set riscv [create_bd_cell -type module -reference rv_soc_wrap rv_soc_0]
+# Pin XLEN on the cell: the BD discovers module-reference params by elaborating
+# the wrapper WITHOUT the RV_XLEN_64 define, so its `ifdef would otherwise bake
+# XLEN=32 and force 32 down the whole SoC (breaking RV64 part-selects).
+set XLEN_VAL [expr {$XLEN64 ? 64 : 32}]
+set_property CONFIG.XLEN $XLEN_VAL $riscv
 # Tie off GPIO/UART inputs (outputs left open for a headless DDR bring-up).
 set c0 [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:* const_gpio_in]
 set_property -dict [list CONFIG.CONST_WIDTH {4} CONFIG.CONST_VAL {0}] $c0
@@ -137,7 +153,8 @@ connect_bd_net [get_bd_pins proc_rst/peripheral_aresetn] [get_bd_pins rv_soc_0/r
 connect_bd_net $ps_clk  [get_bd_pins axi_smc/aclk]
 connect_bd_net [get_bd_pins proc_rst/interconnect_aresetn] [get_bd_pins axi_smc/aresetn]
 connect_bd_net $ps_clk  [get_bd_pins zynq_ps/saxihp0_fpd_aclk]
-connect_bd_net $ps_clk  [get_bd_pins zynq_ps/maxihpm0_fpd_aclk]
+# No PS master AXI port is enabled (M_AXI_GP0/GP1 = 0), so there is no
+# maxihpm0_fpd_aclk pin to clock; only the S_AXI_HP slave clock is needed.
 
 # ---- AXI paths: rv_soc data + instruction masters -> SmartConnect -> PS HP0 ----
 # The discrete m_axi_*/m_axi_if_* ports are inferred by Vivado as master
@@ -165,6 +182,12 @@ if {$build_to eq "bd"} {
 
 # ---- Wrapper + top ----
 set bd_file [get_files "$bd_name.bd"]
+
+# Synthesize the BD in GLOBAL (flat) mode so the RV_XLEN_64 fileset define reaches
+# the SoC RTL (a per-IP OOC synth run does not inherit it, leaving XLEN=32 and
+# breaking RV64-only part-selects such as int_a[63:0] in rv_fpu_misc).
+set_property synth_checkpoint_mode None $bd_file
+
 make_wrapper -files $bd_file -top
 set wrapper "$proj_dir/$proj_name.gen/sources_1/bd/$bd_name/hdl/${bd_name}_wrapper.v"
 add_files -norecurse $wrapper
