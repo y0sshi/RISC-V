@@ -119,7 +119,43 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello boot stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test
+.PHONY: hello sim_hello boot stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test
+
+# ----- mal_cachemiss_test: misaligned 8-byte access retiring while I$ not ready
+# Reproducer for RTL bug #15 (mal_state restart-livelock): a misaligned 8-byte
+# store/load completes its 2-phase access on a cycle ~imem_ready is low (the
+# timer-IRQ handler entry is a cold I$ fetch -> line-fill), so the old RTL
+# resets mal_state and restarts phase 0 forever.  Old RTL livelocks (timeout);
+# fixed RTL PASS.
+#   make mal_cachemiss_test  &&  (cd ../sim && make vl_boot \
+#     BOOT_HEX=../software/boot/mal_cachemiss_test.hex)
+mal_cachemiss_test: boot/mal_cachemiss_test.hex
+
+boot/mal_cachemiss_test.elf: boot/mal_cachemiss_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/mal_cachemiss_test.S -o boot/mal_cachemiss_test.elf
+
+boot/mal_cachemiss_test.hex: boot/mal_cachemiss_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/mal_cachemiss_test.elf boot/mal_cachemiss_test.hex
+	@echo "  mal_cachemiss_test hex: $@"
+
+# ----- mal_load_irq_test: misaligned 8-byte LOAD vs timer IRQ under a D$ miss --
+# Candidate-bug reproducer (separate from #15, which is fixed): a timer interrupt
+# landing on a misaligned 8-byte load while it takes a D$ miss appears to return
+# a STALE value (previous iteration).  Data-verifies the main-loop load.
+#   make mal_load_irq_test  &&  (cd ../sim && make vl_boot \
+#     BOOT_HEX=../software/boot/mal_load_irq_test.hex)
+mal_load_irq_test: boot/mal_load_irq_test.hex
+
+boot/mal_load_irq_test.elf: boot/mal_load_irq_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/mal_load_irq_test.S -o boot/mal_load_irq_test.elf
+
+boot/mal_load_irq_test.hex: boot/mal_load_irq_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/mal_load_irq_test.elf boot/mal_load_irq_test.hex
+	@echo "  mal_load_irq_test hex: $@"
 
 # ----- div_cachemiss_test: divide starting while a prior load/store dmem_waits -
 div_cachemiss_test: boot/div_cachemiss_test.hex

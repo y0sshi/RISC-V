@@ -997,8 +997,25 @@ module rv_core
     end
     wire mal_phase1_start = mal_state && !mal_state_prev;
 
+    // mal_squash: the misaligned 2-phase access is ABANDONED (FSM reset) only when
+    // the MEM-stage instruction ITSELF is squashed by its own MEM-stage fault.
+    // It must NOT reset on a generic flush_ex_mem (bug #16): flush_ex_mem bubbles
+    // the EX->MEM transition to squash a trap/MRET/SRET taken on the YOUNGER
+    // instruction in EX (or an IF page fault) -- but the OLDER misaligned access
+    // sitting in MEM is legitimately RETIRING that cycle and must keep its
+    // mal_first_data (captured at mal_phase1_start) intact.  The old code zeroed
+    // mal_first_data there, dropping the phase-0 word of a misaligned LOAD that a
+    // timer interrupt landed on under a D$ miss (loaded value lost its low half).
+    // mem_trap_enter is the load/store's OWN fault, so resetting then is correct
+    // (identical to the old behavior for that case).  ~stall_ex matches the commit
+    // timing of flush_ex_mem; flush_ex_mem can only fire at the phase-1 retire
+    // cycle (stall_ex=0 implies dmem_wait=0), never mid-access.  STRICT no-op when
+    // there is no MEM fault: the else-branch already drops mal_state to idle on the
+    // retire cycle and captures mal_first_data, so the only behavioral change is
+    // preserving (not zeroing) the phase-0 word across a younger-instruction trap.
+    wire mal_squash = mem_trap_enter & ~stall_ex;
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n || flush_ex_mem) begin
+        if (!rst_n || mal_squash) begin
             mal_state      <= 1'b0;
             mal_first_data <= '0;
         end else begin
