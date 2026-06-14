@@ -1013,8 +1013,24 @@ module rv_core
             if (!dmem_wait && !mem_stall) begin
                 if (mal_cross && !mal_state)
                     mal_state <= 1'b1;   // phase 0 -> phase 1
+                else if (mal_state && stall_ex)
+                    mal_state <= 1'b1;   // HOLD phase 1: the misaligned access has
+                                         // finished both word accesses but the
+                                         // instruction cannot RETIRE this cycle
+                                         // because EX is held by an unrelated stall
+                                         // (notably ~imem_ready from an in-flight I$
+                                         // fill / straddle-bypass).  Resetting to 0
+                                         // here would re-assert mal_stall next cycle
+                                         // and RESTART phase 0 -> livelock (the same
+                                         // restart class as muldiv_done bug #14).
+                                         // mal_stall=0 in phase 1, so stall_ex here
+                                         // reflects only the unrelated blocker; once
+                                         // it clears the instruction retires and the
+                                         // else-branch drops mal_state to idle.
+                                         // Strict no-op when imem_ready=1 at retire
+                                         // (every BRAM run): stall_ex=0 -> else.
                 else
-                    mal_state <= 1'b0;   // phase 1 -> idle
+                    mal_state <= 1'b0;   // phase 1 -> idle (instruction retires)
             end
             // Capture the phase-0 word at the first cycle of phase 1 (ungated).
             if (mal_phase1_start && ex_mem_ctrl.mem_read)
