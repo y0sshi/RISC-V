@@ -4,7 +4,10 @@ OUTPUT_ARCH("riscv")
 ENTRY(_start)
 
 SECTIONS {
-    . = 0x80200000;
+    /* Link the payload at FW_TEXT_START + FW_PAYLOAD_OFFSET.  Default base
+     * 0x8000_0000 (+0x20_0000) keeps prior artifacts byte-identical; build.sh
+     * passes --defsym FW_LINK=<base+0x200000> to re-link for another base. */
+    . = DEFINED(FW_LINK) ? FW_LINK : 0x80200000;
     .text   : { *(.text*) }
     .rodata : { *(.rodata*) }
     .data   : { *(.data*) }

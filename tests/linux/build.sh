@@ -22,8 +22,17 @@ KDIR=$W/linux-$KVER
 XK=riscv64-linux-gnu-                         # kernel/payload cross toolchain
 NPROC=$(nproc)
 
+# FW_BASE = firmware/DDR base (= RST_ADDR = BFM BASE_ADDR).  Default 0x80000000
+# reproduces the proven baseline; pass FW_BASE=0x00200000 (with a base-matched
+# DTS) to re-link the fw_payload for the real-HW PS-DDR base.  The kernel Image
+# is position-independent (relocatable) and base-independent -- only the OpenSBI
+# wrapper + DTB depend on FW_BASE -- so switching base only re-wraps (no kernel
+# rebuild).  OUT renames the hex so both bases can coexist in work/.
+FW_BASE=${FW_BASE:-0x80000000}
+OUT=${OUT:-fw_payload_linux}
+
 OPENSBI=$HERE/../opensbi/work/opensbi          # reuse the cloned v1.2 tree
-DTS=$HERE/rv_soc_linux.dts
+DTS=${DTS:-$HERE/rv_soc_linux.dts}
 
 echo "== [1/6] static init + initramfs listing =="
 # Freestanding (no target libc needed): raw write() via ecall, custom _start.
@@ -77,14 +86,14 @@ make -C $OPENSBI distclean >/dev/null 2>&1 || true
 # Linux payload is a separate binary, so its gc/lp64d ABI need not match).
 make -C $OPENSBI PLATFORM=generic CROSS_COMPILE=$XK \
     PLATFORM_RISCV_XLEN=64 PLATFORM_RISCV_ISA=rv64imac_zicsr_zifencei PLATFORM_RISCV_ABI=lp64 \
-    FW_TEXT_START=0x80000000 \
+    FW_TEXT_START=$FW_BASE \
     FW_PAYLOAD=y FW_PAYLOAD_PATH=$W/Image FW_PAYLOAD_OFFSET=0x200000 \
     FW_FDT_PATH=$W/rv_soc_linux.dtb \
     -j$NPROC 2>&1 | tail -8
 
 FW=$OPENSBI/build/platform/generic/firmware/fw_payload
-${XK}objcopy -O binary $FW.elf $W/fw_payload_linux.bin
-${XK}objcopy -I binary -O verilog $W/fw_payload_linux.bin $W/fw_payload_linux.hex
-echo "   fw_payload_linux.bin: $(stat -c %s $W/fw_payload_linux.bin) bytes"
-echo "   fw_payload_linux.hex: $W/fw_payload_linux.hex"
+${XK}objcopy -O binary $FW.elf $W/$OUT.bin
+${XK}objcopy -I binary -O verilog $W/$OUT.bin $W/$OUT.hex
+echo "   $OUT.bin: $(stat -c %s $W/$OUT.bin) bytes"
+echo "   $OUT.hex: $W/$OUT.hex"
 echo "DONE"

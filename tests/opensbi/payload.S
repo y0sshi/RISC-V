@@ -12,7 +12,14 @@
 # Linked at FW_TEXT_START + FW_PAYLOAD_OFFSET = 0x8000_0000 + 0x20_0000.
 # =============================================================================
 
-    .equ TOHOST,     0x80002000
+    # FW_BASE selects the firmware/DDR base (= RST_ADDR = BFM BASE_ADDR).  The
+    # default 0x8000_0000 keeps every prior artifact byte-identical; pass
+    # -DFW_BASE=0x00200000 (build.sh FW_BASE=...) to re-link for the real-HW
+    # PS-DDR base.  TOHOST is base + 0x2000 (matches tb_rv_boot_soc TOHOST_OFF).
+#ifndef FW_BASE
+#define FW_BASE 0x80000000
+#endif
+    .equ TOHOST,     (FW_BASE + 0x2000)
     .equ DONE_MAGIC, 0x00C0FFEE
     .equ SBI_PUTCHAR, 1            # legacy console_putchar (EID 0x01)
 
