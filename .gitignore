@@ -32,6 +32,7 @@ boards/**/vivado/rv_riscv_*/
 # =============================================================================
 boards/**/vitis/ws/
 boards/**/vitis/boot.gen.bif
+boards/**/vitis/ps7_init.tcl
 *.xsa
 BOOT.bin
 *.elf

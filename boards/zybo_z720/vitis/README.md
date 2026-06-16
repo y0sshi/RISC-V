@@ -50,24 +50,44 @@ Use a **57600 8N1** terminal on hardware.
     layout: FSBL(exec OCM) -> firmware@0x200000 (data, no A9 handoff) -> bitstream
     last, so the RISC-V core leaves reset with firmware already resident in DDR.
 
-## Remaining (needs the board)
+## prep-D/E (done offline) -- ready for the board
 
-- **prep-E** rebuild the firmware with the real-HW DTS, then regenerate BOOT.bin:
-  ```
-  docker run --rm -v "E:/work/git/RISC-V.git:/workspace" -w /workspace/tests/opensbi \
-    riscof_run:latest bash -c \
-    "FW_BASE=0x00200000 DTS=/workspace/docs/opensbi/rv_soc_hw.dts OUT=fw_payload_hw bash build.sh"
-  .\make_bootbin.ps1 -Firmware E:\work\git\RISC-V.git\tests\opensbi\work\fw_payload_hw.bin
-  ```
-  (Linux: `tests/linux/build.sh` with `DTS=.../rv_soc_linux_hw.dts OUT=fw_payload_linux_hw`,
-  CRLF-strip per CLAUDE.md.)
-- **prep-D / P1** JTAG bring-up (script to author when at the board; uses the
-  debug side of xsct, not the project flow): `connect` -> select APU ->
-  `source ps7_init.tcl; ps7_init; ps7_post_config` (PS/DDR up) -> `fpga -file
-  bd_riscv_wrapper.bit` -> `dow fw_payload_hw.elf` (loads to 0x200000) -> release
-  the PL reset so the core boots from 0x200000. `ps7_init.tcl` is inside the XSA.
-- **P1-c** observe the OpenSBI banner on the **Pmod JC** USB-UART (FPGA TX=V15 ->
-  adapter RX, FPGA RX=W15 <- adapter TX, common GND), **57600 8N1**.
+- **prep-E DONE** real-HW OpenSBI hello firmware is built and BOOT.bin is staged
+  with it:
+  - `tests/opensbi/work/fw_payload_hw.{elf,bin}` (entry 0x200000, 25 MHz/57600 DTB),
+  - `BOOT.bin` regenerated via `make_bootbin.ps1 -Firmware ...fw_payload_hw.bin`.
+  - Rebuild recipe (if the DTS changes):
+    ```
+    docker run --rm -v "E:/work/git/RISC-V.git:/workspace" -w /workspace/tests/opensbi \
+      riscof_run:latest bash -c \
+      "FW_BASE=0x00200000 DTS=/workspace/docs/opensbi/rv_soc_hw.dts OUT=fw_payload_hw bash build.sh"
+    cp tests/opensbi/work/opensbi/build/platform/generic/firmware/fw_payload.elf \
+       tests/opensbi/work/fw_payload_hw.elf
+    .\make_bootbin.ps1 -Firmware ...\fw_payload_hw.bin
+    ```
+  - Linux later: `tests/linux/build.sh` with `DTS=.../rv_soc_linux_hw.dts
+    OUT=fw_payload_linux_hw` (CRLF-strip per CLAUDE.md); swap the elf in
+    `bringup_jtag.tcl`.
+- **prep-D DONE** JTAG bring-up script `bringup_jtag.tcl` (XSDB debug flow, which IS
+  available here -- only the classic IDE project flow is not). It `connect`s,
+  selects the A9, runs `ps7_init`/`ps7_post_config`, `dow`s `fw_payload_hw.elf` to
+  0x200000, then `fpga`-configures the PL so the RISC-V core boots from 0x200000.
+  `ps7_init.tcl` is extracted from the XSA (gitignored; re-extract with
+  `python -c "import zipfile; open('ps7_init.tcl','wb').write(zipfile.ZipFile(r'../vivado/rv_riscv_zybo/rv_riscv_zybo.xsa').read('ps7_init.tcl'))"`).
+
+## On the board (P1 -- run these)
+
+1. Power the Zybo, set JTAG boot mode (or insert the SD with `BOOT.bin` for SD boot).
+2. Wire a 3.3 V USB-UART to **Pmod JC**: FPGA TX=**V15** -> adapter RX,
+   FPGA RX=**W15** <- adapter TX, common GND. Open the terminal at **57600 8N1**.
+3. JTAG path (recommended):
+   ```
+   & "E:\Tools\Xilinx\Vitis\2024.2\bin\xsct.bat" `
+       E:\work\git\RISC-V.git\boards\zybo_z720\vitis\bringup_jtag.tcl
+   ```
+   Expect the OpenSBI banner + `PAYLOAD: hello` on the UART.
+4. SD path (alternative): copy `BOOT.bin` to a FAT32 SD card, set SD boot mode,
+   power-cycle.
 
 ## Artifacts (all gitignored)
 
