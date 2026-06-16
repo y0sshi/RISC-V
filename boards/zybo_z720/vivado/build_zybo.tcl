@@ -219,3 +219,11 @@ if {$build_to eq "synth"} {
 launch_runs impl_1 -to_step write_bitstream -jobs 4
 wait_on_run impl_1
 puts "INFO: Bitstream generation done."
+
+# ---- Export a fixed HW platform (.xsa) for Vitis (FSBL/BOOT.bin/JTAG) ----
+# Bundles ps7_init (PS DDR/MIO/clock bring-up) + the implemented bitstream.  This
+# is the hand-off Vitis consumes (prep-C/D).  To (re-)emit the XSA from an existing
+# build without re-running impl, use export_xsa.tcl instead.
+open_run impl_1
+write_hw_platform -fixed -include_bit -force "$proj_dir/$proj_name.xsa"
+puts "INFO: Wrote HW platform $proj_dir/$proj_name.xsa"

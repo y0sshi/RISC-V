@@ -1,0 +1,94 @@
+/dts-v1/;
+
+/* Real-HARDWARE Linux device tree for the Zybo Z7-20 bitstream.
+ *
+ * Derived from rv_soc_linux_lo.dts (the sim-verified, base-relocated 0x0020_0000
+ * copy).  IDENTICAL to rv_soc_linux_lo.dts EXCEPT for the three CLOCK constants,
+ * which on real silicon must reflect the actual PL clock instead of the sim
+ * placeholders.  See docs/opensbi/rv_soc_hw.dts for the full derivation; in
+ * brief, with PL clock = 25 MHz and rv_soc MTIME_DIV = 1:
+ *
+ *   - timebase-frequency = 25000000 (mtime runs at 25 MHz on HW; the sim used
+ *       1 MHz only because BOOT_MTIME_DIV=64 slows mtime in the boot harness).
+ *   - serial clock-frequency = 25000000 (= PL clock; the 8250 divisor is
+ *       clock-frequency/(16*baud), and actual_baud = PL/(divisor*16), so the two
+ *       must match for the baud to be correct).
+ *   - current-speed = 57600 (25 MHz cannot make a clean 115200; 57600 -> divisor
+ *       27 -> 57870 baud = +0.47%, safe; 115200 would be +/-4% = unreliable).
+ *
+ * The kernel Image is relocatable / base-independent; only this DTB + the OpenSBI
+ * wrapper depend on the firmware base.  /memory is kept at 64 MiB for bring-up
+ * parity with the sim-verified image (1 GB PS DDR is a later P2 step).
+ */
+
+/ {
+    #address-cells = <2>;
+    #size-cells = <2>;
+    compatible = "rvcore,rv_soc";
+    model = "rv_soc (RV64GC educational core, Zybo Z7-20)";
+
+    chosen {
+        bootargs = "earlycon=sbi console=ttyS0,57600";
+        stdout-path = "/soc/serial@c0010000";
+    };
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        timebase-frequency = <25000000>;  /* mtime = PL/MTIME_DIV = 25 MHz/1 */
+
+        cpu0: cpu@0 {
+            device_type = "cpu";
+            reg = <0>;
+            compatible = "riscv";
+            riscv,isa = "rv64imafdc";
+            mmu-type = "riscv,sv39";
+            status = "okay";
+
+            cpu0_intc: interrupt-controller {
+                #interrupt-cells = <1>;
+                interrupt-controller;
+                compatible = "riscv,cpu-intc";
+            };
+        };
+    };
+
+    /* 64 MiB at the re-linked base (0x0020_0000) for bring-up parity. */
+    memory@200000 {
+        device_type = "memory";
+        reg = <0x0 0x00200000  0x0 0x04000000>;
+    };
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        compatible = "simple-bus";
+        ranges;
+
+        clint@c0000000 {
+            compatible = "riscv,clint0";
+            reg = <0x0 0xc0000000  0x0 0x10000>;
+            interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;  /* MSIP, MTIP */
+        };
+
+        plic0: interrupt-controller@c0100000 {
+            compatible = "riscv,plic0";
+            reg = <0x0 0xc0100000  0x0 0x4000000>;
+            #interrupt-cells = <1>;
+            interrupt-controller;
+            interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>; /* MEIP, SEIP */
+            riscv,ndev = <8>;
+        };
+
+        serial@c0010000 {
+            compatible = "ns16550a";
+            reg = <0x0 0xc0010000  0x0 0x1000>;
+            reg-shift = <2>;
+            reg-io-width = <4>;
+            interrupt-parent = <&plic0>;
+            interrupts = <1>;
+            clock-frequency = <25000000>;  /* = PL clock; sets the 8250 divisor */
+            current-speed = <57600>;       /* 25e6/(16*27)=57870, +0.47% */
+        };
+    };
+};
