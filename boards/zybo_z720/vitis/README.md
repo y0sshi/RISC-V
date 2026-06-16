@@ -7,6 +7,10 @@ the PS-side boot artifacts (XSA -> FSBL -> BOOT.bin) and the JTAG bring-up scrip
 All Xilinx tools must run from **PowerShell** with **absolute** paths (Bash/MSYS
 path translation crashes Vivado synth and the Vitis server).
 
+**One-shot:** `..\build_all.ps1` runs `bit -> fsbl -> bootbin` (use
+`-Stage xsa,fsbl,bootbin` to reuse an existing impl). The bash/docker side
+(firmware, sim, tests) is the top-level `make` -- run `make help` at the repo root.
+
 ## Clock / UART facts baked into the design (read first)
 
 - PL clock `FCLK_CLK0` = **25 MHz** (`build_zybo.tcl` `PL_FREQMHZ=25`).

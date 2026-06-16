@@ -6,10 +6,10 @@ FROM ubuntu:24.04 AS builder
 ARG IVERILOG_VER=v13_0
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Only the deps needed to build iverilog from the release tarball.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential autoconf bison flex pkg-config \
-    libreadline-dev libncurses-dev wget ca-certificates git \
-    python3 python3-pip curl && \
+    libreadline-dev libncurses-dev wget ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # fetch official release tarball (adjust URL if needed)
@@ -30,10 +30,12 @@ RUN if [ -d /out/usr/local/bin ]; then strip /out/usr/local/bin/* || true; fi
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
-# runtime deps for iverilog and tools
+# Runtime deps for iverilog/vvp only (linked against readline/ncurses at build
+# time).  NOTE: verilator/gtkwave are intentionally NOT here -- verilator sims use
+# the separate verilator:5.020 image (this image lacks g++/make anyway), and
+# `make wave_*` launches gtkwave on the HOST, not in the container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libreadline8 libncurses6 ca-certificates \
-    verilator gtkwave wget && \
+    libreadline8 libncurses6 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # copy iverilog install tree from builder

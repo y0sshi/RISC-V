@@ -50,10 +50,10 @@ module tb_rv_act_debug;
         if (u_soc.core_dmem_req && u_soc.core_dmem_we
                 && u_soc.core_dmem_va == tohost_addr_val[63:0]) begin
             if (eff_wdata == 64'd1)
-                $display("TEST PASSED (priv=%0d)", u_soc.priv_out);
+                $display("TEST PASSED (priv=%0d)", u_soc.u_cpu.priv_out);
             else
                 $display("TEST FAILED: testnum=%0d (priv=%0d)",
-                         eff_wdata >> 1, u_soc.priv_out);
+                         eff_wdata >> 1, u_soc.u_cpu.priv_out);
             $finish;
         end
     end
@@ -64,13 +64,13 @@ module tb_rv_act_debug;
         if (rst_n) begin
             cycle_cnt <= cycle_cnt + 1;
             if (cycle_cnt < 200 || cycle_cnt % 5000 == 0)
-                $display("[cyc %0d] imem_addr=%h dmem_addr=%h dmem_req=%b dmem_we=%b priv=%0d",
+                $display("[cyc %0d] imem_pa=%h dmem_addr=%h dmem_req=%b dmem_we=%b priv=%0d",
                          cycle_cnt,
-                         u_soc.core_imem_va,
+                         u_soc.mmu_imem_pa,
                          u_soc.core_dmem_va,
                          u_soc.core_dmem_req,
                          u_soc.core_dmem_we,
-                         u_soc.priv_out);
+                         u_soc.u_cpu.priv_out);
         end
     end
 
