@@ -34,7 +34,7 @@ puts "== connecting to the board (hw_server / local JTAG) =="
 connect
 
 # ---- Select the PS Cortex-A9 #0 (for PS init + DDR access over JTAG) ----
-targets -set -nocase -filter {name =~ "*Cortex-A9*#0" || name =~ "APU*"}
+targets -set -nocase -filter {name =~ "*Cortex-A9*#0"}
 stop
 
 # ---- PS init: DDR controller, MIO, clocks (FCLK_CLK0 = 25 MHz) ----
@@ -47,7 +47,7 @@ ps7_post_config
 puts "== downloading firmware to DDR 0x200000: $fw =="
 dow $fw
 puts "   readback @0x200000:"
-mrd 0x00200000 4
+puts [mrd 0x00200000 4]
 
 # ---- Configure the PL -> the RISC-V core leaves reset and boots from 0x200000 ----
 puts "== configuring PL with $bit =="
@@ -55,3 +55,12 @@ fpga -file $bit
 
 puts "== DONE: RISC-V core released; watch the Pmod JC UART at 57600 8N1 =="
 puts "   (OpenSBI banner -> 'PAYLOAD: hello' for the hello firmware)"
+
+# ---- Liveness probe: the hello payload writes 0x00C0FFEE to TOHOST (= base+0x2000)
+#      AFTER it has printed the banner via SBI putchar.  Reading it back proves the
+#      core ran (fetched from DDR, ran OpenSBI init + the S-mode payload, and the
+#      UART register writes executed) WITHOUT needing to see the UART. ----
+puts "== waiting ~1s, then reading the done-sentinel @0x00202000 =="
+after 1000
+puts "   sentinel @0x202000 (expect 0x00C0FFEE if the core ran the payload):"
+puts [mrd 0x00202000 1]
