@@ -131,18 +131,24 @@ cd src/software
 make all           # Cross-compile test programs to .hex
 ```
 
-### FPGA build & real-HW bring-up (Vivado/Vitis — PowerShell)
+### FPGA build & real-HW bring-up (Vivado/Vitis)
 
-The scripts find the Xilinx tools via the `XILINX_VIVADO` / `XILINX_VITIS` environment
-variables (or `PATH`). Set them once per shell, e.g.:
+The build is a cross-platform Python orchestrator (`build_all.py`, stdlib only — no venv)
+that runs on Windows and Linux. The Xilinx tools are found via the `XILINX_VIVADO` /
+`XILINX_VITIS` env vars (or `PATH` after the Xilinx `settings64`):
 
+```bash
+# Linux / bash:
+export XILINX_VIVADO=/opt/Xilinx/Vivado/2024.2     # adjust to your install
+export XILINX_VITIS=/opt/Xilinx/Vitis/2024.2
+python boards/zybo_z720/build_all.py               # all: bit -> FSBL -> BOOT.bin
+python boards/zybo_z720/build_all.py --stage xsa fsbl bootbin   # reuse the existing impl
+```
 ```powershell
-$env:XILINX_VIVADO = "C:\Xilinx\Vivado\2024.2"     # adjust to your install path
+# Windows / PowerShell ($env: instead of export; build_all.ps1 is a thin shim that forwards here):
+$env:XILINX_VIVADO = "C:\Xilinx\Vivado\2024.2"
 $env:XILINX_VITIS  = "C:\Xilinx\Vitis\2024.2"
-# or just run the Xilinx settings64.bat to put the tools on PATH; or pass -Vivado/-Vitis explicitly.
-
-# One-shot bitstream -> FSBL -> BOOT.bin for Zybo Z7-20 (PS7 + SmartConnect + S_AXI_HP -> rv_soc):
-boards\zybo_z720\build_all.ps1
+python boards\zybo_z720\build_all.py        # or the shim:  .\boards\zybo_z720\build_all.ps1
 ```
 
 Then bring up on the board over JTAG (loads firmware to PS-DDR, configures the PL, prints to

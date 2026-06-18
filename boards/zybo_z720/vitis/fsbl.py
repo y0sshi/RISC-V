@@ -22,9 +22,16 @@
 # =============================================================================
 import os
 import shutil
+from pathlib import Path
 import vitis
 
-REPO = "E:/work/git/RISC-V.git"
+# Repo root derived from this script (boards/zybo_z720/vitis/fsbl.py -> 3 levels up).
+# Fall back to the cwd (build_all.py runs vitis with cwd = repo root) if __file__
+# is unavailable under the vitis interpreter.
+try:
+    REPO = Path(__file__).resolve().parents[3].as_posix()
+except NameError:
+    REPO = Path.cwd().as_posix()
 XSA  = REPO + "/boards/zybo_z720/vivado/rv_riscv_zybo/rv_riscv_zybo.xsa"
 WS   = REPO + "/boards/zybo_z720/vitis/ws"
 
