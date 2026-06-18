@@ -24,7 +24,8 @@ set ps7_init "$here/ps7_init.tcl"
 set bit      "$repo/boards/zybo_z720/vivado/rv_riscv_zybo/rv_riscv_zybo.runs/impl_1/bd_riscv_wrapper.bit"
 # Real-HW firmware (OpenSBI hello), re-linked to 0x200000 with the 25 MHz / 57600
 # device tree (prep-E).  Swap for fw_payload_linux_hw.elf to boot Linux.
-set fw       "$repo/tests/opensbi/work/fw_payload_hw.elf"
+#set fw       "$repo/tests/opensbi/work/fw_payload_hw.elf"
+set fw       "$repo/tests/linux/work/fw_payload_linux_hw.elf"
 
 foreach f [list $ps7_init $bit $fw] {
     if {![file exists $f]} { error "missing input: $f" }

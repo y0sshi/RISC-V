@@ -143,7 +143,10 @@ fw-linux-lo:
 
 fw-linux-hw:
 	$(DRUN) -w /workspace/tests/linux $(IMG_LINUX) bash -c \
-	    "tr -d '\015' < build.sh | FW_BASE=$(HW_BASE) DTS=$(DTS_LINUX_HW) OUT=fw_payload_linux_hw bash -s"
+	    "tr -d '\015' < build.sh | FORCE_KERNEL=$(FORCE_KERNEL) FW_BASE=$(HW_BASE) DTS=$(DTS_LINUX_HW) OUT=fw_payload_linux_hw bash -s"
+	cp tests/opensbi/work/opensbi/build/platform/generic/firmware/fw_payload.elf \
+	   tests/linux/work/fw_payload_linux_hw.elf
+	@echo "stashed tests/linux/work/fw_payload_linux_hw.elf (entry 0x200000, for JTAG dow)"
 
 # -----------------------------------------------------------------------------
 # Simulation boot (verilator).  Delegate to src/sim; clean the model dir first

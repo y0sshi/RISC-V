@@ -17,5 +17,6 @@
 # they are auto-constrained and need no entries here.
 # =============================================================================
 
-set_property -dict { PACKAGE_PIN V15  IOSTANDARD LVCMOS33 } [get_ports { uart_tx }]; # Pmod JC1
-set_property -dict { PACKAGE_PIN W15  IOSTANDARD LVCMOS33 } [get_ports { uart_rx }]; # Pmod JC2
+set_property -dict {PACKAGE_PIN V15 IOSTANDARD LVCMOS33} [get_ports uart_tx]
+set_property -dict {PACKAGE_PIN W15 IOSTANDARD LVCMOS33} [get_ports uart_rx]
+

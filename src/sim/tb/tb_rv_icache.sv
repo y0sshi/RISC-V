@@ -5,7 +5,7 @@
 // (BFM ALIGN=0):
 //   - aligned fetch hit/miss + line fill,
 //   - 2-byte-aligned (RVC) window spanning two words within a line,
-//   - line-crossing window served uncached (bypass),
+//   - line-crossing window served as a 2-line straddle hit (both lines cached),
 //   - FENCE.I flush forces a re-fetch of modified memory,
 //   - correctness under several AXI latency profiles.
 // XLEN selected by -DRV_XLEN_64 (default 32).
@@ -182,8 +182,9 @@ module tb_rv_icache;
         // 2-byte-aligned window within line 0: bytes[2..5]
         fetch(BASE + 2, d);  check(d, 32'h0001_C0DE, "RVC window byte+2");
 
-        // line-crossing window (offset 30): served uncached (bypass)
-        fetch(BASE + 30, d); check(d, 32'h0008_C0DE, "line-cross window bypass");
+        // line-crossing window (offset 30): both adjacent lines cached above
+        // (line0 via BASE+0, line1 via BASE+0x20), so this is a 2-line straddle HIT
+        fetch(BASE + 30, d); check(d, 32'h0008_C0DE, "line-cross window 2-line hit");
 
         // latency sweep: re-fetch all of line 0 words at various latencies (hits)
         begin : sweep

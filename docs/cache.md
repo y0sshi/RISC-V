@@ -74,9 +74,15 @@ is fetched in one AXI burst, after which the held address re-looks-up and hits.
   window can span two 32-bit words. Within a line the window is extracted with a
   byte-granular part-select of the packed line (`line[idx][boff*8 +: 32]`). The
   single offset whose window crosses the **line** boundary (`boff == LINE_BYTES-2`)
-  is served **UNCACHED** via a direct single-beat read -- rare, and it preserves
-  the byte-addressable fetch the AXI path already supported without a two-line
-  buffer.
+  is served as a **2-line straddle HIT** when both adjacent lines are cached: a
+  second registered read port (`line_q2`, set `idx+1`) supplies the high half, and
+  the window is `{line_q2[15:0], line_q[LINEW-1 -: 16]}`. A cold straddle fills the
+  missing line(s) through the normal `S_FILL`/`S_FILL2` path (up to two sequential
+  fills) and then hits -- **there is no uncached bypass**, so every memory access
+  is an aligned line burst (no unaligned ARADDR on real `S_AXI_HP`). This replaced
+  the earlier single-beat bypass, whose multi-cycle uncached fetch turned a
+  redirect whose target was a straddle address into a fetch/redirect squash race
+  (the OpenSBI/Linux livelock fixed 2026-06-18).
 - **FENCE.I**: `flush` clears all valid bits so self-modified / newly loaded code
   is re-fetched.
 
@@ -130,8 +136,9 @@ Unit tests (v12.0 native + v13.0 docker):
 - `make sim_axi_burst` : 52/52 -- burst line fills + single writes vs latency.
 - `make sim_dcache` / `sim_dcache64` : 40/40 each -- hit/miss/fill/eviction,
   write-through hit update, same-line neighbours, latency sweep, hit/miss counters.
-- `make sim_icache` / `sim_icache64` : 42/42 each -- aligned + RVC-window fetch,
-  line-crossing bypass, FENCE.I refetch, latency sweep.
+- `make sim_icache` / `sim_icache64` : 50/50 each -- aligned + RVC-window fetch,
+  2-line straddle hit, FENCE.I refetch, MMU-gap resume, translation-change-mid-
+  fill, latency sweep.
 
 Integration -- `make sim_cache_soc` / `sim_cache_soc64` (6/6 each, v12 + v13):
 two `rv_soc` instances (caches on vs off) run the same nested-loop program
@@ -161,8 +168,6 @@ so the whole suite was re-run):
 - **Write-back + set-associative** D$ for higher performance (this version is
   write-through direct-mapped for provable correctness). A write-back cache needs
   dirty bits + eviction write-out.
-- **I$ two-line fetch** to cache line-crossing RVC windows instead of bypassing
-  them (minor; bypass is correct and rare).
 - **PTW-over-AXI through the D$** (currently bypassed) if PTE caching is wanted.
 - Real-program soak over a single shared DDR image; board bring-up with the
   PS DDR (the burst bridge already emits proper INCR bursts for the HP port).

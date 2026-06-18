@@ -31,9 +31,14 @@
 /// window can span two 32-bit words.  Within a line the window is extracted with
 /// a byte-granular part-select of the registered line read.  The single offset
 /// whose window would cross the LINE boundary (@c byte_off == LINE_BYTES-2) is
-/// served UNCACHED via a direct single-beat read (rare; preserves the
-/// byte-addressable fetch the AXI path already supported, without a two-line
-/// buffer).
+/// served as a 1-cycle HIT from BOTH adjacent lines when each is cached: a second
+/// registered read port (@c line_q2, set @c idx+1) supplies the high half while
+/// @c line_q supplies the low half.  A cold straddle (either line not yet cached)
+/// fills the missing line(s) through the normal @c S_FILL/@c S_FILL2 path (up to
+/// two sequential line fills) and then hits -- there is NO uncached bypass.  This
+/// keeps every memory access an aligned line burst and removes the multi-cycle
+/// uncached fetch that otherwise turned a redirect whose target is a straddle
+/// address into a fetch/redirect squash race.
 ///
 /// @c flush (FENCE.I) invalidates the whole cache so self-modified / newly loaded
 /// code is re-fetched from memory.
@@ -91,17 +96,15 @@ module rv_icache #(
     logic [SETS-1:0]    valid;
     logic [TAGW-1:0]    tagm  [0:SETS-1];
 
-    // ---- Line data: synchronous-read block RAM (one R port + one W port) -----
+    // ---- Line data: synchronous-read block RAM (two R ports + one W port) ----
+    // The two read ports (line_q at set idx, line_q2 at set idx+1) let a straddle
+    // window be assembled from two adjacent lines; Xilinx replicates the BRAM.
     (* ram_style = "block" *)
     logic [LINEW-1:0]   line  [0:SETS-1];
 
     // ---- Registered fetch address (1-cycle, BRAM-equivalent) ----------------
     logic [XLEN-1:0] addr_q;
     logic            req_q;
-    // Raw previous-cycle c_addr (registered unconditionally).  Used only to
-    // detect a mid-flight translation change (addr_q vs the address the core
-    // presented LAST cycle) without a combinational c_ready->c_addr loop.
-    logic [XLEN-1:0] c_addr_q;
 
     wire [OFFW-1:0]  boff = addr_q[OFFW-1:0];
     wire [IDXW-1:0]  idx  = addr_q[OFFW +: IDXW];
@@ -111,8 +114,26 @@ module rv_icache #(
     wire             straddle = (boff == OFFW'(LINE_BYTES-2));
     wire [XLEN-1:0]  line_base = {addr_q[XLEN-1:OFFW], {OFFW{1'b0}}};
 
+    // ---- Straddle (line-crossing window) 2-line hit -------------------------
+    // A line-crossing fetch window's low 16 bits live in the TOP of line[idx] and
+    // its high 16 bits in the BOTTOM of the NEXT line (idx+1; tag +1 when the set
+    // index wraps).  When BOTH adjacent lines are cached the window is served as a
+    // 1-cycle HIT from the two registered line reads, exactly like an aligned hit.
+    // A cold straddle (either line not yet cached) is resolved by filling the
+    // missing line(s) through the SAME proven S_FILL/S_FILL2 path a normal miss
+    // uses (up to two sequential line fills), after which the held address re-
+    // looks-up and hits.  There is NO uncached/multi-cycle-bypass path: this
+    // removes the "multi-cycle uncached redirect-target fetch" that turned a
+    // redirect whose target is a straddle address into a fetch/redirect squash
+    // race (OpenSBI/Linux livelock), and makes every memory access an aligned
+    // line burst (no unaligned ARADDR on real S_AXI_HP).
+    wire [IDXW-1:0]  idx_p1  = idx + IDXW'(1);
+    wire [TAGW-1:0]  tg_next = (idx == IDXW'(SETS-1)) ? (tg + TAGW'(1)) : tg;
+    wire             hit2    = valid[idx_p1] & (tagm[idx_p1] == tg_next);
+    wire             straddle_hit = straddle & hit & hit2;
+
     // ---- FSM ----------------------------------------------------------------
-    typedef enum logic [1:0] { S_LOOKUP, S_FILL, S_FILL2, S_BYPASS } state_t;
+    typedef enum logic [1:0] { S_LOOKUP, S_FILL, S_FILL2 } state_t;
     state_t state;
 
     logic [IDXW-1:0] fill_idx;
@@ -121,11 +142,11 @@ module rv_icache #(
 
     // ---- Fetch-address register enable --------------------------------------
     // addr_q advances when this fetch completes (c_ready), when a request is
-    // (re)presented after an idle gap (resume priming), or when a fill/bypass
-    // completes with a request still presented (mid-flight translation re-arm).
+    // (re)presented after an idle gap (resume priming), or when a fill completes
+    // with a request still presented (mid-flight translation re-arm).
     wire addr_q_en = c_ready
                    || (state == S_LOOKUP && c_req && !req_q)
-                   || ((state == S_FILL || state == S_BYPASS) && m_done && c_req);
+                   || (state == S_FILL && m_done && c_req);
 
     // ---- BRAM read port (registered output = line_q) ------------------------
     // Hit path: clocked with addr_q_en reading set(c_addr) -- the line being
@@ -150,8 +171,20 @@ module rv_icache #(
         if (rd_en) line_q <= line[rd_set];
     end
 
+    // Second registered read port (set idx+1) for the straddle window.  Reads in
+    // lockstep with line_q (same rd_en), one set ahead, so at the serve cycle
+    // line_q2 == line[idx+1].  1W2R -> Xilinx replicates the (small) line BRAM.
+    logic [LINEW-1:0] line_q2;
+    wire  [IDXW-1:0]  rd_set2 = rd_set + IDXW'(1);
+    always_ff @(posedge clk) begin
+        if (rd_en) line_q2 <= line[rd_set2];
+    end
+
     // Combinational 32-bit window extract from the registered line read
     wire [31:0] window = line_q[boff*8 +: 32];
+    // Straddle window: low 16b = top of this line, high 16b = bottom of next line
+    // (addr_q[1:0]==2'b10 for any straddle).
+    wire [31:0] window_straddle = {line_q2[15:0], line_q[LINEW-1 -: 16]};
 
     // ---- BRAM write port (line fill beats) ----------------------------------
     integer w;
@@ -164,43 +197,18 @@ module rv_icache #(
     end
 
     // ---- Outputs (combinational) --------------------------------------------
+    // Only S_LOOKUP serves a fetch: an aligned/in-line hit OR a 2-line straddle
+    // hit (both adjacent lines cached).  c_rdata is don't-care while c_ready=0.
     always_comb begin
-        unique case (state)
-            S_LOOKUP: begin
-                c_ready = req_q & ~straddle & hit;
-                c_rdata = window;
-            end
-            S_BYPASS: begin
-                // Serve only if the request still targets the address this
-                // bypass was launched for.  The MMU may retranslate the SAME
-                // fetch_pc to a different physical address mid-flight (e.g. an
-                // MRET privilege change or an SFENCE.VMA retranslation), in
-                // which case this data belongs to a stale translation and must
-                // be dropped; the re-armed lookup below then serves the live
-                // address.  Compares against the REGISTERED previous-cycle
-                // request (req_q/c_addr_q) -- the contract is "data for the
-                // address presented last cycle", and using the live c_addr
-                // would create a combinational c_ready -> stall -> c_addr loop.
-                // No-op while c_addr is held stable (all bare runs).
-                c_ready = m_done & req_q & (addr_q == c_addr_q);
-                c_rdata = m_rdata;         // byte-exact window from memory
-            end
-            default: begin                 // S_FILL / S_FILL2
-                c_ready = 1'b0;
-                c_rdata = window;
-            end
-        endcase
+        c_ready = (state == S_LOOKUP) & req_q & ((~straddle & hit) | straddle_hit);
+        c_rdata = straddle ? window_straddle : window;
     end
 
+    // Memory side: only aligned line-fill bursts (no uncached/unaligned reads).
     always_comb begin
-        m_req  = 1'b0;
+        m_req  = (state == S_FILL);
         m_addr = fill_base;
         m_len  = 8'(WORDS-1);
-        unique case (state)
-            S_FILL:   begin m_req = 1'b1; m_addr = fill_base; m_len = 8'(WORDS-1); end
-            S_BYPASS: begin m_req = 1'b1; m_addr = addr_q;    m_len = 8'd0;        end
-            default: ;
-        endcase
     end
 
     // ---- Sequential (FSM / tag / valid / addr / counters) -------------------
@@ -208,7 +216,6 @@ module rv_icache #(
         if (!rst_n) begin
             state    <= S_LOOKUP;
             addr_q   <= RST_ADDR[XLEN-1:0];
-            c_addr_q <= RST_ADDR[XLEN-1:0];
             req_q    <= 1'b0;
             hit_cnt  <= '0;
             miss_cnt <= '0;
@@ -230,10 +237,10 @@ module rv_icache #(
             // stale pre-gap line.  This term primes addr_q for that resume.  It is
             // a structural no-op whenever c_req is held continuously (req_q==1
             // every cycle: bare/M-mode, all unit tests, OpenSBI), and never fires
-            // during a fill/bypass (state!=S_LOOKUP), so the redirect protection
+            // during a fill (state!=S_LOOKUP), so the redirect protection
             // above is preserved.
             //
-            // EXTRA-2: re-arm addr_q from the live c_addr when a FILL or BYPASS
+            // EXTRA-2: re-arm addr_q from the live c_addr when a FILL
             // completes (m_done) with a request still presented.  The physical
             // address of the SAME held fetch_pc can change underneath a multi-
             // cycle fill: an MRET/SRET privilege switch translates the first
@@ -251,7 +258,6 @@ module rv_icache #(
             if (addr_q_en)
                 addr_q <= c_addr;
             req_q    <= c_req;
-            c_addr_q <= c_addr;
 
             // FENCE.I invalidate (cheap: clear all valid bits).
             if (flush)
@@ -261,7 +267,26 @@ module rv_icache #(
                 S_LOOKUP: begin
                     if (req_q) begin
                         if (straddle) begin
-                            state <= S_BYPASS;   // line-crossing window: uncached
+                            if (hit && hit2) begin
+                                // line-crossing window served this cycle from both
+                                // cached lines (combinationally); stay in S_LOOKUP.
+                                hit_cnt <= hit_cnt + 32'd1;
+                            end else if (!hit) begin
+                                // cold straddle: fill THIS line first (then re-eval).
+                                fill_idx  <= idx;
+                                fill_tag  <= tg;
+                                fill_base <= line_base;
+                                miss_cnt  <= miss_cnt + 32'd1;
+                                state     <= S_FILL;
+                            end else begin
+                                // this line cached, NEXT line missing: fill it; the
+                                // re-lookup then sees hit && hit2 and serves.
+                                fill_idx  <= idx_p1;
+                                fill_tag  <= tg_next;
+                                fill_base <= line_base + XLEN'(LINE_BYTES);
+                                miss_cnt  <= miss_cnt + 32'd1;
+                                state     <= S_FILL;
+                            end
                         end else if (hit) begin
                             hit_cnt <= hit_cnt + 32'd1;
                         end else begin
@@ -289,10 +314,6 @@ module rv_icache #(
                     // (rd_en/rd_set above); line_q is valid next cycle, when the
                     // held address re-looks-up in S_LOOKUP and hits.
                     state <= S_LOOKUP;
-                end
-
-                S_BYPASS: begin
-                    if (m_done) state <= S_LOOKUP;
                 end
 
                 default: state <= S_LOOKUP;
