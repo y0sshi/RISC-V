@@ -2,9 +2,10 @@
 # bringup_fw.tcl - generic loader: dow an arbitrary firmware ELF + boot + read marker.
 # =============================================================================
 # Iterate test firmwares on the SAME bitstream (no Vivado rebuild needed).
-#   & "E:\Tools\Xilinx\Vitis\2024.2\bin\xsct.bat" `
-#       E:\work\git\RISC-V.git\boards\zybo_z720\vitis\bringup_fw.tcl `
-#       E:\work\git\RISC-V.git\src\software\boot\jalmin_u_hw.elf
+# From the repo root in PowerShell (Xilinx tool via $env:XILINX_VITIS or PATH):
+#   & "$env:XILINX_VITIS\bin\xsct.bat" `
+#       $PWD\boards\zybo_z720\vitis\bringup_fw.tcl `
+#       $PWD\src\software\boot\jalmin_u_hw.elf
 #
 # Marker @0x300000: advancing = ret round-trips; 0xDEADBEEF = ret died at boot.
 # Open TeraTerm 57600 8N1 if the firmware uses the UART.

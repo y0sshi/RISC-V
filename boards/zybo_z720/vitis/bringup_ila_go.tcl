@@ -5,8 +5,8 @@
 # Manager.  Deasserts the PL reset so the core boots from 0x200000; the armed ILA
 # then captures the first instructions (the jal + the failing ret).
 #
-#   & "E:\Tools\Xilinx\Vitis\2024.2\bin\xsct.bat" `
-#       E:\work\git\RISC-V.git\boards\zybo_z720\vitis\bringup_ila_go.tcl
+#   & "$env:XILINX_VITIS\bin\xsct.bat" `
+#       $PWD\boards\zybo_z720\vitis\bringup_ila_go.tcl   (from the repo root)
 #
 # After it boots, read the marker to see whether ret round-tripped:
 #   0x300000 advancing (>0) -> ret worked    |    0xDEADBEEF -> ret died at boot

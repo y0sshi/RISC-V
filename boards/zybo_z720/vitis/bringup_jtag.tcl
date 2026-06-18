@@ -10,8 +10,8 @@
 #
 # The XSDB/debug commands (connect/targets/dow/fpga/...) ARE available in this
 # Vitis 2024.2 install (only the classic IDE *project* flow is not).  Run:
-#   & "E:\Tools\Xilinx\Vitis\2024.2\bin\xsct.bat" `
-#       E:\work\git\RISC-V.git\boards\zybo_z720\vitis\bringup_jtag.tcl
+#   & "$env:XILINX_VITIS\bin\xsct.bat" `
+#       $PWD\boards\zybo_z720\vitis\bringup_jtag.tcl   (from the repo root)
 #
 # Then observe the OpenSBI banner on the Pmod JC USB-UART at 57600 8N1
 # (FPGA TX=V15 -> adapter RX, FPGA RX=W15 <- adapter TX, common GND).

@@ -13,8 +13,8 @@
 #   3) xsct  bringup_ila_go.tcl    <- DEASSERT PL reset -> core boots -> ILA triggers
 #   4) Vivado Hardware Manager     <- view waveform; also `mrd 0x00300000 1` (marker)
 #
-#   & "E:\Tools\Xilinx\Vitis\2024.2\bin\xsct.bat" `
-#       E:\work\git\RISC-V.git\boards\zybo_z720\vitis\bringup_ila_pre.tcl
+#   & "$env:XILINX_VITIS\bin\xsct.bat" `
+#       $PWD\boards\zybo_z720\vitis\bringup_ila_pre.tcl   (from the repo root)
 # =============================================================================
 
 set here [file normalize [file dirname [info script]]]

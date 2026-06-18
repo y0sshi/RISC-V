@@ -6,12 +6,12 @@
 # the implemented bitstream, and is the hand-off Vitis consumes to generate the
 # FSBL and BOOT.bin (prep-C) and the JTAG bring-up scripts (prep-D).
 #
-# Run from PowerShell with an ABSOLUTE -source path (Bash/MSYS path translation
-# crashes Vivado synth/child processes; a relative path makes Vivado's cwd != repo
-# root and "couldn't read file"):
-#   & "E:\Tools\Xilinx\Vivado\2024.2\bin\vivado.bat" -mode batch `
-#       -source E:\work\git\RISC-V.git\boards\zybo_z720\vivado\export_xsa.tcl `
-#       *> E:\work\git\RISC-V.git\boards\zybo_z720\vivado\export_xsa.log 2>&1
+# Run from PowerShell (NOT Bash/MSYS -- its path translation crashes Vivado).  The
+# -source path must be ABSOLUTE (a relative path makes Vivado's cwd != repo root
+# and "couldn't read file"); from the repo root, $PWD\... is absolute:
+#   & "$env:XILINX_VIVADO\bin\vivado.bat" -mode batch `
+#       -source $PWD\boards\zybo_z720\vivado\export_xsa.tcl `
+#       *> $PWD\boards\zybo_z720\vivado\export_xsa.log 2>&1
 #
 # Requires a completed impl_1 with a written bitstream (build_zybo.tcl -tclargs bit).
 # Output: boards/zybo_z720/vivado/rv_riscv_zybo/rv_riscv_zybo.xsa (gitignored).

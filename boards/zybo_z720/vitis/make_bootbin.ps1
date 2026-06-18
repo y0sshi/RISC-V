@@ -17,16 +17,37 @@
 # validating the bootgen flow but will mis-clock the UART on hardware.
 # =============================================================================
 param(
-    [string]$Firmware = "E:\work\git\RISC-V.git\tests\opensbi\work\fw_payload_lo.bin",
-    [string]$Out      = "E:\work\git\RISC-V.git\boards\zybo_z720\vitis\BOOT.bin"
+    [string]$Firmware,
+    [string]$Out,
+    [string]$Bootgen
 )
 
 $ErrorActionPreference = "Stop"
-$repo   = "E:\work\git\RISC-V.git"
-$here   = Join-Path $repo "boards\zybo_z720\vitis"
+
+# Paths derived from this script's location (boards/zybo_z720/vitis/ -> repo is 3 up).
+$here   = $PSScriptRoot
+$repo   = (Resolve-Path (Join-Path $here "..\..\..")).Path
+if (-not $Firmware) { $Firmware = Join-Path $repo "tests\opensbi\work\fw_payload_lo.bin" }
+if (-not $Out)      { $Out      = Join-Path $here "BOOT.bin" }
 $fsbl   = Join-Path $here "ws\zybo_plat\export\zybo_plat\sw\boot\fsbl.elf"
 $bit    = Join-Path $repo "boards\zybo_z720\vivado\rv_riscv_zybo\rv_riscv_zybo.runs\impl_1\bd_riscv_wrapper.bit"
-$bootgen= "E:\Tools\Xilinx\Vitis\2024.2\bin\bootgen.bat"
+
+# bootgen: explicit -Bootgen, then env var, then PATH (run Xilinx settings64.bat).
+$bootgen = $Bootgen
+if (-not ($bootgen -and (Test-Path $bootgen))) {
+    foreach ($v in @("BOOTGEN_BIN","XILINX_VITIS")) {
+        $val = [Environment]::GetEnvironmentVariable($v)
+        if ($val) { foreach ($c in @($val, (Join-Path $val "bin\bootgen.bat"))) { if (Test-Path $c) { $bootgen = $c; break } } }
+        if ($bootgen -and (Test-Path $bootgen)) { break }
+    }
+}
+if (-not ($bootgen -and (Test-Path $bootgen))) {
+    $cmd = Get-Command bootgen.bat -ErrorAction SilentlyContinue
+    if ($cmd) { $bootgen = $cmd.Source }
+}
+if (-not ($bootgen -and (Test-Path $bootgen))) {
+    throw "Cannot find bootgen.bat. Pass -Bootgen <path>, set BOOTGEN_BIN/XILINX_VITIS, or add the Xilinx bin to PATH (settings64.bat)."
+}
 
 foreach ($f in @($fsbl, $bit, $Firmware, $bootgen)) {
     if (-not (Test-Path $f)) { throw "missing input: $f" }

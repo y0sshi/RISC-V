@@ -11,11 +11,11 @@
 # component -- no separate "Zynq FSBL" app is needed (and the stock app template
 # fails here anyway because the platform BSP omits xilffs/xilrsa).
 #
-# Run in BATCH from PowerShell (absolute paths; Bash/MSYS path translation breaks
-# the Xilinx tools):
-#   & "E:\Tools\Xilinx\Vitis\2024.2\bin\vitis.bat" -s `
-#       E:\work\git\RISC-V.git\boards\zybo_z720\vitis\fsbl.py `
-#       *> E:\work\git\RISC-V.git\boards\zybo_z720\vitis\fsbl.log 2>&1
+# Run in BATCH from PowerShell, NOT Bash/MSYS (its path translation breaks the
+# Xilinx tools).  From the repo root (tool via $env:XILINX_VITIS or PATH):
+#   & "$env:XILINX_VITIS\bin\vitis.bat" -s `
+#       $PWD\boards\zybo_z720\vitis\fsbl.py `
+#       *> $PWD\boards\zybo_z720\vitis\fsbl.log 2>&1
 #
 # Output FSBL ELF (workspace is gitignored):
 #   boards/zybo_z720/vitis/ws/zybo_plat/export/zybo_plat/sw/boot/fsbl.elf
