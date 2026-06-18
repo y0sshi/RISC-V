@@ -31,7 +31,8 @@ foreach f [list $ps7_init $bit $fw] {
 puts "== connecting =="
 connect
 targets -set -nocase -filter {name =~ "*Cortex-A9*#0"}
-stop
+catch { stop };  # may already be stopped from a prior session -> don't abort
+
 
 puts "== ps7_init =="
 source $ps7_init

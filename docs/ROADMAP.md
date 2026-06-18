@@ -47,15 +47,26 @@ ISA/テスト詳細は `CLAUDE.md`、実機バグ史は memory `zybo-jalr-fetch-
 
 ### ① atomic 整合性バグ修正 → CONFIG_NET=y (最優先・基盤)
 
-実機 Linux が `inet_init → netlink_table_grab` で PID1 永久ブロック (`nl_table_users` が 0 に戻らない)。
-sim では通過するため **実機固有** = straddle と同じクラス。netlink は atomic カウンタ + waitqueue
-(LR/SC) を使うので、**実 DDR タイミング下の LR/SC・AMO・FENCE の整合性**が最有力。
+実機 Linux が `inet_init → ip_fib_init → __netlink_kernel_create → netlink_table_grab` で PID1 永久ブロック
+(`nl_table_users` が 0 に戻らない)。sim では通過するため **実機固有** = straddle と同じ「sim クリーン/実機 fail」
+クラス (ただし straddle 自体とは別バグ。straddle は解消済)。
 
+- **✅ 2026-06-18 JTAG 切り分けで根本原因クラス確定** (詳細メモリ [[zybo-netlink-atomic-bug]]):
+  - **間欠的なレース** — 同一 NET=y fw で **boot#1 は userspace 到達、boot#2 は同じ netlink site で hang**。
+  - 決定的データ: RISC-V の PS DDR を A9 から `mrd` で直読 (`boards/zybo_z720/vitis/inspect_netlink.tcl`)。
+    `nl_table_users` (atomic_t, HW PA `0x0191d9f8`) が **1 に固着**・`jiffies_64` は前進 (カーネル生存・真の待機)。
+  - = `netlink_unlock_table` の `atomic_dec_and_test` (`amoadd.w -1`) の **dec が喪失** (counter 破損)。値が巨大
+    ゴミでなく**ちょうど 1** = 「stale read→ゴミ書込」でなく **AMO 書込フェーズが落ちた (dec が実行されず)**。
+    → #15/#16 と同族の「可変レイテンシ × flush/IRQ × AMO/atomic retire 衝突」。sim BFM (低レイテンシ) は窓を開かない。
+  - 容疑 = `rv_core.sv` AMO 2-phase 書込コミット / `rv_dcache.sv` write-through / burst bridge の read/write 交錯。
+    inspection 上 AMO は flush/IRQ から保護されて見える (書込中 `dmem_wait=1`→`flush_ex_mem` 不可) ので、レースは
+    より微妙で波形観測が要る。
 - **なぜ最優先**: networking 単体でなく **コア正当性の問題**。RootFS の userspace は futex/atomic を酷使する
-  ので、潰さないと ③ が不安定化する恐れ。`CONFIG_NET=n` で net 経路に切り分け済み。
-- **初手**: 実機 ILA で `nl_table_users` の `atomic_dec` と `netlink_unlock_table` の wake を観測 →
-  LR/SC 命令列の実機挙動を確認。straddle と同じ ILA 資産・手法が使える。
-- **完了条件**: `CONFIG_NET=y` の Linux が実機で userspace 到達。
+  ので、潰さないと ③ が不安定化する恐れ。`CONFIG_NET=n` で net 経路に切り分け・workaround 済 (`kernel_fragment.config`)。
+- **次の手**: (a) focused sim 再現 (amoadd inc/dec を IRQ+AXI 遅延+IF/data 競合下で叩き counter 不復帰を Verilator
+  で再現; 遅延ノブ `BOOT_AR_DELAY` 等を `tb_rv_boot_soc`/`src/sim/Makefile` に追加済) → 出れば波形デバッグ。
+  (b) 実機 ILA: data-write AXI を `nl_table_users` PA でトリガし落ちる dec の AMO FSM/flush/bridge 信号を捕捉。
+- **完了条件**: `CONFIG_NET=y` の Linux が実機で **複数回連続** userspace 到達 (間欠ゆえ 1 回成功では不十分)。
 
 ### ② 動作周波数向上 25→50MHz+ (基盤・加速)
 
@@ -103,7 +114,7 @@ sim では通過するため **実機固有** = straddle と同じクラス。ne
 | バグ | 状態 | 対応 |
 |---|---|---|
 | **I$ straddle** (redirect 先 straddle の squash race / 実 S_AXI_HP 非アライン AXI) | ✅ 解決 | rv_icache 2-line 化 + S_BYPASS 全廃 (commit fd382da)。sim + 実機検証済 |
-| **netlink/atomic ハング** (`nl_table_users` 不復帰、実 DDR 下 atomic 疑い) | ⚠️ 回避中 | `CONFIG_NET=n` で回避。根治は ロードマップ ① |
+| **netlink/atomic ハング** (間欠レース。`nl_table_users` が 1 固着 = `amoadd.w -1` の dec 喪失 = counter 破損。JTAG 切り分け済 2026-06-18) | ⚠️ 回避中 | `CONFIG_NET=n` で回避。根治は ロードマップ ① ([[zybo-netlink-atomic-bug]] / `inspect_netlink.tcl`) |
 
 ---
 

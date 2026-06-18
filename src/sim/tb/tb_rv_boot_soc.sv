@@ -123,7 +123,28 @@ module tb_rv_boot_soc;
     );
 
     // AXI latency (cycles).  Low for the large OpenSBI image to keep sim time down.
-    logic [7:0] ard=8'd0, rd_=8'd0, awd=8'd0, wd=8'd0, bd=8'd0;
+    // Overridable at compile time to emulate real-HW DDR/SmartConnect latency:
+    // -DBOOT_AR_DELAY=<n> (read addr->data lead), -DBOOT_R_DELAY=<n> (extra beat
+    // latency), -DBOOT_AW/W/B_DELAY for writes.  Default 0 = strict no-op (the
+    // proven baseline).  Used to widen the imem_ready/dmem_wait stall windows that
+    // mask variable-latency atomic/LR-SC races on bare BRAM-like (0-delay) memory.
+`ifndef BOOT_AR_DELAY
+  `define BOOT_AR_DELAY 0
+`endif
+`ifndef BOOT_R_DELAY
+  `define BOOT_R_DELAY 0
+`endif
+`ifndef BOOT_AW_DELAY
+  `define BOOT_AW_DELAY 0
+`endif
+`ifndef BOOT_W_DELAY
+  `define BOOT_W_DELAY 0
+`endif
+`ifndef BOOT_B_DELAY
+  `define BOOT_B_DELAY 0
+`endif
+    logic [7:0] ard=8'd`BOOT_AR_DELAY, rd_=8'd`BOOT_R_DELAY, awd=8'd`BOOT_AW_DELAY,
+                wd=8'd`BOOT_W_DELAY, bd=8'd`BOOT_B_DELAY;
 
     // 64 MiB shared DDR image.  Must cover OpenSBI firmware + payload (2 MiB
     // offset) AND the FDT relocation target (~0x8220_0000 = 34 MiB), which the

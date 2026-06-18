@@ -706,8 +706,29 @@ ifneq ($(BOOT_VCD),)
 BOOT_DBG_FLAG += -DBOOT_VCD
 endif
 
+# Optional: AXI BFM latency injection (cycles) to emulate real-HW DDR/SmartConnect
+# timing.  Default 0 (strict no-op = proven baseline).  Widens the imem_ready/
+# dmem_wait stall windows that mask variable-latency atomic/LR-SC races on the
+# otherwise near-combinational (0-delay) BFM.  e.g. BOOT_AR_DELAY=8 BOOT_R_DELAY=4
+BOOT_DELAY_FLAG =
+ifneq ($(BOOT_AR_DELAY),)
+BOOT_DELAY_FLAG += -DBOOT_AR_DELAY=$(BOOT_AR_DELAY)
+endif
+ifneq ($(BOOT_R_DELAY),)
+BOOT_DELAY_FLAG += -DBOOT_R_DELAY=$(BOOT_R_DELAY)
+endif
+ifneq ($(BOOT_AW_DELAY),)
+BOOT_DELAY_FLAG += -DBOOT_AW_DELAY=$(BOOT_AW_DELAY)
+endif
+ifneq ($(BOOT_W_DELAY),)
+BOOT_DELAY_FLAG += -DBOOT_W_DELAY=$(BOOT_W_DELAY)
+endif
+ifneq ($(BOOT_B_DELAY),)
+BOOT_DELAY_FLAG += -DBOOT_B_DELAY=$(BOOT_B_DELAY)
+endif
+
 sim_boot: dirs
-	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) $(BOOT_DELAY_FLAG) \
 		-o $(OUT_DIR)/tb_rv_boot_soc.vvp \
 		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
 	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_boot_soc.vvp
@@ -741,7 +762,7 @@ image_verilator:
 
 vl_boot: dirs
 	$(VL_DOCKER_RUN) verilator $(VL_FLAGS) -DRV_XLEN_64 \
-		$(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) \
+		$(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) $(BOOT_DELAY_FLAG) \
 		-I$(INC_DIR) --top-module tb_rv_boot_soc --Mdir $(VL_BOOT_MDIR) -o tb_rv_boot_soc \
 		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
 	$(VL_DOCKER_RUN) ./$(VL_BOOT_MDIR)/tb_rv_boot_soc

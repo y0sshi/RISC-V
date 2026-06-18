@@ -36,7 +36,7 @@ connect
 
 # ---- Select the PS Cortex-A9 #0 (for PS init + DDR access over JTAG) ----
 targets -set -nocase -filter {name =~ "*Cortex-A9*#0"}
-stop
+catch { stop };  # may already be stopped from a prior session -> don't abort
 
 # ---- PS init: DDR controller, MIO, clocks (FCLK_CLK0 = 25 MHz) ----
 puts "== ps7_init (DDR / MIO / clocks) =="
