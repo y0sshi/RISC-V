@@ -8,10 +8,13 @@ A SystemVerilog RISC-V processor core designed for learning and FPGA implementat
 **RV64 117/117**, **RV32 88/88** (p-variants) + RISCOF I/M/A/C 107/107 vs Spike.
 Builds with iverilog **v12 and v13**, **Verilator 5.x**, and Vivado.
 
-Toward Linux: BRAM->DDR over **AXI4** (2 masters) + **I/D caches** done; **real OpenSBI v1.2
-boots fully** in sim (banner -> S-mode payload, see `docs/opensbi_sim.md`); a minimal RV64
-**Linux kernel boots into early head.S / MMU-enable** (`docs/linux_sim.md`, in progress).
-See [CLAUDE.md](CLAUDE.md) for the always-current detailed status and the Linux roadmap.
+**Boots real Linux on real hardware.** On a Zybo Z7-20 (Zynq-7000) the core boots
+**OpenSBI v1.2 fully** and a **RV64 Linux 6.12 kernel to userspace**
+(`LINUX-USERSPACE-OK: init running`) over PS-DDR via **AXI4** (2 masters) with **I/D caches** —
+verified both in sim (Verilator, ~100x faster) and **on the board over JTAG**. Networking is
+currently disabled (`CONFIG_NET=n`) pending one real-HW atomic bug.
+See **[docs/ROADMAP.md](docs/ROADMAP.md)** for the prioritized plan and [CLAUDE.md](CLAUDE.md)
+for the always-current detailed status.
 
 ## Goals
 
@@ -25,8 +28,9 @@ See [CLAUDE.md](CLAUDE.md) for the always-current detailed status and the Linux 
 
 | Board | FPGA | On-board DRAM | Status |
 |-------|------|---------------|--------|
-| Zybo Z7-20 | Zynq-7000 (XC7Z020) | 1 GB DDR3 (PS) | Board top instantiates SoC on BRAM; PS-DDR via AXI planned |
-| KV260 | Zynq UltraScale+ (XCK26, K26 SOM) | 4 GB DDR4 | Same; PS-DDR via AXI planned |
+| Zybo Z7-20 | Zynq-7000 (XC7Z020) | 1 GB DDR3 (PS) | ✅ Real HW: OpenSBI + Linux to userspace (PS-DDR via AXI, timing met @25 MHz) |
+| KV260 | Zynq UltraScale+ (XCK26, K26 SOM) | 4 GB DDR4 | Board top + scripted BD; not yet brought up on HW |
+| PYNQ-Z1 / Z2 | Zynq-7000 | 512 MB DDR3 | Planned (Zynq-7000, near-identical to Zybo) |
 
 ## Directory Structure
 
@@ -52,7 +56,7 @@ src/
 │   └── Makefile        # iverilog + Verilator simulation
 └── software/
     ├── tests/          # ISA test programs
-    └── boot/           # mini-SBI stand-in firmware (sbi_boot.S)
+    └── boot/           # mini-SBI stand-in (sbi_boot.S) + RTL-bug regression firmware (*_test.S)
 
 tests/
 ├── compliance/         # riscv-tests runner (Docker)
@@ -60,8 +64,14 @@ tests/
 ├── opensbi/            # build.sh: real OpenSBI v1.2 fw_payload
 └── linux/              # build.sh: minimal RV64 Linux Image -> fw_payload
 
-docs/   # architecture.md, isa_implemented.md, axi_ddr.md, cache.md,
-        # opensbi_sim.md, verilator_sim.md, linux_sim.md, next_session_prompt.md
+boards/
+├── zybo_z720/          # Zybo Z7-20: top, XDC, vivado/ BD, vitis/ (FSBL, JTAG bring-up), build_all.ps1
+└── kv260/              # KV260: top, XDC, vivado/ BD
+
+archive/                # retired, out-of-build code (legacy RV32I project)
+
+docs/   # ROADMAP.md, architecture.md, isa_implemented.md, axi_ddr.md, cache.md, opensbi_sim.md,
+        # verilator_sim.md, linux_sim.md, fpga_timing_bringup.md, rtl_bug_history.md, next_session_prompt.md
 ```
 
 ## Quick Start
@@ -82,6 +92,8 @@ cd src/sim
 make sim_boot                          # mini-SBI stand-in on rv_soc (shared DDR, caches)
 make image_verilator                   # build the verilator:5.020 image (once)
 make vl_boot BOOT_HEX=<fw_payload.hex>  # ~100x faster; real OpenSBI ~8s (see docs/verilator_sim.md)
+# RV64 Linux to userspace (LINUX-USERSPACE-OK):
+make vl_boot BOOT_HEX=../../tests/linux/work/fw_payload_linux.hex BOOT_MAX=480000000 BOOT_MTIME_DIV=64
 ```
 
 ### Build Software (RISC-V toolchain required)
@@ -91,27 +103,32 @@ cd src/software
 make all           # Cross-compile test programs to .hex
 ```
 
-### FPGA Build (Vivado, scripted block design)
+### FPGA build & real-HW bring-up (Vivado/Vitis — PowerShell, absolute paths)
 
-```bash
-# PS + AXI SmartConnect + S_AXI_HP wired to rv_soc (2 AXI masters). See boards/vivado_README.md.
-vivado -mode batch -source boards/zybo_z720/vivado/build_zybo.tcl   -tclargs bd    # or synth | bit
-vivado -mode batch -source boards/kv260/vivado/build_kv260.tcl      -tclargs bit
+```powershell
+# One-shot bitstream -> FSBL -> BOOT.bin for Zybo Z7-20 (PS7 + SmartConnect + S_AXI_HP -> rv_soc):
+boards\zybo_z720\build_all.ps1
 ```
+
+Then bring up on the board over JTAG (loads firmware to PS-DDR, configures the PL, prints to
+UART at 57600 8N1) — OpenSBI then Linux: see **[boards/zybo_z720/vitis/README.md](boards/zybo_z720/vitis/README.md)**.
 
 ## Development Roadmap
 
-Done ✅: RV32I/RV64I base · Zicsr + M-mode traps · M · A · **F/D** · **C** · RV64
-(parameterized XLEN) · Supervisor mode + MMU (Sv32/Sv39) · Peripherals (UART/NS16550,
+Done ✅: RV32I/RV64I base · Zicsr + M/S-mode traps · M · A · **F/D** · **C** · RV64
+(parameterized XLEN) · Supervisor mode + MMU (Sv32/Sv39) · peripherals (UART/NS16550,
 CLINT, PLIC, GPIO) · illegal-instr trap · `counteren`/`time` CSR · **BRAM->DDR over AXI4**
-(2 masters) · **I/D caches** · **real OpenSBI v1.2 full boot** in sim · **Verilator** fast sim.
+(2 masters) · **I/D caches** · **real OpenSBI v1.2 full boot** · **RV64 Linux to userspace** —
+all verified in sim (Verilator) **and on real Zybo Z7-20 hardware** · **Verilator** fast sim.
 
-Next (toward Linux) — detail in [CLAUDE.md](CLAUDE.md) and the `linux-boot-roadmap`:
+Next — prioritized plan in **[docs/ROADMAP.md](docs/ROADMAP.md)** (detail in [CLAUDE.md](CLAUDE.md)):
 
-1. **P0-1 (in progress)**: boot a minimal RV64 Linux kernel in sim to the earlycon banner;
-   fix the early-boot core bugs (I-cache / MMU after Sv39 enable — see `docs/linux_sim.md`).
-2. **P1 (FPGA)**: Vivado block design (PS7/PS8 + SmartConnect + S_AXI_HP), bitstream, DDR preload.
-3. **P2/P3**: write-back/set-assoc D-cache, buildroot shell, PMP enforcement, vectored mtvec.
+1. **atomic correctness -> `CONFIG_NET=y`** — fix a real-HW-only netlink/atomic hang (suspected
+   LR/SC / memory-ordering under real DDR; networking is disabled until then).
+2. **Clock frequency** — pipeline the FPU / multiplier to push past 25 MHz.
+3. **RootFS / Ubuntu** — DDR expansion + a block device (larger initramfs first).
+4. **More boards** — PYNQ-Z1/Z2 (easy, Zynq-7000), KV260 (Zynq US+).
+5. **Vector (RVV)** extension.
 
 ### Compliance / test commands
 ```bash
