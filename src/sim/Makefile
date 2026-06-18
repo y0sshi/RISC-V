@@ -666,6 +666,9 @@ endif
 ifneq ($(BOOT_DCWIN),)
 BOOT_TRACE_FLAG += -DBOOT_DCWIN=$(BOOT_DCWIN)
 endif
+ifneq ($(BOOT_CTRPROBE),)
+BOOT_TRACE_FLAG += -DBOOT_CTRPROBE
+endif
 # Differential store-sequence hash (baseline vs C-2a corruption hunt)
 ifneq ($(BOOT_STHASH),)
 BOOT_TRACE_FLAG += -DBFM_STORE_HASH
@@ -693,6 +696,12 @@ BOOT_DBG_FLAG += -DBOOT_NO_DCACHE
 endif
 ifneq ($(BOOT_NO_ICACHE),)
 BOOT_DBG_FLAG += -DBOOT_NO_ICACHE
+endif
+# Model the board's AXI SmartConnect -> ONE PS DDR: serialize the BFM's IF / data
+# / write channels (only one in flight at a time) so I$-vs-data contention -- the
+# real-HW difference the parallel-port BFM cannot show -- is exercised.
+ifneq ($(BOOT_SERIALIZE),)
+BOOT_DBG_FLAG += -DBFM_SERIALIZE
 endif
 ifneq ($(BOOT_ICACHE_SETS),)
 BOOT_DBG_FLAG += -DBOOT_ICACHE_SETS=$(BOOT_ICACHE_SETS)

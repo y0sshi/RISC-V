@@ -50,6 +50,7 @@ module rv_cpu
     // ---- Page-table-walk port (physical address) ----------------------------
     output logic [XLEN-1:0]  ptw_paddr,
     output logic             ptw_req,
+    output logic             ptw_for_if,    // 1 = active PTW is an instruction-fetch walk
     input  wire  [XLEN-1:0]  ptw_rdata,
     input  wire              ptw_ready,
 
@@ -154,6 +155,7 @@ module rv_cpu
         .mem_stall (mem_stall),
         .ptw_paddr (ptw_paddr),
         .ptw_req (ptw_req),
+        .ptw_for_if (ptw_for_if),
         .ptw_rdata (ptw_rdata),
         .ptw_ready (ptw_ready)
     );

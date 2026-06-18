@@ -189,6 +189,13 @@ module tb_rv_boot_soc;
                 u_bfm.mem_b[TOHOST_OFF+1], u_bfm.mem_b[TOHOST_OFF+0]};
     endfunction
 
+    // Read a 32-bit word at a base-relative byte offset (always available, for
+    // failure-context discriminators a focused test leaves near TOHOST).
+    function automatic logic [31:0] peek(input int off);
+        return {u_bfm.mem_b[off+3], u_bfm.mem_b[off+2],
+                u_bfm.mem_b[off+1], u_bfm.mem_b[off+0]};
+    endfunction
+
     // ---- In-context divide-result checker (C-2a regression hunt) -------------
     // At each integer-divide retire, recompute the golden result from the live
     // forwarded operands and compare to the multi-cycle divider output.  Catches
@@ -262,6 +269,25 @@ module tb_rv_boot_soc;
     logic   ever_extirq1 = 0, ever_extirq0 = 0, ever_uirq = 0, ever_ier1 = 0;
     logic   ever_en1 = 0, ever_pend1 = 0;
     logic   itr_d = 0;
+    // ---- PTW-mask hazard detector (netlink atomic_dec loss; rv_soc.sv:364) ----
+    // core_dmem_wait = ptw_req ? 0 : dc_c_wait masks an IN-FLIGHT D$ access (load
+    // miss fill / write-through) whenever ANY ptw_req is asserted -- including an
+    // INSTRUCTION-fetch PTW (ptw_for_if) that is independent of the held data
+    // access.  When an IF-PTW masks a real dc_c_wait, the held AMO/load/store can
+    // advance before its D$ access completes -> lost AMO write (counter stuck at
+    // the pre-decrement value) / stale load.  Pure observation (no DUT effect):
+    // count cycles where an IF-PTW is actively masking a real D$ wait.
+    longint unsigned ptwmask_cyc = 0;   // dc_c_wait & ptw_req (any: window hit)
+    longint unsigned ptwmask_if  = 0;   // dc_c_wait & ptw_req & ptw_for_if
+    longint unsigned ptwmask_adv = 0;   // dc_c_wait & !stall_ex (TRUE harm:
+                                        // a data op leaves MEM while the D$ still
+                                        // has its access in flight = lost/stale)
+    // Smoking gun for the netlink AMO write-loss: amo_state==1 (WRITE phase)
+    // while the D$ is still in S_FILL (the READ-miss line fill).  Only the
+    // ptw_req dmem_wait mask (rv_soc.sv:364) can advance amo_state during the
+    // fill; the AMO then retires at the S_RELOOKUP cycle (c_wait drops) BEFORE
+    // S_LOOKUP latches the write -> the AMO write is lost.  Must be 0 post-fix.
+    longint unsigned amo_prem = 0;
     always @(posedge clk) if (rst_n) begin
         if (u_soc.plic_ext_irq[1])            ever_extirq1 <= 1'b1;
         if (u_soc.plic_ext_irq[0])            ever_extirq0 <= 1'b1;
@@ -280,6 +306,22 @@ module tb_rv_boot_soc;
                 default: ;
             endcase
         end
+`ifndef BOOT_NO_DCACHE
+        if (u_soc.gen_dcache.u_dc.c_wait && u_soc.ptw_req) begin
+            ptwmask_cyc <= ptwmask_cyc + 1;
+            if (u_soc.u_cpu.u_mmu.ptw_for_if) ptwmask_if <= ptwmask_if + 1;
+        end
+        // TRUE harm: the D$ still has an access in flight (c_wait) yet the core
+        // is NOT stalling EX -> the held data op (AMO/load/store) is retiring
+        // before its D$ access completes.  Only reachable because core_dmem_wait
+        // was masked to 0 by ptw_req (rv_soc.sv:364).
+        if (u_soc.gen_dcache.u_dc.c_wait && !u_soc.u_cpu.u_core.stall_ex)
+            ptwmask_adv <= ptwmask_adv + 1;
+        // amo_state in WRITE phase while the D$ is still in S_FILL = premature
+        // advance (the write will be lost when the AMO retires at S_RELOOKUP).
+        if (u_soc.u_cpu.u_core.amo_state && (u_soc.gen_dcache.u_dc.state == 2'd1))
+            amo_prem <= amo_prem + 1;
+`endif
     end
 
 `ifdef MTIME_INSTR
@@ -399,6 +441,22 @@ module tb_rv_boot_soc;
     endfunction
     always @(posedge clk) if (rst_n) begin
         tcyc <= tcyc + 1;
+`ifdef BOOT_CTRPROBE
+        // Focused probe: every D$ access (and AMO state) touching the watched
+        // line (BOOT_WATCH_PA), to localize a stale amoadd read.
+`ifndef BOOT_NO_DCACHE
+        if (u_soc.gen_dcache.u_dc.c_req
+            && (u_soc.gen_dcache.u_dc.c_addr[31:5] == (`BOOT_WATCH_PA >> 5)))
+            $display("[CTR c%0d] dcst=%0d we=%b hit=%b cwait=%b mdone=%b mrv=%b rdq=%016h cwd=%016h | amo_st=%b amo_sl=%b exmpc=%h imrdy=%b sex=%b",
+                tcyc, u_soc.gen_dcache.u_dc.state, u_soc.gen_dcache.u_dc.c_we,
+                u_soc.gen_dcache.u_dc.hit, u_soc.gen_dcache.u_dc.c_wait,
+                u_soc.gen_dcache.u_dc.m_done, u_soc.gen_dcache.u_dc.m_rvalid,
+                u_soc.gen_dcache.u_dc.rdata_q, u_soc.gen_dcache.u_dc.c_wdata,
+                u_soc.u_cpu.u_core.amo_state, u_soc.u_cpu.u_core.amo_stall,
+                u_soc.u_cpu.u_core.ex_mem_pc, u_soc.imem_ready,
+                u_soc.u_cpu.u_core.stall_ex);
+`endif
+`endif
 `ifdef BOOT_DCWIN
         // IF AXI channel state in the wedge window (why does a fill never finish?).
         if (tcyc >= `BOOT_DCWIN && tcyc <= `BOOT_DCWIN + 160)
@@ -1041,6 +1099,15 @@ module tb_rv_boot_soc;
         $display("[IRQCHAIN final] ier1(THRI)=%b uart_irq=%b plic_en1=%b plic_pend=%b ext_ctx1=%b ext_ctx0=%b | seip_traps=%0d meip_traps=%0d stip_traps=%0d",
                  ever_ier1, ever_uirq, ever_en1, ever_pend1, ever_extirq1, ever_extirq0,
                  n_seip, n_meip, n_stip);
+        $display("[PTWMASK] ptw_req masked a real D$ wait: %0d cyc (of which IF-PTW: %0d) | HARM (data op retired w/ D$ in flight): %0d | AMO premature-write (write phase during S_FILL): %0d",
+                 ptwmask_cyc, ptwmask_if, ptwmask_adv, amo_prem);
+        // Focused-test failure discriminator: a test that FAILs may leave
+        // disc@0x2004 (1 = architectural check broke; >=2 = trap mcause),
+        // A@0x2008, B@0x200C.  Only meaningful on FAIL (real firmware has
+        // arbitrary data there), so gate on the FAIL sentinel.
+        if (sentinel() === FAIL_MAGIC)
+            $display("[FAILINFO] disc@2004=%08h A@2008=%08h B@200C=%08h",
+                     peek(32'h2004), peek(32'h2008), peek(32'h200c));
         if (sentinel() === DONE_MAGIC) begin
             $display("tb_rv_boot_soc: PASS (firmware reached SBI done; sentinel=0x%08h)", sentinel());
             $display("ALL TESTS PASSED");

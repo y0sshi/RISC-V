@@ -121,7 +121,7 @@ module rv_axi_dualport_mem_bfm #(
             d_rstate<=R_IDLE; d_rcnt<='0; d_rlen_q<='0; d_rbeat<='0;
             d_raddr_q<='0; d_rid_q<='0; d_rdata<='0;
         end else case (d_rstate)
-            R_IDLE:   if (d_arvalid) begin d_raddr_q<=d_araddr; d_rid_q<=d_arid; d_rlen_q<=d_arlen; d_rcnt<=ar_delay; d_rstate<=R_ARWAIT; end
+            R_IDLE:   if (ser_grant_dr) begin d_raddr_q<=d_araddr; d_rid_q<=d_arid; d_rlen_q<=d_arlen; d_rcnt<=ar_delay; d_rstate<=R_ARWAIT; end
             R_ARWAIT: if (d_rcnt==0) begin d_rcnt<=r_delay; d_rbeat<=0; d_rstate<=R_LAT; end else d_rcnt<=d_rcnt-8'd1;
             R_LAT:    if (d_rcnt==0) begin d_rdata<=d_beat_rd(8'd0); d_rstate<=R_DATA; end else d_rcnt<=d_rcnt-8'd1;
             R_DATA:   if (d_rready) begin
@@ -156,7 +156,7 @@ module rv_axi_dualport_mem_bfm #(
         if (!rst_n) begin
             d_wstate<=W_IDLE; d_wcnt<='0; d_waddr_q<='0; d_wid_q<='0;
         end else case (d_wstate)
-            W_IDLE:   if (d_awvalid) begin d_waddr_q<=d_awaddr; d_wid_q<=d_awid; d_wcnt<=aw_delay; d_wstate<=W_AWWAIT; end
+            W_IDLE:   if (ser_grant_dw) begin d_waddr_q<=d_awaddr; d_wid_q<=d_awid; d_wcnt<=aw_delay; d_wstate<=W_AWWAIT; end
             W_AWWAIT: if (d_wcnt==0) begin d_wcnt<=w_delay; d_wstate<=W_WWAIT; end else d_wcnt<=d_wcnt-8'd1;
             W_WWAIT:  if (d_wcnt==0) begin
                           if (d_wvalid) begin
@@ -214,6 +214,32 @@ module rv_axi_dualport_mem_bfm #(
     logic [ADDR_WIDTH-1:0] i_raddr_q;
     logic [ID_WIDTH-1:0]  i_rid_q;
 
+    // =========================================================================
+    // Optional single-DDR serialization (BFM_SERIALIZE): model the real board's
+    // AXI SmartConnect -> ONE PS DDR, where the instruction master, the data
+    // master and the write channel cannot all reach DRAM at once.  The default
+    // (independent ports) lets I$ line fills run in PARALLEL with data/PTW
+    // traffic -- which the board CANNOT do -- hiding the I$-vs-data contention
+    // suspected in the netlink atomic_dec loss (memory zybo-netlink-atomic-bug).
+    // When defined, at most ONE of {data-read, data-write, instruction-read} is
+    // in flight at a time; a fixed priority (data-read > data-write >
+    // instruction-read) breaks simultaneous requests so exactly one transaction
+    // is accepted per idle cycle.  These grants gate the IDLE->accept edges of
+    // the three FSMs below; everything else is unchanged (strict no-op when the
+    // macro is undefined: grant == the channel's own *valid).
+    wire ser_grant_dr, ser_grant_dw, ser_grant_ir;
+`ifdef BFM_SERIALIZE
+    wire ser_any_busy = (d_rstate != R_IDLE) || (d_wstate != W_IDLE)
+                        || (i_rstate != R_IDLE);
+    assign ser_grant_dr = !ser_any_busy && d_arvalid;
+    assign ser_grant_dw = !ser_any_busy && !d_arvalid && d_awvalid;
+    assign ser_grant_ir = !ser_any_busy && !d_arvalid && !d_awvalid && i_arvalid;
+`else
+    assign ser_grant_dr = d_arvalid;
+    assign ser_grant_dw = d_awvalid;
+    assign ser_grant_ir = i_arvalid;
+`endif
+
     function automatic [31:0] i_beat_rd(input [7:0] beat);
         logic [63:0] off; logic [31:0] d;
         off = base_off(i_raddr_q, 1'b0, 4) + 64'(beat) * 4;
@@ -226,7 +252,7 @@ module rv_axi_dualport_mem_bfm #(
             i_rstate<=R_IDLE; i_rcnt<='0; i_rlen_q<='0; i_rbeat<='0;
             i_raddr_q<='0; i_rid_q<='0; i_rdata<='0;
         end else case (i_rstate)
-            R_IDLE:   if (i_arvalid) begin i_raddr_q<=i_araddr; i_rid_q<=i_arid; i_rlen_q<=i_arlen; i_rcnt<=ar_delay; i_rstate<=R_ARWAIT; end
+            R_IDLE:   if (ser_grant_ir) begin i_raddr_q<=i_araddr; i_rid_q<=i_arid; i_rlen_q<=i_arlen; i_rcnt<=ar_delay; i_rstate<=R_ARWAIT; end
             R_ARWAIT: if (i_rcnt==0) begin i_rcnt<=r_delay; i_rbeat<=0; i_rstate<=R_LAT; end else i_rcnt<=i_rcnt-8'd1;
             R_LAT:    if (i_rcnt==0) begin i_rdata<=i_beat_rd(8'd0); i_rstate<=R_DATA; end else i_rcnt<=i_rcnt-8'd1;
             R_DATA:   if (i_rready) begin

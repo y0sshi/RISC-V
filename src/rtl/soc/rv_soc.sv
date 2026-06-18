@@ -116,6 +116,7 @@ module rv_soc
     logic [XLEN-1:0]   core_dmem_wdata;  logic [XLEN/8-1:0] core_dmem_wstrb;
     logic [XLEN-1:0]   core_dmem_va;
     logic [XLEN-1:0]   ptw_paddr;    logic ptw_req;
+    logic              ptw_for_if;
     logic [XLEN-1:0]   ptw_rdata;    logic ptw_ready;
     logic [31:0]       imem_rdata;   logic imem_ready;
     logic [XLEN-1:0]   dmem_rdata;   logic dmem_ready;
@@ -139,7 +140,7 @@ module rv_soc
         .dmem_wait (core_dmem_wait),
         .dmem_va (core_dmem_va),
         .fence_i_out (cpu_fence_i),
-        .ptw_paddr (ptw_paddr), .ptw_req (ptw_req),
+        .ptw_paddr (ptw_paddr), .ptw_req (ptw_req), .ptw_for_if (ptw_for_if),
         .ptw_rdata (ptw_rdata), .ptw_ready (ptw_ready),
         // External interrupt: OR both PLIC contexts (0 = M/MEIP, 1 = S/SEIP per
         // the DT interrupts-extended <&intc 11 &intc 9>).  Only one context owns
@@ -361,7 +362,18 @@ module rv_soc
     // which the PTW FSM samples on ptw_ready).  Peripheral accesses keep the data
     // master idle so the core does not stall and the 1-cycle registered peripheral
     // read is selected next cycle.
-    assign core_dmem_wait = ptw_req ? 1'b0 : dc_c_wait;
+    // Mask the data-side wait ONLY for a DATA-translation PTW (ptw_for_if=0): the
+    // MEM instruction is mid-translation so there is no in-flight D$ access to
+    // honor (dc_c_wait is already 0 in that case).  An INSTRUCTION-fetch PTW
+    // (ptw_for_if=1) is INDEPENDENT of the held data access and must NOT blind
+    // the core to a real dc_c_wait: doing so let an AMO's amo_state advance to
+    // its WRITE phase during the read-miss line fill (S_FILL), after which the
+    // AMO retired at the S_RELOOKUP cycle (c_wait drops) before S_LOOKUP could
+    // latch the write -> the AMO write was LOST (nl_table_users stuck -> the
+    // CONFIG_NET=y netlink hang; memory zybo-netlink-atomic-bug).  Strict no-op
+    // when vm is off (ptw_req=0) and for data PTWs.  Repro/regression:
+    // src/software/boot/ptw_amo_test.S.
+    assign core_dmem_wait = (ptw_req && !ptw_for_if) ? 1'b0 : dc_c_wait;
     assign ptw_rdata      = br_rdata;
     assign ptw_ready      = owner_ptw & br_done;   // only the PTW's own completion
 

@@ -81,6 +81,7 @@ module rv_mmu
     // ---- PTW physical-memory port (rv_soc muxes with dmem) -----------------
     output logic [XLEN-1:0]  ptw_paddr,
     output logic             ptw_req,
+    output logic             ptw_for_if,     // 1 = the active PTW is an instruction-fetch walk
     input  wire  [XLEN-1:0]  ptw_rdata,
     input  wire              ptw_ready
 );
@@ -224,7 +225,7 @@ module rv_mmu
 
     ptw_state_t      ptw_state;
     logic            ptw_wait;            // 1 = just entered new state, skip 1 cycle
-    logic            ptw_for_if;          // 1 = walking for IF port
+    // ptw_for_if is now an output port (see port list); driven by the PTW FSM.
     logic [VPN_W-1:0] ptw_vpn;           // VPN of the VA being walked
     logic [PPN_INT_W-1:0] ptw_ppn_cur;   // PPN of the current page table
 

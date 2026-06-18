@@ -119,7 +119,27 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello boot boot_lo stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test
+.PHONY: hello sim_hello boot boot_lo stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test ptw_amo_test
+
+# ----- ptw_amo_test: AMO write-loss when an IF-PTW masks the D$ wait -----
+# Focused reproducer for the real-HW netlink atomic_dec loss (rv_soc.sv:364
+# core_dmem_wait = ptw_req ? 0 : dc_c_wait masks an in-flight D$ access for ANY
+# ptw_req, incl. an instruction-fetch PTW).  Sv39 ON, amoadd.w at a code-page
+# end so the next fetch IF-PTWs during the AMO's D$ fill -> the write is lost
+# and the counter invariant breaks.  MMU-gated, so all M-mode tests miss it.
+#   make ptw_amo_test  &&  (cd ../sim && rm -rf out/vl_boot && make vl_boot \
+#     BOOT_HEX=../software/boot/ptw_amo_test.hex \
+#     VL_FLAGS="<defaults> -DBOOT_AR_DELAY=50 -DBOOT_R_DELAY=4")
+ptw_amo_test: boot/ptw_amo_test.hex
+
+boot/ptw_amo_test.elf: boot/ptw_amo_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/ptw_amo_test.S -o boot/ptw_amo_test.elf
+
+boot/ptw_amo_test.hex: boot/ptw_amo_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/ptw_amo_test.elf boot/ptw_amo_test.hex
+	@echo "  ptw_amo_test hex: $@"
 
 # ----- mal_cachemiss_test: misaligned 8-byte access retiring while I$ not ready
 # Reproducer for RTL bug #15 (mal_state restart-livelock): a misaligned 8-byte
