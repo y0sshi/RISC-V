@@ -60,6 +60,7 @@ module rv_dcache #(
 
     // ---- Core (physical-address) data port; cacheable accesses only ---------
     input  wire                c_req,
+    input  wire                c_new,    // 1-cycle strobe: first cycle of a NEW access
     input  wire                c_we,
     input  wire  [XLEN-1:0]    c_addr,
     input  wire  [XLEN-1:0]    c_wdata,
@@ -118,8 +119,28 @@ module rv_dcache #(
     wire             hit  = c_req & valid[idx] & (tagm[idx] == tg);
     wire [XLEN-1:0]  line_base = {c_addr[XLEN-1:OFFW], {OFFW{1'b0}}};
 
+    logic   hit_q;          // REGISTERED tag/valid hit (captured leaving S_IDLE)
+    logic   acc_pending_q;  // a strobe arrived but the lookup has not started yet
+
+    // A NEW access is ready to look up when the request is live (c_req, i.e. the
+    // MMU has forwarded the translated access) AND the core's strobe says it is
+    // new -- either this cycle (c_new) or pending from an earlier strobe latched
+    // across a PTW (acc_pending_q).  c_req still depends on the data TLB, so this
+    // alone does not remove the TLB from c_wait (that is the MMU's registered
+    // lookup, a separate step); it removes the D$ TAG compare and the oscillation.
+    wire             new_acc = c_req & (c_new | acc_pending_q);
+
     // ---- FSM ----------------------------------------------------------------
-    typedef enum logic [1:0] { S_LOOKUP, S_FILL, S_RELOOKUP, S_WRITE } state_t;
+    // S_IDLE / S_LK2 split the access into a REGISTERED 2-cycle lookup so the slow
+    // combinational tag/valid compare (`hit`) never reaches `c_wait` (hence the
+    // core's stall_if / I$ fetch path) in one cycle -- it only feeds `hit_q`.
+    // The split is gated by the core's per-access STROBE c_new (not by a level
+    // c_req), so a completed access HELD in MEM by an unrelated stall does NOT
+    // re-trigger a lookup (no c_wait oscillation -> no atomic corruption; an
+    // earlier strobe-less in-place 2-phase regressed Linux exactly this way, see
+    // docs/freq_50mhz.md).  acc_pending latches the strobe across an MMU PTW
+    // (during which c_req is suppressed) so the lookup starts when c_req arrives.
+    typedef enum logic [2:0] { S_IDLE, S_LK2, S_FILL, S_RELOOKUP, S_WRITE } state_t;
     state_t state;
 
     // Latched miss/store context
@@ -138,9 +159,14 @@ module rv_dcache #(
     // A load HIT keeps c_wait low (1-cycle BRAM read).  A store or load MISS
     // raises it until the access (and, for a load miss, the post-fill re-lookup)
     // completes.
+    // CRITICAL for timing: c_wait must NOT depend on the combinational `hit` (the
+    // slow tag/valid compare).  S_IDLE asserts wait only when a new access is
+    // strobed (new_acc; hit goes to hit_q, not here); S_LK2 uses the REGISTERED
+    // hit_q.  A held completed access (no new strobe) keeps c_wait=0 in S_IDLE.
     always_comb begin
         unique case (state)
-            S_LOOKUP:   c_wait = c_req & (c_we | ~hit);  // store, or load miss
+            S_IDLE:     c_wait = new_acc;                 // hold the new access one cycle
+            S_LK2:      c_wait = c_req & (c_we | ~hit_q);  // store, or load miss -> hold
             S_FILL:     c_wait = 1'b1;                   // held; re-lookup ends it
             S_RELOOKUP: c_wait = 1'b0;                   // requested word read this cycle
             S_WRITE:    c_wait = ~m_done;                // drop on the write response
@@ -182,7 +208,9 @@ module rv_dcache #(
             rd_en   = 1'b1;
             rd_addr = {fill_idx, fill_wsel};
         end else begin
-            rd_en   = (state == S_LOOKUP) & c_req & ~c_we & hit;
+            // Hit read issues in phase 2 (S_LK2) on the REGISTERED hit_q; the held
+            // c_addr (idx/wsel) is still stable (core freezes during c_wait).
+            rd_en   = (state == S_LK2) & c_req & ~c_we & hit_q;
             rd_addr = {idx, wsel};
         end
     end
@@ -230,20 +258,43 @@ module rv_dcache #(
     // ---- FSM / tag / valid / counters (fabric) ------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state    <= S_LOOKUP;
+            state    <= S_IDLE;
             hit_cnt  <= '0;
             miss_cnt <= '0;
             fill_idx <= '0; fill_tag <= '0; fill_base <= '0; fill_wsel <= '0;
             st_hit   <= 1'b0; st_idx <= '0; st_wsel <= '0;
             st_addr  <= '0; st_wdata <= '0; st_wstrb <= '0;
             valid <= '0;
+            hit_q <= 1'b0;
+            acc_pending_q <= 1'b0;
         end else begin
+            // Latch the per-access strobe until the lookup actually starts (covers
+            // an MMU PTW that delays c_req).  Consumed (cleared) when S_IDLE begins
+            // the lookup; otherwise set by a fresh strobe.
+            if (state == S_IDLE && new_acc) acc_pending_q <= 1'b0;
+            else if (c_new)                 acc_pending_q <= 1'b1;
+
             unique case (state)
-                S_LOOKUP: begin
-                    if (c_req && !c_we) begin
+                S_IDLE: begin
+                    // Phase 1: a strobed new access -> capture the (slow) hit into
+                    // hit_q and advance to S_LK2.  c_wait=new_acc held it this cycle,
+                    // so c_addr stays stable in S_LK2.  A held completed access has
+                    // no strobe (new_acc=0) and idles here (c_wait=0).
+                    if (new_acc) begin
+                        hit_q <= hit;
+                        state <= S_LK2;
+                    end
+                end
+
+                S_LK2: begin
+                    // Phase 2: act on the REGISTERED hit_q.
+                    if (!c_req) begin
+                        state <= S_IDLE;             // access squashed (defensive)
+                    end else if (!c_we) begin
                         // Load
-                        if (hit) begin
-                            hit_cnt <= hit_cnt + 32'd1;  // word read by BRAM port
+                        if (hit_q) begin
+                            hit_cnt <= hit_cnt + 32'd1;  // BRAM read issued this cycle
+                            state   <= S_IDLE;
                         end else begin
                             // Miss: start a line fill
                             fill_idx  <= idx;
@@ -253,16 +304,16 @@ module rv_dcache #(
                             miss_cnt  <= miss_cnt + 32'd1;
                             state     <= S_FILL;
                         end
-                    end else if (c_req && c_we) begin
+                    end else begin
                         // Store (write-through): latch context, issue write
-                        st_hit   <= hit;
+                        st_hit   <= hit_q;
                         st_idx   <= idx;
                         st_wsel  <= wsel;
                         st_addr  <= c_addr;
                         st_wdata <= c_wdata;
                         st_wstrb <= c_wstrb;
-                        if (hit) hit_cnt  <= hit_cnt  + 32'd1;
-                        else     miss_cnt <= miss_cnt + 32'd1;
+                        if (hit_q) hit_cnt  <= hit_cnt  + 32'd1;
+                        else       miss_cnt <= miss_cnt + 32'd1;
                         state    <= S_WRITE;
                     end
                 end
@@ -282,17 +333,17 @@ module rv_dcache #(
                 S_RELOOKUP: begin
                     // BRAM read of {fill_idx,fill_wsel} is issued this cycle; the
                     // word lands in rdata_q next cycle.  c_wait is already low.
-                    state <= S_LOOKUP;
+                    state <= S_IDLE;
                 end
 
                 S_WRITE: begin
                     if (m_done) begin
                         // Cached word is updated by the BRAM write port (above).
-                        state <= S_LOOKUP;
+                        state <= S_IDLE;
                     end
                 end
 
-                default: state <= S_LOOKUP;
+                default: state <= S_IDLE;
             endcase
         end
     end

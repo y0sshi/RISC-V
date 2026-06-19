@@ -129,6 +129,7 @@ module rv_soc
     logic core_dmem_req, core_dmem_we;
     assign core_dmem_req = mmu_dmem_req;
     assign core_dmem_we  = mmu_dmem_we;
+    logic dmem_acc_new;   // per-access strobe (core -> D$); see rv_core/docs/freq_50mhz.md
 
     rv_cpu #(.XLEN (XLEN), .RST_ADDR (RST_ADDR)) u_cpu (
         .clk (clk), .rst_n (rst_n),
@@ -136,6 +137,7 @@ module rv_soc
         .imem_rdata (imem_rdata), .imem_ready (imem_ready),
         .dmem_addr (mmu_dmem_pa), .dmem_wdata (core_dmem_wdata),
         .dmem_wstrb (core_dmem_wstrb), .dmem_req (mmu_dmem_req), .dmem_we (mmu_dmem_we),
+        .dmem_acc_new (dmem_acc_new),
         .dmem_rdata (dmem_rdata), .dmem_ready (dmem_ready),
         .dmem_wait (core_dmem_wait),
         .dmem_va (core_dmem_va),
@@ -300,6 +302,7 @@ module rv_soc
         rv_dcache #(.XLEN (XLEN), .LINE_BYTES (DCACHE_LINE), .SETS (DCACHE_SETS)) u_dc (
             .clk (clk), .rst_n (rst_n),
             .c_req (dc_c_req), .c_we (mmu_dmem_we), .c_addr (mmu_dmem_pa),
+            .c_new (dmem_acc_new),
             .c_wdata (core_dmem_wdata), .c_wstrb (core_dmem_wstrb),
             .c_rdata (dc_c_rdata), .c_wait (dc_c_wait),
             .hit_cnt (), .miss_cnt (),

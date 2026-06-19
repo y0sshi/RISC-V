@@ -52,6 +52,7 @@ module rv_core
     output logic [XLEN/8-1:0]  dmem_wstrb,   // 4b(RV32) or 8b(RV64)
     output logic             dmem_req,
     output logic             dmem_we,
+    output logic             dmem_acc_new,   // 1-cycle STROBE: first cycle of a NEW data access
     input  wire  [XLEN-1:0]  dmem_rdata,
     input  wire              dmem_ready,
 
@@ -355,12 +356,26 @@ module rv_core
     // ---- Redirect request (this cycle), priority order ----------------------
     logic            redir_req;
     logic [XLEN-1:0] redir_tgt;
+    // MRET/SRET REDIRECT must be GATED by the commit condition (~stall_ex), exactly
+    // like the privilege change they carry (rv_csr mret_en/sret_en = ex_*_en &
+    // csr_commit_ex).  Otherwise the redirect to mepc/sepc fires while the xRET is
+    // still HELD in EX (stall_ex=1), so fetch jumps to the target (e.g. a U-page on
+    // SRET-to-userspace) BEFORE priv actually changes (still S-mode).  Fetching a
+    // U-page in S-mode faults / is not forwarded -> imem_ready=0 -> stall_ex=1 ->
+    // the xRET can NEVER commit (csr_commit_ex=~stall_ex) -> priv stays S -> the
+    // fetch keeps faulting = a self-sustaining DEADLOCK at the S->U handoff.  Found
+    // when a +1-cycle D$ access latency shifted an xRET's commit cycle onto a
+    // ~imem_ready stall (docs/freq_50mhz.md; #14/#15/#16-class variable-latency
+    // exposure).  Gating defers the redirect until the xRET commits, so the fetch
+    // stays on the (fetchable) sequential path, ~imem_ready clears, stall_ex drops,
+    // the xRET commits with priv AND redirect atomic.  STRICT no-op for the common
+    // case (xRET commits at stall_ex=0: the gate is then 1, same as before).
     always_comb begin
         redir_req = 1'b1;
         if      (ifpf_take)                       redir_tgt = trap_vector;  // instruction page fault
         else if (ex_trap_enter || mem_trap_enter) redir_tgt = trap_vector;
-        else if (ex_mret_en)                      redir_tgt = mepc_out;
-        else if (ex_sret_en)                      redir_tgt = sepc_out;
+        else if (ex_mret_en && ~stall_ex)         redir_tgt = mepc_out;
+        else if (ex_sret_en && ~stall_ex)         redir_tgt = sepc_out;
         else if (branch_taken_ex)                 redir_tgt = branch_target_ex;
         else if (satp_write_redir)                redir_tgt = satp_redir_tgt; // SATP fetch barrier
         else begin redir_req = 1'b0; redir_tgt = '0; end
@@ -996,6 +1011,37 @@ module rv_core
         else        mal_state_prev <= mal_state;
     end
     wire mal_phase1_start = mal_state && !mal_state_prev;
+
+    // -------------------------------------------------------------------------
+    // Per-access STROBE to the data cache / MMU (dmem_acc_new)
+    // -------------------------------------------------------------------------
+    // The D$ / MMU need to register their (slow) hit/translate result, but the
+    // simple bus has no per-access strobe: c_req is level-high, so a downstream
+    // FSM cannot tell a NEW access from a completed one HELD in MEM by an
+    // unrelated stall (~imem_ready etc.).  A naive in-place 2-phase oscillated
+    // c_wait every cycle on a held hit and corrupted atomics (see docs/freq_50mhz.md).
+    // The core, which owns the pipeline, marks the FIRST cycle of each distinct
+    // logical access UNAMBIGUOUSLY, derived only from REGISTERS (no combinational
+    // path from c_wait back in -> no loop):
+    //   - a new instruction's first MEM cycle  = ex_adv_q (last cycle EX advanced)
+    //   - AMO read->write phase start          = amo_state rising edge
+    //   - misaligned phase0->phase1 start       = mal_phase1_start
+    // A held access never re-pulses (ex_adv_q drops after the entry cycle), so the
+    // downstream FSM only (re)starts a lookup on this strobe.  STRICT no-op for
+    // bram/act wrappers (no D$/MMU consumer).
+    logic amo_state_prev;
+    logic ex_adv_q;     // 1 = EX advanced into MEM last cycle (new instr now in MEM)
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            amo_state_prev <= 1'b0;
+            ex_adv_q       <= 1'b0;
+        end else begin
+            amo_state_prev <= amo_state;
+            ex_adv_q       <= ~stall_ex;
+        end
+    end
+    wire amo_started  = amo_state & ~amo_state_prev;
+    assign dmem_acc_new = (ex_adv_q & dmem_req) | amo_started | mal_phase1_start;
 
     // mal_squash: the misaligned 2-phase access is ABANDONED (FSM reset) only when
     // the MEM-stage instruction ITSELF is squashed by its own MEM-stage fault.

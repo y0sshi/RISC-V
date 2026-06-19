@@ -319,7 +319,7 @@ module tb_rv_boot_soc;
             ptwmask_adv <= ptwmask_adv + 1;
         // amo_state in WRITE phase while the D$ is still in S_FILL = premature
         // advance (the write will be lost when the AMO retires at S_RELOOKUP).
-        if (u_soc.u_cpu.u_core.amo_state && (u_soc.gen_dcache.u_dc.state == 2'd1))
+        if (u_soc.u_cpu.u_core.amo_state && (u_soc.gen_dcache.u_dc.state == 3'd2))
             amo_prem <= amo_prem + 1;
 `endif
     end

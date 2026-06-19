@@ -34,6 +34,7 @@ module tb_rv_dcache;
 
     // core side
     logic              c_req, c_we;
+    logic              c_new, c_req_q;   // per-access strobe (rising edge of c_req)
     logic [XLEN-1:0]   c_addr, c_wdata;
     logic [XLEN/8-1:0] c_wstrb;
     logic [XLEN-1:0]   c_rdata;
@@ -64,9 +65,15 @@ module tb_rv_dcache;
     logic [IDW-1:0]    rid;    logic [XLEN-1:0] rdata;   logic [1:0] rresp;
     logic              rlast, rvalid, rready;
 
+    // Per-access strobe: the TB drops c_req between accesses, so a c_req rising
+    // edge marks each new access (mirrors the core's dmem_acc_new).
+    always_ff @(posedge clk or negedge rst_n)
+        if (!rst_n) c_req_q <= 1'b0; else c_req_q <= c_req;
+    assign c_new = c_req & ~c_req_q;
+
     rv_dcache #(.XLEN (XLEN), .LINE_BYTES (LINE_BYTES), .SETS (SETS)) u_dc (
         .clk (clk), .rst_n (rst_n),
-        .c_req (c_req), .c_we (c_we), .c_addr (c_addr),
+        .c_req (c_req), .c_new (c_new), .c_we (c_we), .c_addr (c_addr),
         .c_wdata (c_wdata), .c_wstrb (c_wstrb),
         .c_rdata (c_rdata), .c_wait (c_wait),
         .hit_cnt (hit_cnt), .miss_cnt (miss_cnt),

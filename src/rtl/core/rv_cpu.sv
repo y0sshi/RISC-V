@@ -37,6 +37,7 @@ module rv_cpu
     output logic [XLEN/8-1:0] dmem_wstrb,
     output logic             dmem_req,
     output logic             dmem_we,
+    output logic             dmem_acc_new, // 1-cycle strobe: first cycle of a new data access
     input  wire  [XLEN-1:0]  dmem_rdata,
     input  wire              dmem_ready,
     input  wire              dmem_wait,    // variable-latency hold (AXI/DDR)
@@ -105,6 +106,7 @@ module rv_cpu
         .dmem_wstrb (core_dmem_wstrb),
         .dmem_req (core_dmem_req),
         .dmem_we (core_dmem_we),
+        .dmem_acc_new (dmem_acc_new),
         .dmem_rdata (dmem_rdata),
         .dmem_ready (dmem_ready),
         .satp_out (satp_out),
