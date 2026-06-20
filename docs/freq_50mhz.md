@@ -380,3 +380,209 @@ step-1 (D$ tag 登録) commit `0238beb` の `build_zybo.log` (Jun 20, 25MHz=40ns
   userspace HARM=0 amo_prem=0 baseline 完全一致)。整数 load の IPC コスト 0。
 - **実 impl で「D$-load→FP forward を critical path から除去」を実証** (path が I$ line_reg へ移動)。
   WNS 1.130→2.968 (+1.84ns)。50MHz には次 path (I$ line_reg) 以降の段も要 = 継続。
+
+## 10. ❌ 第11セッション: データ側 stall のレジスタ化は袋小路 (revert 済み — 重要教訓)
+
+第10 後の実 worst-path (routed DCP, `report_worst_fpld.log`) を 3 等分で確認:
+- **① データ側 (5→17ns)**: `ex_mem_alu_result -> sc_success0(SC 予約アドレス比較) -> core_dmem_req ->
+  periph 領域デコード/D$ new_acc -> dc_c_wait`。
+- **② redirect/PC mux (17→27ns)**: `dc_c_wait -> stall -> trap/redirect target mux(sepc/cur_priv/redir_pend) -> fetch_pc(imem_addr)`。
+- **③ IF-TLB+I$ (27→38ns)**: `imem_addr -> IF TLB 16-way compare -> mmu_imem_req -> I$ addr_q_en -> line_reg ENARDEN`。
+- route 80%。三等分はほぼ等長 (~11-12ns ずつ)。**1 段の register では 20ns に届かず** (どこで割っても片側 >20ns)。
+
+**狙い**: ① の `dc_c_wait`(live, データ領域) を `stall_if` から外し、**登録信号 `data_acc_freeze`** に置換して
+データ領域→IF の長配線を flop で分断する。`data_acc_freeze = data_acc_first | mem_occ` (両方 register 由来,
+sc_success 非依存):
+- `data_acc_first` = アクセスの MEM 進入サイクル (`ex_adv_q & (mem_read|mem_write|is_amo) | amo_started | mal_phase1_start`)。
+- `mem_occ` = SET(進入)/HOLD/CLEAR(`~stall_ex`=retire) ラッチ。**uncached/I$-fill で dmem_wait が進入後に遅れて
+  立ち上がる**ケース (ロードが ~imem_ready で凍結中に bus アクセスが後から wait を上げる) も全期間カバー
+  (単純な `dmem_wait_q` 1サイクル履歴では取りこぼし → under-stall → 命令喪失 = cache_soc uncached で corruption)。
+
+**結論 = あらゆる変種が破綻 (revert 済み)**。登録 stall は本質的に **+1 over-stall** (立ち下がりが register で 1
+サイクル遅れる) を生み、それが:
+1. **`stall_if/id` のみ置換 (decouple)**: `stall_id`(IF/ID・ID/EX gate) が `stall_ex`(EX/MEM gate) と発散し、
+   over-stall サイクルで **保持された ID/EX を前進中の EX/MEM が再キャプチャ = 命令重複** (`sim_cache_soc` で値
+   corruption。`[DUP]` 検出器で確認: 同一 pc が EX/MEM へ 2 連続 advance)。BRAM では冪等命令に当たり PASS する
+   ことがあるが HW では危険。
+2. **+ `flush_ex` で重複防止**: `flush_ex` は ID/EX をバブル化するが、**多サイクル EX 演算 (FDIV/divide) を計算前に
+   EX→MEM へ早期排出** → 結果未計算 (`sim_fpu_pipe` T6 で FDIV→FSW の f8=X。t=575 で FSW f7 が MEM 在席中に
+   `data_acc_first`→flush_ex が FDIV(pc=0x48) を MEM へ排出)。D$ 経路は entry が `stall_ex=1` で flush_ex 抑止
+   され retire のみ発火するため非発火だが、BRAM(no-wait)経路で発火。
+3. **3 stall 全て置換 (lockstep, flush_ex 無)**: `stall_ex` にも over-stall が入り **全データアクセスに EX バブル**
+   → load データ capture / forwarding / load-use タイミングが破壊 (`sim_fpu_pipe` 0/7, `sim_pipeline` 15/19,
+   `sim_cache_soc` 失敗)。
+
+= **データ側 stall 操作は本質的に「登録 stall の +1 over-stall ↔ パイプラインの多サイクル EX 段 / 厳密 load
+タイミング」と非互換**。`stall_if/id/ex` を触る方向は放棄。
+
+**次の方向 (候補)**:
+- **(B) IF 2 段化 (= 元の approach a)**: `imem_addr` を真のパイプライン register 段にし、③(IF-TLB→I$) を独立
+  サイクルへ。stall/EX 相互作用に触れず redirect-latch(#15/#16 既存機構)で flush。**最高リスクだが stall 袋小路
+  を回避**。ただし 1 段では ①②(~22ns)が残るので、② も別途切る必要 = 複数段。
+- **(C) imem_addr mux SELECT のみ登録 + fetch_pc を live stall で gate** (stall 本体は不変)。stall の dup/EX
+  問題に触れない。代償 = stall 中に I$ が seq_pc を無駄フェッチ (IF/ID 凍結で無害)。I$ addr_q トラッキング
+  (fetch_pc 同期) との相互作用が要検証 (中リスク)。
+- ⚠️ いずれも IF 側 = #15/#16 領域。着手前にユーザ確認推奨。
+
+### ❌ approach (C) も over-stall 重複の壁 (第11セッション後半; revert 済み)
+`imem_addr` の SELECT を `imem_hold`(= stall_if の dmem_wait を登録 `data_acc_freeze` に置換)で駆動し、stall 本体
+(stall_if/id/ex)は live のまま不変にした。狙い通り **stall の dup/EX 問題には触れない**(パイプラインは baseline 動作、
+FDIV も無傷)。しかし `imem_hold ⊇ stall_if` の **+1 over-stall** サイクルで `imem_addr=fetch_pc` を保持したまま
+パイプラインが前進(stall_id=0)→ **IF/ID が in-flight 命令を再フェッチ・再キャプチャ = 重複フェッチ**。
+- **flush_id で殺そうとすると数が合わない**: 1 サイクル flush(`imem_hold & ~stall_id`)は **全機能テスト PASS**
+  (pipeline 19/cache_soc 6/fpu_pipe 7、uncached corruption 含む)だが `[DUP]` 検出器で残存重複(pc=0x08 等;
+  多くが偶然冪等=add rd,rs,rs/SPIN/flushed でテストは通る)。2 サイクル flush(`held_dup_q` 追加)は **過剰 flush で
+  実命令喪失**(pipeline 17/19)。
+- **真因 = 重複スパンがメモリレイテンシモデル依存**: pipeline は `rv_soc_bram`(I$ 無し)で imem_rdata(M+1) も
+  stale → 重複 2 サイクル。`rv_soc`(I$ 有り)は rv_icache FSM(addr_q/c_ready)依存で 1 サイクル。**単一の flush 数では
+  両モデルを正しく殺せない** → 精密な flush は fetch/I$ パイプライン状態の完全モデル化が必要 (#15/#16 の深部)。
+
+### 第11セッション結論 = データ側/SELECT 登録は共に over-stall 重複で袋小路 → 残るは IF 2 段化のみ
+**登録した fetch 制御信号は本質的に +1 over-stall(登録ゆえ live の立ち下がりに 1 サイクル遅れる)を生み、その +1 が
+重複(EX 段 or IF/ID 段)を作る。重複を精密に殺すのは pipeline/memory レイテンシ依存で困難**。= ①データ側 stall も
+③SELECT 登録も同根で破綻。**route(長配線)を割るには route 上に register を置くしかなく、それは imem_addr→I$ 経路の
+register = IF 2 段化(B)**(over-stall 近似でなく真のパイプライン段。redirect-latch で flush、stall 過近似が無いので
+重複しない)。次セッションは **(B) を本腰で設計するか、50MHz を一旦保留して他ロードマップ項目**を選ぶ。worst=37.03ns
+で 20ns には B でも複数段(①②も別途)要 = 大規模。
+
+## 11. (B) IF 2 段化 = decoupled fetch (フェッチバッファ) 設計 (第12セッション着手予定)
+
+### 課題: imem_addr 単純登録は可変長 RVC フィードバックを壊す
+現行 fetch は **単一 `fetch_pc` + 組合せ `seq_pc = fetch_pc + (imem_rdata[1:0]==2'b11 ? 4 : 2)`** の 1 サイクル
+フィードバックループ (`rv_core.sv` IF 段)。worst path ① (データ stall→`stall_if`→`imem_addr` select) を切るために
+`imem_addr` を登録 (`imem_addr_q`→I$) すると、**rdata が 1 サイクル遅れ、次アドレス計算 (seq_pc は現命令の length に
+依存) が間に合わず、命令毎にフェッチ 2 サイクル化 = スループット半減** (+100% IPC、不可)。= 「fetch ループに register
+を挿入すると、可変長フィードバックがループ遅延を許容できない」。real RVC コアと同じ問題。
+
+### 解 = decoupled fetch (フェッチを I$ と自由走行させ、FIFO で decode stall を吸収)
+フェッチループ (~13ns, 1 命令/cyc) は**現行のまま据え置き**、データ stall を**フェッチ経路から完全に外す**:
+- **フェッチエンジン (自由走行)**: `imem_addr = redir_eff ? redir_eff_tgt : (fetch_full ? fetch_ptr : seq_pc)`。
+  **`stall_if`(=データ stall ①)を含まない**。hold は `fetch_full`(FIFO 満杯 = ローカル登録信号, 高速)のみ。
+  `fetch_ptr`(現 `fetch_pc` 相当) は imem_ready で advance。可変長 `seq_pc` は据え置き (フィードバック維持)。
+- **フェッチ FIFO (2-4 段)**: I$ から来る `{pc, inst, if_fault}` を push。`fetch_full` で backpressure。
+  redirect で flush (全 valid クリア + `fetch_ptr<=tgt`)。straddle/RVC 窓・`redir_pend`/`redirect_settle` は
+  フェッチエンジン側に温存 (#15/#16 の既存修正を壊さない)。
+- **デコード境界 (IF/ID)**: FIFO head を `~stall_id` で pop → 現 `if_id_*` レジスタへ。データ stall (`stall_id`) は
+  **FIFO pop を止めるだけ** (FIFO が埋まり `fetch_full`→フェッチ backpressure)。→ **データ stall は FIFO/decode
+  ローカル信号にのみ到達、`imem_addr`→IF-TLB→I$ の長配線には来ない = ① 切断**。
+- **redirect**: EX 解決 (branch/trap/xRET) は従来通り `redir_eff`。フェッチエンジンを redirect + FIFO flush。
+  FIFO 内の wrong-path 命令は valid クリアで破棄。`redir_pend`(多サイクル IF 跨ぎ) は据え置き。
+
+### 効果と残課題
+- **① (データ→stall→imem_addr) が I$ 経路から消える**。新 worst は ② (redirect mux→imem_addr→I$, CSR reg 起点) か
+  seq_pc フィードバック (~13ns) 近辺へ。再 impl 測定で確認。20ns には ② も別途切る必要 (複数段) は不変。
+- **IPC**: FIFO がフェッチ/デコードを分離するので throughput は不変 (stall 中もフェッチ先行 → むしろ向上余地)。
+  redirect penalty は FIFO flush 分 +α (要計測)。
+- **リスク = 最高 (#15/#16)**: fetch/redirect/straddle/RVC 窓の全面改修。**full Linux NET=y + rv64uc(C 拡張) +
+  rv64si(trap/redirect) を必須ゲート**。straddle (`zybo-jalr-fetch-bug`) と redirect squash を壊さないこと。
+- **実装ステップ案**: (1) FIFO + fetch_full backpressure を挿入し `imem_addr` から `stall_if` を除去 (機能等価=
+  全ユニット PASS を確認、まだ timing 効果は出ない)。(2) full Linux gate。(3) 再 impl で ① 消失を測定。(4) 残 worst
+  (②) を次段へ。各ステップ非破壊検証。
+
+### ✅ step 1 実装完了 = decoupled fetch FIFO (第11セッション; rv_core.sv +60/-4 行)
+`rv_core.sv` のみ改変。**フェッチエンジン (fetch_pc/seq_pc/redirect_settle/redir_pend/ifpf) は温存**し:
+- `imem_addr` の hold select を `stall_if` → **`fetch_hold = ~imem_ready | redirect_stall | fetch_full`** に変更
+  (= フェッチ領域のみ。データ stall dmem_wait を含まない)。⚠️ **`~imem_ready` は必須** (I$ fill / 初回フェッチで
+  fetch_pc 保持。I$ 出力=短配線でデータ leak でない)。最初の実装で抜かして pipeline 全滅 → 追加で解決。
+- **フェッチ FIFO (depth 4, 循環)**: `ff_push = imem_ready & ~redir_eff & ~redirect_stall & ~fetch_full` で
+  `{fetch_pc, imem_rdata}` を push、`ff_pop = ~stall_id & ~ff_empty` でデコードへ、`ff_flush = redir_eff & imem_ready`
+  で wrong-path 破棄 (head/tail/count リセットのみ、配列クリアせず=Verilator NBA-in-loop 回避)。`fetch_full =
+  (ff_count==4)`。**`fetch_full` は ff_count レジスタ由来** → データ stall は `stall_id→ff_pop→ff_count(reg)→
+  fetch_full→imem_addr` と **必ず flop を経由** = ① の組合せ leak 切断。重複なし (バッファ済の実命令、再フェッチ複製でない)。
+- **IF/ID レジスタ**: `imem_rdata` 直接でなく **FIFO head を pop** (`ff_empty` 時 bubble)。`stall_if` は割込注入
+  (`irq_pending && !stall_if`, line 1322) でのみ残存=正当。
+- **✅ 検証 (全 PASS)**: 全ユニット (pipeline 19/cache_soc(64) 6/dcache(64)/amo(64)/mmu(64)/sv(64)/csr/intr/
+  fpu_pipe 7/fpu_d/**icache(64)=straddle/RVC/redirect**/cdecode(64)) + compliance **rv64uc-p-rvc** (C 拡張 fetch) +
+  **rv64si-p 7/7** (csr/dirty/icache-alias/**ma_fetch**/sbreak/scall/wfi) + **full Linux NET=y `LINUX-USERSPACE-OK`
+  HARM=0 amo_prem=0 chars=11428**。
+- **IPC コスト**: userspace 到達 425M→**444M cyc (+4.5%)** (FIFO 1 段 = branch penalty +1)。許容範囲。
+
+### ⚠️ step 1 の実 impl 測定 = timing 不変 (① を切っても ② が並行で残る; 重要)
+`build_b_step1` (25MHz=40ns): **WNS 2.968→2.819 (worst 37.03→37.18ns) = placement noise 内で実質不変**。
+worst path は依然 `ex_mem_alu_result_reg[2] → ... → gen_icache.u_ic/line_reg_2_1/ENARDEN` (35.95ns, logic
+8.67ns/route 27.27ns=76%; logic levels 39→44, route 28.4→27.3)。中間 net で **経路が ① から ② へ移動**を確認:
+```
+ex_mem_alu_result -> sc_success -> core_dmem_req -> dc_c_req -> dc_c_wait -> core_dmem_wait
+  -> stall_if -> [割込注入 irq_pending && !stall_if (rv_core.sv:1326) -> ex_trap_enter -> redir_req]
+  -> redir_eff_tgt -> fetch_pc -> u_mmu IF-TLB -> I$ line_reg ENARDEN
+```
+= **step 1 は `stall_if -> imem_addr の hold select` (①) を確かに切った**が、worst は **`stall_if -> 割込注入 ->
+ex_trap_enter -> redir_req -> redir_eff (imem_addr の redirect select) -> imem_addr -> IF-TLB -> I$`** (②) へ移動。
+**imem_addr には 2 つの late select (`fetch_hold`=①, `redir_eff`=②) があり、データ源 (ex_mem_alu_result) は両方へ
+並行に届く**。① だけ登録化しても ② が同長で残るので worst 不変。
+
+**結論 = step 1 単独では timing 利得ゼロ + IPC +4.5% (純コスト)。利得には step 2 (② = imem_addr の redirect select の
+登録化) が必須**。step 1 は機能的に正しく非破壊だが、**② とセットで初めて意味を持つ**。
+- **step 2 案 = imem_addr の redirect 入力を登録駆動に**: redir_req (EX の trap/branch/割込, データ依存・組合せ) が
+  redir_eff 経由で imem_addr の select を叩くのを断つ。redir_req を常時ラッチ (`redir_pend` 機構を全 redirect に拡張)
+  し、**imem_addr は登録済 redirect (redir_pend_q) のみ参照**。FIFO が wrong-path を flush するので redirect +1 cyc 化は
+  branch penalty +α のみ。⚠️ commit-gate atomicity (#3/SRET) と redirect_settle の整合が要 (最高リスク; full Linux gate)。
+  割込注入の `!stall_if` も登録 stall か `~stall_ex` 起点へ。
+- **判断事項**: step 1 を foundation としてコミットし step 2 を次段で行うか、step 2 まで step 1 を未コミット保持するか
+  (単独では純コストのため)。
+
+### ✅ step 2 実装完了 = imem_addr の redirect select を登録化 (第12セッション; rv_core.sv のみ)
+**狙い**: `imem_addr` の redirect 入力 (②) を登録駆動にし、データ依存・組合せの `redir_req` が
+`imem_addr → IF-TLB → I$` に到達するのを断つ。step 1 で `fetch_hold` は既に登録駆動 (①済) なので、redirect
+select も登録化すれば **`imem_addr` は完全に登録/I$-local 駆動 → データ源 `ex_mem_alu_result` が IF へ leak しない**。
+
+実装 (最小 3 変更、`rv_core.sv` IF 段):
+1. **`imem_addr` select を登録 redirect のみに**: 旧 `redir_eff ? redir_eff_tgt : ...` → 新
+   `redir_pend_q ? redir_pend_tgt_q : (fetch_hold ? fetch_pc : seq_pc)`。`redir_eff`/`redir_eff_tgt` (組合せ
+   `redir_req` 含む) は imem_addr から外す。`redir_eff_tgt` wire は削除。
+2. **`redir_pend_q` ラッチを「arm → 次 fetch 境界で apply」に変更**: 旧は `imem_ready && redir_eff` で同サイクル
+   consume (= fast path で pend が立たず imem_addr が組合せ redir_req を要した)。新:
+   ```
+   if (redir_req) redir_pend_tgt_q <= redir_tgt;          // 最新ターゲット捕捉
+   if (redir_pend_q && imem_ready) redir_pend_q <= redir_req; // 適用; 同サイクル新 req なら re-arm
+   else if (redir_req)             redir_pend_q <= 1'b1;      // 次境界へ arm
+   ```
+3. **`redir_eff = redir_req | redir_pend_q` は squash 専用に温存**: `flush_id`/`flush_ex`/`ff_flush`/`ff_push`/
+   `ifpf` gate が使用。登録化で `redir_eff` が **2 サイクル (N: redir_req, N+1: redir_pend_q)** 高くなり、+1 した
+   wrong-path フェッチ (N+1 に imem_rdata へ出る seq_pc 命令) の push 抑止/fault 抑止 (ifpf gate) を**自動でカバー**。
+
+非破壊性 (構造保証):
+- **CSR commit は不変**: trap_enter/mret_en/sret_en/csr_we は `csr_commit_ex = ~stall_ex` ゲートで cycle N に commit
+  (redir_pend_q 非依存)。priv 変更は N、fetch redirect は N+1 に適用 → **priv 変更後に target を新 priv で fetch**
+  = #3/SRET handoff の inversion なし (むしろ登録化で redirect が stall_ex 非依存になり安全側)。
+- **redirect_settle (2cyc hold) が target を保持**: 登録化で redirect は +1cyc 遅れて適用されるが、`fetch_hold` が
+  settle 窓中 `fetch_pc` を re-present し、`ff_push` は `~redirect_stall` で抑止 → settle クリア後に target を push。
+  step 1 と同じ「hold して保持」機構が +1cyc 分も自然にカバー (target ロスなし)。
+- **+1cyc penalty は `imem_ready=1` の redirect 解決サイクルのみ** (fast path)。`~imem_ready` で解決 (I$ miss) なら
+  旧と完全同一 = strict no-op (miss が +1 を吸収)。`flush_ex_mem = trap_or_mret & ~stall_ex` は EX 命令依存で N+1 は
+  EX=bubble → trap_or_mret=0 → 二重 squash なし。
+
+**✅ 機能検証 (全 PASS、第12セッション)**:
+- 全ユニット: pipeline 19、icache(64) 50/50、intr 10、csr 16、cdecode(64)、sv(64) 46/46、mmu 28/mmu64 11、
+  amo 29/amo64 38、dcache 64/54、cache_soc(64) 6/6、fpu_pipe 7/7、fpu_d 33。
+- compliance: rv64uc-p 1/1 (C-ext fetch)、rv64si-p **7/7** (ma_fetch/icache-alias/dirty/csr/sbreak/scall/wfi)。
+- **full Linux NET=y**: `LINUX-USERSPACE-OK: init running` 到達 (~434M cyc)、`HARM=0`・`amo_prem=0`・`chars=11428`、
+  panic/Oops/BUG なし = ゲート PASS。
+
+### ✅ step 1+2 実 impl 測定 (第12セッション; ① ② は切れたが WNS 不変 = FPU 組合せ経路が新たな壁)
+`build_b_step2` (25MHz=40ns; `boards/reports/build_b_step2.log` / `report_worst_b2.log`):
+**timing met (WNS=2.782 / WHS=0.038)**。step 1 の WNS 2.819 から実質不変 (placement noise)。
+
+- **✅ ① ② は構造的に切れた**: worst path から **`ex_mem_alu_result → imem_addr → IF-TLB → I$ line_reg`** (step 1 の
+  worst, 35.95ns) が**完全に消失**。imem_addr は登録/I$-local 駆動になり、EX データ源は IF へ leak しなくなった。
+- **❌ WNS は改善せず**: 下に隠れていた **同長の FPU 組合せ経路** (36.37ns, route 76%, 34 levels) が露見:
+  ```
+  D$ data BRAM read (gen_dcache data_reg DOBDO -> dc_c_rdata) -> dmem_eff (load 結果)
+    -> wb_data[*] (整数 regfile writeback) -> id_ex_rs1_data (MEM/WB->EX forward)
+    -> u_fpu (u_misc/u_fma_add/u_div/u_fma_add_d の組合せ FP compute, ~23ns)
+    -> ex_mem_fpu_result_f_reg[30] (EX/MEM FP 結果レジスタ)
+  ```
+  = **integer-load 結果が FPU 命令 (FMV.W.X/FCVT.S.W/L 等, 整数 rs1 入力) へ forward され、single-cycle 組合せ FPU
+  が結果を ex_mem_fpu_result_f に確定する経路**。front-end (D$ read→forward) は ~11ns、**残り ~23ns は FPU の
+  operand→result 組合せ compute そのもの** (u_misc の FCLASS/FMV/FCVT/min-max + fma/div の結果 mux を縦断)。
+
+**結論 = step 1+2 の goal (IF leak ① ② の除去) は達成。だが binding constraint は FPU 組合せ result 経路へ移った。**
+step 10 が対処したのは FP-load→FP-forward (FLW/FLD データ→FP regfile)。今回のは **整数 load→整数 forward→FPU 整数
+入力 op** で別物。かつ front-end を全部消しても FPU compute ~23ns + operand ~2ns = ~25ns で **20ns 未達**。
+→ **次段 (step 5) = 組合せ FPU の段化 (single-cycle FP 演算 = FADD/FMUL/FMA/FCVT/FSGNJ/FMIN-MAX/FCMP を 2 サイクル
+レジスタ化; FDIV/FSQRT は既に多サイクル)** が 20ns 到達に必須。これは forward/hazard/stall に波及する大改造 →
+ユーザ方針確認の上で着手。route 76% 支配は floorplan も要 (FPU/D$/I$/regfile が物理的に散在)。
+
+**step 1+2 の扱い (判断事項)**: 単独では timing 利得ゼロ + IPC コスト (step1 +4.5%, step2 は taken redirect +1cyc)。
+但し **FPU 段化後に IF leak が再び worst に浮上するため、必要な foundation**。コミットして残すのを推奨 (機能的に正しく
+非破壊、full Linux NET=y gate PASS 済)。

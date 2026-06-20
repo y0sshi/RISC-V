@@ -154,6 +154,11 @@ module rv_core
     (* max_fanout = 64 *) logic stall_if;      // freeze PC and IF/ID register
     (* max_fanout = 64 *) logic stall_id;      // freeze IF/ID register
     logic stall_ex;      // freeze EX/MEM register (AMO 2-phase stall)
+    // Decoupled-fetch (approach B / 50 MHz step 4): the FETCH hold is fetch-domain
+    // ONLY (redirect settle + FIFO backpressure), NEVER the data stall dmem_wait, so
+    // the ex_mem_alu_result -> dc_c_wait -> stall -> imem_addr -> I$ worst path is cut.
+    logic fetch_hold;    // hold (re-present) the in-flight fetch PC
+    logic fetch_full;    // fetch FIFO backpressure (registered occupancy)
     logic flush_id;      // clear IF/ID   -> insert bubble into ID
     logic flush_ex;      // clear ID/EX   -> insert bubble into EX
     logic flush_ex_mem;  // clear EX/MEM  -> discard trap-interrupted instruction
@@ -410,27 +415,48 @@ module rv_core
     // unchanged: the redirect is applied immediately, exactly as before.
     logic            redir_pend_q;
     logic [XLEN-1:0] redir_pend_tgt_q;
+    // redir_eff = "a redirect is in progress" -- drives only the SQUASH machinery
+    // (flush_id / flush_ex / FIFO flush+push gate / redirect_settle is separate) so
+    // wrong-path instructions are discarded both the cycle the redirect RESOLVES
+    // (redir_req) AND the extra cycle the registered steer below is still applying
+    // (redir_pend_q).  It is NO LONGER used to drive imem_addr: the fetch address is
+    // steered ONLY by the registered redir_pend_q / redir_pend_tgt_q (step 4), so the
+    // data-dependent combinational redir_req never reaches imem_addr -> IF-TLB -> I$.
     assign           redir_eff     = redir_req | redir_pend_q;  // (declared above)
-    wire [XLEN-1:0]  redir_eff_tgt = redir_req ? redir_tgt : redir_pend_tgt_q;
 
+    // 50 MHz step 4 (approach B step 2): the redirect is ALWAYS latched one fetch
+    // boundary before it steers imem_addr.  Previously redir_eff (which contains the
+    // combinational, data-dependent redir_req) selected imem_addr directly; that put
+    // ex_mem_alu_result -> dmem_wait -> stall_if -> irq inject -> ex_trap_enter ->
+    // redir_req -> imem_addr -> IF-TLB -> I$ on the critical path.  By driving
+    // imem_addr from the REGISTER redir_pend_q/_tgt_q only, redir_req ends at a flop
+    // (this latch) and no longer fans out to the fetch address.  Cost: a taken
+    // redirect resolved on a fetch-boundary cycle (imem_ready=1) applies +1 cycle
+    // later; the decoupled fetch FIFO absorbs the fetch and redirect_settle/redir_eff
+    // keep the wrong path squashed across the extra cycle.  STRICT no-op when the
+    // redirect resolves while ~imem_ready (the I$-miss case already deferred it).
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             redir_pend_q     <= 1'b0;
             redir_pend_tgt_q <= '0;
         end else begin
-            if (redir_req) redir_pend_tgt_q <= redir_tgt;     // remember newest target
-            if (imem_ready && redir_eff) redir_pend_q <= 1'b0; // consumed (fetch_pc<=target)
-            else if (redir_req)          redir_pend_q <= 1'b1; // pending until consumed
+            if (redir_req) redir_pend_tgt_q <= redir_tgt;          // capture newest target
+            // Apply (and clear) on the fetch boundary the registered target is
+            // presented; re-arm iff a fresh redir_req coincides with that cycle.
+            if (redir_pend_q && imem_ready) redir_pend_q <= redir_req; // applied; re-arm iff new
+            else if (redir_req)             redir_pend_q <= 1'b1;      // arm for next boundary
         end
     end
 
-    // Next IMEM address (combinational).  An effective redirect (immediate or
-    // pending) is presented first; otherwise hold the in-flight PC while a fetch
-    // is outstanding (stall_if); otherwise the sequential next PC.
+    // Next IMEM address (combinational).  A REGISTERED redirect (redir_pend_q) is
+    // presented first; otherwise hold the in-flight PC while the front end can't
+    // advance (fetch_hold); otherwise the sequential next PC.  Note: redir_pend_q
+    // and fetch_pc/seq_pc are all register-driven, and fetch_hold is register/I$-
+    // local, so imem_addr carries no EX datapath leak (the step-4 goal).
     always_comb begin
-        if      (redir_eff)  imem_addr = redir_eff_tgt;
-        else if (stall_if)   imem_addr = fetch_pc;   // hold / re-fetch in-flight PC
-        else                 imem_addr = seq_pc;
+        if      (redir_pend_q) imem_addr = redir_pend_tgt_q; // registered redirect (step 4)
+        else if (fetch_hold)   imem_addr = fetch_pc;         // hold / re-fetch in-flight PC
+        else                   imem_addr = seq_pc;
     end
 
     // fetch_pc = PC of the in-flight fetch (held stable during the transaction so
@@ -445,6 +471,56 @@ module rv_core
     end
 
     assign imem_req = 1'b1;
+
+    // =========================================================================
+    // Decoupled fetch FIFO (approach B / 50 MHz step 4)
+    // =========================================================================
+    // The FETCH engine above runs FREELY with the I$: its hold (fetch_hold) is
+    // fetch-domain ONLY (redirect settle + this FIFO's backpressure) -- it NEVER
+    // contains the data stall dmem_wait.  Fetched {pc,inst} are pushed here; DECODE
+    // pops a head entry into IF/ID when ~stall_id.  A decode/pipeline stall (incl.
+    // dmem_wait) simply stops the pop -> the FIFO fills -> fetch_full backpressures
+    // the fetch.  Because fetch_full is a REGISTER-derived occupancy (ff_count), the
+    // data stall reaches imem_addr only THROUGH that register, never combinationally:
+    // the ex_mem_alu_result -> dc_c_wait -> stall -> imem_addr -> IF-TLB -> I$ worst
+    // path is split by the ff_count flop.  No over-stall / duplication: the
+    // fetched-ahead instructions are REAL (buffered), not re-fetched copies.
+    localparam int FF_DEPTH = 4;
+    logic [31:0]     ff_inst [FF_DEPTH];
+    logic [XLEN-1:0] ff_pc   [FF_DEPTH];
+    logic [1:0]      ff_head, ff_tail;      // $clog2(FF_DEPTH) bits, wrap naturally
+    logic [2:0]      ff_count;              // 0 .. FF_DEPTH
+    wire ff_empty = (ff_count == 3'd0);
+    assign fetch_full = (ff_count == FF_DEPTH[2:0]);
+    // Fetch holds for fetch-domain reasons only (NOT the pipeline/data stall dmem_wait):
+    //   ~imem_ready    = the I$ is busy (fill / first fetch) -> re-present fetch_pc.
+    //                    This is the I$'s OWN ready (near the I$ = short route), not the
+    //                    data leak; the original held the fetch on it via stall_if.
+    //   redirect_stall = 2-cycle wrong-path settle after a redirect.
+    //   fetch_full     = FIFO backpressure (registered occupancy).
+    assign fetch_hold = ~imem_ready | redirect_stall | fetch_full;
+
+    // Flush wrong-path entries when a redirect is APPLIED (redir_eff & imem_ready,
+    // matching flush_id and the fetch_pc<=target capture).  Push the instruction the
+    // fetch just produced when it advances to seq_pc.  Pop into IF/ID when decode
+    // accepts (~stall_id) and the FIFO has an entry.
+    wire ff_flush = redir_eff & imem_ready;
+    wire ff_push  = imem_ready & ~redir_eff & ~redirect_stall & ~fetch_full;
+    wire ff_pop   = ~stall_id & ~ff_empty;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n || ff_flush) begin
+            ff_head <= 2'd0; ff_tail <= 2'd0; ff_count <= 3'd0;
+        end else begin
+            if (ff_push) begin
+                ff_inst[ff_tail] <= imem_rdata;
+                ff_pc  [ff_tail] <= fetch_pc;
+                ff_tail          <= ff_tail + 2'd1;
+            end
+            if (ff_pop) ff_head <= ff_head + 2'd1;
+            ff_count <= ff_count + (ff_push ? 3'd1 : 3'd0) - (ff_pop ? 3'd1 : 3'd0);
+        end
+    end
 
     // -------------------------------------------------------------------------
     // Instruction page fault (rv_mmu if_fault)
@@ -486,9 +562,10 @@ module rv_core
             if_id_pc    <= '0;
             if_id_valid <= 1'b0;
         end else if (!stall_id) begin
-            if_id_inst  <= imem_rdata;
-            if_id_pc    <= fetch_pc;        // use fetch_pc (not pc_reg) for sync BRAM
-            if_id_valid <= imem_ready;
+            // Decoupled fetch: decode consumes the FIFO head (a bubble when empty).
+            if_id_inst  <= ff_empty ? 32'h0000_0013 : ff_inst[ff_head];
+            if_id_pc    <= ff_empty ? '0            : ff_pc  [ff_head];
+            if_id_valid <= ~ff_empty;
         end
         // else: stall — hold current value
     end
