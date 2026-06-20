@@ -372,8 +372,27 @@ module rv_core
     // case (xRET commits at stall_ex=0: the gate is then 1, same as before).
     always_comb begin
         redir_req = 1'b1;
-        if      (ifpf_take)                       redir_tgt = trap_vector;  // instruction page fault
-        else if (ex_trap_enter || mem_trap_enter) redir_tgt = trap_vector;
+        if      (ifpf_take)                       redir_tgt = trap_vector;  // instruction page fault (ungated; the faulting fetch holds imem_ready low)
+        else if (ex_trap_enter || mem_trap_enter) begin
+            // A trap changes privilege; its REDIRECT must be ATOMIC with the priv
+            // commit (csr_commit_ex = ~stall_ex), exactly like MRET/SRET below.  If a
+            // trap is detected while EX is HELD (stall_ex=1) -- e.g. the +1-cycle
+            // registered MEM-port fault lands while mem_stall holds the bubble, or an
+            // older store's dmem_wait still stalls EX -- redirecting to trap_vector NOW
+            // fetches the handler in the OLD privilege (an M-mode mtvec handler fetched
+            // in S-mode), which faults -> imem_ready=0 -> stall_ex stays 1 -> the trap
+            // can NEVER commit (csr_commit_ex=0) -> priv is stuck -> a self-sustaining
+            // DEADLOCK (the same commit-gate class as the SRET S->U handoff;
+            // docs/freq_50mhz.md #3, exposed by the registered data-TLB lookup).  Defer
+            // (hold, no redirect) until stall_ex drops: the held instruction keeps the
+            // fetch on a fetchable path so ~imem_ready clears, then the trap commits with
+            // privilege AND redirect atomic.  The explicit hold also stops a YOUNGER
+            // EX-stage branch from stealing redirect priority over an older held MEM
+            // fault.  STRICT no-op for the common case (trap taken at stall_ex=0: the
+            // gate is 1, immediate redirect exactly as before).
+            if (~stall_ex)                        redir_tgt = trap_vector;
+            else begin redir_req = 1'b0;          redir_tgt = '0; end
+        end
         else if (ex_mret_en && ~stall_ex)         redir_tgt = mepc_out;
         else if (ex_sret_en && ~stall_ex)         redir_tgt = sepc_out;
         else if (branch_taken_ex)                 redir_tgt = branch_target_ex;
@@ -1231,7 +1250,10 @@ module rv_core
     // MEM stage page fault detection
     // -------------------------------------------------------------------------
     // Fires when a valid load/store in MEM has a TLB-hit permission failure.
-    // mem_fault is combinational from rv_mmu (TLB hit, no PTW stall needed).
+    // Under VM, rv_mmu now presents mem_fault from its REGISTERED MEM-port lookup,
+    // i.e. ONE cycle after the access enters MEM (the capture bubble); the trap
+    // redirect is therefore gated by ~stall_ex (see redir_req) so the priv change
+    // and redirect stay atomic despite that +1-cycle latency (docs/freq_50mhz.md #3).
     logic [XLEN-1:0] mem_trap_cause;
     logic [XLEN-1:0] mem_trap_val;
 

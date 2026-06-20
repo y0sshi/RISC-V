@@ -78,6 +78,7 @@ module rv_cpu
     logic [XLEN-1:0]   mmu_dmem_pa;
     logic              mmu_dmem_req;
     logic              mmu_dmem_we;
+    logic              core_dmem_acc_new;   // raw per-access strobe out of rv_core
 
     logic [XLEN-1:0]   satp_out;
     priv_level_t       priv_out;
@@ -106,7 +107,7 @@ module rv_cpu
         .dmem_wstrb (core_dmem_wstrb),
         .dmem_req (core_dmem_req),
         .dmem_we (core_dmem_we),
-        .dmem_acc_new (dmem_acc_new),
+        .dmem_acc_new (core_dmem_acc_new),
         .dmem_rdata (dmem_rdata),
         .dmem_ready (dmem_ready),
         .satp_out (satp_out),
@@ -149,10 +150,12 @@ module rv_cpu
         .mem_va (core_dmem_va),
         .mem_req (core_dmem_req),
         .mem_we (core_dmem_we),
+        .mem_acc_new (core_dmem_acc_new),
         .mem_pa (mmu_dmem_pa),
         .mem_req_out (mmu_dmem_req),
         .mem_we_out (mmu_dmem_we),
         .mem_fault (mem_fault_mmu),
+        .mem_acc_new_out (dmem_acc_new),
         .mmu_stall (mmu_stall),
         .mem_stall (mem_stall),
         .ptw_paddr (ptw_paddr),
