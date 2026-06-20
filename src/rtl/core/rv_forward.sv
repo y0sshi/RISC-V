@@ -51,11 +51,20 @@ module rv_forward
     input  wire ctrl_signals_t mem_wb_ctrl,
     input  wire reg_addr_t mem_wb_rd_addr,
 
+    // Delayed FP-load writeback (fpld): the FP-load value, registered one cycle at
+    // the core boundary, becomes available here one cycle after it would have via
+    // the MEM/WB path.  This is the OLDEST FP producer in the forward network, so
+    // it has the lowest priority (only used when no EX/MEM or MEM/WB FP forward
+    // matches the same f-register).
+    input  wire           fpld_valid,
+    input  wire reg_addr_t fpld_rd_addr,
+
     // Integer forwarding mux select signals
     output logic [1:0]    fwd_rs1_sel,
     output logic [1:0]    fwd_rs2_sel,
 
-    // FP forwarding mux select signals (2'b00=regfile, 2'b01=EX/MEM, 2'b10=MEM/WB)
+    // FP forwarding mux select signals
+    //   2'b00=regfile, 2'b01=EX/MEM, 2'b10=MEM/WB, 2'b11=delayed FP-load (fpld)
     output logic [1:0]    fwd_frs1_sel,
     output logic [1:0]    fwd_frs2_sel,
     output logic [1:0]    fwd_frs3_sel
@@ -108,24 +117,43 @@ module rv_forward
                 (ex_mem_rd_addr == id_ex_rs3_addr))
             fwd_frs3_sel = 2'b01;
 
-        // MEM hazard: forward from MEM/WB (only if no EX hazard for same reg)
-        if (mem_wb_valid && mem_wb_ctrl.freg_write &&
+        // MEM hazard: forward from MEM/WB (only if no EX hazard for same reg).
+        // FP LOADS are EXCLUDED here: their data is no longer available on the
+        // MEM/WB combinational path (it is registered into fpld and forwarded a
+        // cycle later, below).  Only FP compute results forward via MEM/WB.
+        if (mem_wb_valid && mem_wb_ctrl.freg_write && !mem_wb_ctrl.fp_load &&
                 (mem_wb_rd_addr == id_ex_rs1_addr) &&
                 !(ex_mem_valid && ex_mem_ctrl.freg_write &&
                   (ex_mem_rd_addr == id_ex_rs1_addr)))
             fwd_frs1_sel = 2'b10;
 
-        if (mem_wb_valid && mem_wb_ctrl.freg_write &&
+        if (mem_wb_valid && mem_wb_ctrl.freg_write && !mem_wb_ctrl.fp_load &&
                 (mem_wb_rd_addr == id_ex_rs2_addr) &&
                 !(ex_mem_valid && ex_mem_ctrl.freg_write &&
                   (ex_mem_rd_addr == id_ex_rs2_addr)))
             fwd_frs2_sel = 2'b10;
 
-        if (mem_wb_valid && mem_wb_ctrl.freg_write &&
+        if (mem_wb_valid && mem_wb_ctrl.freg_write && !mem_wb_ctrl.fp_load &&
                 (mem_wb_rd_addr == id_ex_rs3_addr) &&
                 !(ex_mem_valid && ex_mem_ctrl.freg_write &&
                   (ex_mem_rd_addr == id_ex_rs3_addr)))
             fwd_frs3_sel = 2'b10;
+
+        // Delayed FP-load (fpld) hazard: lowest priority.  Forward only when no
+        // younger FP producer (EX/MEM or MEM/WB) already drives this f-register.
+        // Covers a dependent FP op reaching EX one cycle after the FP load retired
+        // (its value is then in fpld_data_q, not yet committed to the regfile).
+        if (fpld_valid && (fpld_rd_addr == id_ex_rs1_addr) &&
+                (fwd_frs1_sel == 2'b00))
+            fwd_frs1_sel = 2'b11;
+
+        if (fpld_valid && (fpld_rd_addr == id_ex_rs2_addr) &&
+                (fwd_frs2_sel == 2'b00))
+            fwd_frs2_sel = 2'b11;
+
+        if (fpld_valid && (fpld_rd_addr == id_ex_rs3_addr) &&
+                (fwd_frs3_sel == 2'b00))
+            fwd_frs3_sel = 2'b11;
     end
 
 endmodule

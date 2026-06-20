@@ -317,3 +317,66 @@ step-1 (D$ tag 登録) commit `0238beb` の `build_zybo.log` (Jun 20, 25MHz=40ns
   #3 trap commit-gate deadlock) を全て根治。
 - **実 impl で「データ TLB を critical path から除去」を実証** (path が D$-load→FPU フォワードへ移動)。
   WNS 0.370→1.130。50MHz には次 path (load-fwd) 以降の段も要 = 継続。
+
+## 9. FP-load 遅延 writeback (第10セッション; 新 critical path = D$-load→FP フォワードを切る)
+
+ユーザ確定の方針 = **「FP load のみ遅延」+「1 段だけ確実に切る」**。第9で移動した新 critical path
+(`D$ data_reg → wb_freg_data → FP datapath → ex_mem_fpu_result_f`, 38.15ns, route 72%) を切る。
+
+### 設計 (構造の本質: D$-read データを core 境界でレジスタ捕捉)
+精査で判明: `wb_freg_data` (= FP-load データ, dmem_shifted 由来) は **2 つの組合せ sink** に入る ―
+① FP forward mux (MEM/WB tier) と ② `rv_fregfile` の write-through (`rd_data`→WT→`rs_data`)。
+→ **FP forward だけをレジスタ化しても WT 経路に同じ D$→core の長配線が残る**。よって route を切るには
+**FP-load データを core 境界の register に捕捉する = FP load の writeback を 1 サイクル遅延**させるのが構造的に必須。
+
+- **`rv_core` fpld レジスタ**: FP load の値 (`wb_freg_data`) をその FRESH WB サイクル (`mem_wb_fresh &
+  mem_wb_valid & freg_write & fp_load`) に `fpld_we_q/fpld_rd_q/fpld_data_q` へ捕捉。
+  これが**唯一 dmem_shifted が FP datapath に入る点**で、ここで route が分割される
+  (`data_reg`(D$, BRAM 近傍) → `fpld_data_q`(core 内 flop) が cycle1、以降が cycle2)。
+  `fpld_we_q` は 1 サイクルパルス。FP load は既に retire 済なので **flush でキャンセルしない** (post-commit writeback)。
+- **`rv_fregfile` 第2 write port (B)**: 遅延 FP-load writeback 専用 (WT 付き)。on-time port (A) は **FP 計算結果
+  のみ** (`mem_wb_fpu_result_f` = register; dmem 経路を完全排除)。FP load は A より 1 サイクル遅いので同一 freg
+  への同サイクル衝突がありうる → program order で load が古い → **A が優先** (commit/WT とも last-assign で A 勝ち)。
+- **`rv_forward`**: FP MEM/WB forward から **fp_load を除外** (`&& !mem_wb_ctrl.fp_load`)。最低優先の
+  **fpld tier (sel 2'b11)** 追加 ― より若い FP producer (EX/MEM, MEM/WB) が無いときのみ `fpld_data_q` を forward。
+- **`rv_hazard`**: FP-load を **MEM 段でも検出** (`ex_mem_ctrl.fp_load`)。FP load-use は **N=1 で 2 stall・N=2 で
+  1 stall** に延長 (load が WB に達するまで consumer を保持; その後 fpld forward(EX, T+3)/WT(ID, T+3)/regfile で供給)。
+- **タイミング検証** (T=FLW EX): FLW WB=T+2(fresh, fpld 捕捉)、fpld_we_q=T+3。consumer は EX@T+3 (N≤2 は stall で
+  到達) で fpld forward(sel11)、ID@T+3 (N=4) は port-B WT、ID≥T+4 は regfile。在順 + port 優先で WAW/上書きも正。
+
+### コスト/非破壊
+- **整数 load の IPC コスト 0** (FP-only)。FP load-use のみ +1 cycle stall (FP-heavy コードのみ影響)。
+- **非破壊**: fpld は FP load 時のみ active、整数/AMO/MMU/regfile 経路は無改変。Linux は FP 未使用 →
+  **Linux gate は bit 一致** (実測: userspace 425M cyc = 第9 baseline と同一、chars=11428/pc=0x1016a, HARM=0,
+  amo_prem=0)。FP 正しさは FP ユニット + RV32/RV64 compliance で担保。
+
+### 検証 (第10セッション; 全 PASS)
+- ✅ FP: sim_fpu_pipe 7/7 (load-use stall T4・FMADD rs3 fwd T5 含む), sim_fpu 94, sim_fpu_d 33, sim_pipeline 19。
+- ✅ compliance FP 実コード: rv64uf-p 11 / rv64ud-p 12 / rv32uf-p 11 / rv32ud-p 10 (ldst・fmadd・move・
+  structural・RV32 mal_wide FLD 含む = FP load-use の実プログラム網羅)。
+- ✅ 非破壊: sim_dcache(64) 64/54, sim_cache_soc(64) 6/6, sim_amo 29/64, sim_mmu(64) 28/11, sim_csr 16,
+  sim_intr 9, sim_sv(64) 46/46。
+- ✅ **full Linux NET=y gate**: `LINUX-USERSPACE-OK: init running`, HARM=0, amo_prem=0, userspace 425M cyc
+  = baseline 完全一致。
+### ✅ 実 impl 測定 (第10セッション; FP-load forward 経路の除去 = critical path が I$ 側へ移動)
+`build_zybo` (25MHz=40ns, 全フロー synth→impl→bit) 最終 route:
+- **WNS=2.968 / WHS=0.030** (worst path = 40-2.968 = **37.03ns**)。第9 baseline WNS=1.130 (38.87ns) から
+  **+1.84ns 改善** (予測 ~1ns を上回る)。
+- **routed checkpoint の worst-path 詳細** (`report_worst.tcl` → `report_worst_fpld.log`): **FP path は完全消滅**:
+  - 旧 (第9): `gen_dcache.u_dc/data_reg → ... → ex_mem_fpu_result_f_reg` (D$-load→FP forward, 38.15ns)。
+  - **新**: `u_core/ex_mem_alu_result_reg[0] → (sc_success0 → core_dmem_req → u_csr periph_rdata/lcr 群) →
+    gen_icache.u_ic/line_reg_2_1/ENARDEN` (datapath 35.679ns; logic 7.292ns/route 28.387ns=**80%**; Slack MET
+    2.989ns)。= **データアクセス VA/制御 → I$ line BRAM の enable (ENARDEN)** 経路。
+  - => FP-load forward の除去は意図通り。新 worst は **データアクセス系信号が I$ line_reg の write/read enable に
+    組合せ到達**する経路 (第9 で「I$ line_reg 35.9-37.9ns で続く」と予告した群が worst 化)。route 80% は不変
+    (FPGA 横断の物理距離が依然支配)。
+- **次の一手 (第11セッション)**: 新 worst = `ex_mem_alu_result → core_dmem_req → u_csr periph デコード
+  (periph_rdata/lcr; UART LCR 等 MMIO read mux) → I$ line_reg ENARDEN`。① u_csr の periph read 経路が
+  ex_mem_alu_result に組合せ依存している点を調査・分離、② I$ の line_reg enable をデータ系信号から decouple。
+  route 80% なので register 段挿入が要。20ns には更に IF-side TLB / 整数 load-fwd 等を順に切る複数セッション規模。
+
+### 第10セッション成果まとめ
+- **FP-load 遅延 writeback を機能完成 + 非破壊検証** (FP ユニット全 + RV32/RV64 FP compliance + full Linux NET=y
+  userspace HARM=0 amo_prem=0 baseline 完全一致)。整数 load の IPC コスト 0。
+- **実 impl で「D$-load→FP forward を critical path から除去」を実証** (path が I$ line_reg へ移動)。
+  WNS 1.130→2.968 (+1.84ns)。50MHz には次 path (I$ line_reg) 以降の段も要 = 継続。

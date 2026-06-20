@@ -568,23 +568,20 @@ module rv_core
     // F-extension values are NaN-boxed (upper 32 bits = 0xFFFFFFFF).
     // =========================================================================
     logic [63:0]  id_frs1_data, id_frs2_data, id_frs3_data;
-    logic [63:0]  wb_freg_data;   // FP WB write data
-    reg_addr_t    wb_frd_addr;    // FP WB write address
-    logic         wb_freg_write;  // FP WB write enable
+    logic [63:0]  wb_freg_data;   // FP WB write data (combinational; FP-load value)
 
-    rv_fregfile u_fregfile (
-        .clk      (clk),
-        .rst_n    (rst_n),
-        .rs1_addr (id_rs1_addr),
-        .rs2_addr (id_rs2_addr),
-        .rs3_addr (id_rs3_addr),
-        .rs1_data (id_frs1_data),
-        .rs2_data (id_frs2_data),
-        .rs3_data (id_frs3_data),
-        .rd_addr  (wb_frd_addr),
-        .rd_data  (wb_freg_data),
-        .rd_we    (wb_freg_write)
-    );
+    // --- Delayed FP-load writeback registers (fpld) ---
+    // The FP-load value (wb_freg_data on its FRESH WB cycle) is registered here at
+    // the core boundary so the long D$-data -> FP-datapath route is split across a
+    // pipeline stage.  Everything downstream of a FP load (the fregfile write and
+    // all FP forwarding) is fed from these registers one cycle later, NOT from the
+    // live D$ read data.  fpld_we_q is a one-cycle pulse (the FP load has already
+    // committed, so it is intentionally NOT gated by any flush).
+    // The rv_fregfile instantiation lives further down, after the MEM/WB pipeline
+    // signals it now reads (mem_wb_*) are declared.
+    logic         fpld_we_q;      // a valid FP load retired last cycle
+    reg_addr_t    fpld_rd_q;      // its destination f-register
+    logic [63:0]  fpld_data_q;    // its loaded value (NaN-boxed / assembled)
 
     // =========================================================================
     // ID/EX Pipeline Register  (between ID and EX)
@@ -718,6 +715,8 @@ module rv_core
         .mem_wb_valid   (mem_wb_valid),
         .mem_wb_ctrl    (mem_wb_ctrl),
         .mem_wb_rd_addr (mem_wb_rd_addr),
+        .fpld_valid     (fpld_we_q),
+        .fpld_rd_addr   (fpld_rd_q),
         .fwd_rs1_sel    (fwd_rs1_sel),
         .fwd_rs2_sel    (fwd_rs2_sel),
         .fwd_frs1_sel   (fwd_frs1_sel),
@@ -753,10 +752,15 @@ module rv_core
     logic [63:0] mem_wb_fpu_result_f;
     // fwd_frs1_data, fwd_frs2_data, fwd_frs3_data forward-declared above.
 
+    // FP forward mux.  sel: 01=EX/MEM, 10=MEM/WB (FP compute results only -- FP
+    // loads excluded by rv_forward), 11=delayed FP-load (fpld_data_q), 00=regfile.
+    // The FP-load path no longer drives the MEM/WB case, so no live D$-read data
+    // enters the FP forward network combinationally.
     always_comb begin
         unique case (fwd_frs1_sel)
             2'b01:   fwd_frs1_data = ex_mem_fpu_result_f;
-            2'b10:   fwd_frs1_data = wb_freg_data;
+            2'b10:   fwd_frs1_data = mem_wb_fpu_result_f;
+            2'b11:   fwd_frs1_data = fpld_data_q;
             default: fwd_frs1_data = id_ex_frs1_data;
         endcase
     end
@@ -764,7 +768,8 @@ module rv_core
     always_comb begin
         unique case (fwd_frs2_sel)
             2'b01:   fwd_frs2_data = ex_mem_fpu_result_f;
-            2'b10:   fwd_frs2_data = wb_freg_data;
+            2'b10:   fwd_frs2_data = mem_wb_fpu_result_f;
+            2'b11:   fwd_frs2_data = fpld_data_q;
             default: fwd_frs2_data = id_ex_frs2_data;
         endcase
     end
@@ -772,10 +777,39 @@ module rv_core
     always_comb begin
         unique case (fwd_frs3_sel)
             2'b01:   fwd_frs3_data = ex_mem_fpu_result_f;
-            2'b10:   fwd_frs3_data = wb_freg_data;
+            2'b10:   fwd_frs3_data = mem_wb_fpu_result_f;
+            2'b11:   fwd_frs3_data = fpld_data_q;
             default: fwd_frs3_data = id_ex_frs3_data;
         endcase
     end
+
+    // --- FP register file (instantiated here, after the MEM/WB signals its write
+    // ports read are declared) ---
+    // Port A (on-time): FP compute results only -- driven by mem_wb_fpu_result_f
+    // (a register) so no D$-read data reaches the fregfile write/write-through.
+    // Port B (delayed): the late FP-load writeback from the fpld registers.
+    logic fp_wr_a_we;
+    always_comb fp_wr_a_we = mem_wb_valid && mem_wb_ctrl.freg_write
+                             && !mem_wb_ctrl.fp_load;
+
+    rv_fregfile u_fregfile (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .rs1_addr (id_rs1_addr),
+        .rs2_addr (id_rs2_addr),
+        .rs3_addr (id_rs3_addr),
+        .rs1_data (id_frs1_data),
+        .rs2_data (id_frs2_data),
+        .rs3_data (id_frs3_data),
+        // Port A: on-time FP compute results
+        .rd_addr  (mem_wb_rd_addr),
+        .rd_data  (mem_wb_fpu_result_f),
+        .rd_we    (fp_wr_a_we),
+        // Port B: delayed FP-load writeback
+        .rd2_addr (fpld_rd_q),
+        .rd2_data (fpld_data_q),
+        .rd2_we   (fpld_we_q)
+    );
 
     // --- ALU operand muxes ---
     logic [XLEN-1:0] alu_op_a, alu_op_b;
@@ -1729,9 +1763,14 @@ module rv_core
     // FLW: NaN-box the 32-bit loaded value (upper 32 bits = 0xFFFFFFFF)
     // FLD: write full 64-bit loaded value
     // FPU: write fpu_result_f (64-bit; already NaN-boxed for SP by rv_fpu.sv)
+    //
+    // wb_freg_data is the FP-load value here (the only place D$-read data enters
+    // the FP datapath).  FP compute results are written via fregfile port A
+    // directly from mem_wb_fpu_result_f; FP loads are written via port B from the
+    // registered fpld_* (captured below) one cycle later.  Keeping the dmem-fed
+    // value confined to wb_freg_data -> fpld_data_q (a register) splits the long
+    // D$-data -> FP route at the core boundary.
     always_comb begin
-        wb_freg_write = mem_wb_valid && mem_wb_ctrl.freg_write;
-        wb_frd_addr   = mem_wb_rd_addr;
         if (mem_wb_ctrl.fp_load) begin
             if (mem_wb_ctrl.fp_double)
                 // FLD: 64-bit.  RV64 gets the whole double in one access (dmem_shifted).
@@ -1745,6 +1784,25 @@ module rv_core
         end
     end
 
+    // ---- Delayed FP-load writeback capture (fpld) ----
+    // Capture the FP-load value on its single FRESH WB cycle (when wb_freg_data is
+    // valid).  fpld_we_q is a one-cycle pulse driving fregfile port B and the
+    // lowest-priority FP forward (sel 2'b11) on the next cycle.  Because the load
+    // has already retired, the capture/commit is NOT cancelled by any flush.
+    // NO-OP for non-FP code (fpld_we_q stays 0).
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            fpld_we_q   <= 1'b0;
+            fpld_rd_q   <= '0;
+            fpld_data_q <= '0;
+        end else begin
+            fpld_we_q   <= mem_wb_fresh && mem_wb_valid
+                           && mem_wb_ctrl.freg_write && mem_wb_ctrl.fp_load;
+            fpld_rd_q   <= mem_wb_rd_addr;
+            fpld_data_q <= wb_freg_data;
+        end
+    end
+
     // =========================================================================
     // Hazard Detection Unit
     // =========================================================================
@@ -1752,6 +1810,9 @@ module rv_core
         .id_ex_valid     (id_ex_valid),
         .id_ex_ctrl      (id_ex_ctrl),
         .id_ex_rd_addr   (id_ex_rd_addr),
+        .ex_mem_valid    (ex_mem_valid),
+        .ex_mem_ctrl     (ex_mem_ctrl),
+        .ex_mem_rd_addr  (ex_mem_rd_addr),
         .id_rs1_addr     (id_rs1_addr),
         .id_rs2_addr     (id_rs2_addr),
         .id_rs3_addr     (id_rs3_addr),
