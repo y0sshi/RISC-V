@@ -24,6 +24,8 @@ vivado_*.backup*
 *.ltx
 *.dcp
 *.rpt
+clockInfo.txt
+tight_setup_hold_pins.txt
 # Scripted Vivado project output dirs (boards/<board>/vivado/rv_riscv_*)
 boards/**/vivado/rv_riscv_*/
 
