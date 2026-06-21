@@ -585,4 +585,280 @@ step 10 が対処したのは FP-load→FP-forward (FLW/FLD データ→FP regfi
 
 **step 1+2 の扱い (判断事項)**: 単独では timing 利得ゼロ + IPC コスト (step1 +4.5%, step2 は taken redirect +1cyc)。
 但し **FPU 段化後に IF leak が再び worst に浮上するため、必要な foundation**。コミットして残すのを推奨 (機能的に正しく
-非破壊、full Linux NET=y gate PASS 済)。
+非破壊、full Linux NET=y gate PASS 済)。→ commit `2e2aecc` 済。
+
+## 12. step 5 = 組合せ FPU misc 経路の 2 段レジスタ化 (第13セッション; `rv_fpu.sv` のみ)
+
+### 精密ターゲット (第12で特定済 — 当初の「single→2cyc」想定とは違う)
+step 1+2 後の worst (`report_worst_b2.log`, 36.37ns) の実体は `int_a (fwd_rs1_data, ライブ forward mux 出力)
+→ u_misc 組合せ (FCVT.S.W/L・FMV.W.X の整数入力) → 出力 mux → ex_mem_fpu_result_f`。
+- **add/mul/fma は既に内部 1-cycle pipeline 済** (`mul_result_q` 等)。残る組合せは **`rv_fpu_misc(_d)` (完全
+  `always_comb`) + 出力 mux** で、これらに register が無く operand→misc→mux→ex_mem が 1 サイクル ~36ns。
+- 「misc 出力のみ登録」では front-end の `D$→forward→misc compute` (~29ns) が残る → 不十分。よって **misc 入力
+  オペランドの登録 (stage A) + misc 出力の登録 (stage B) の 2 段**が必須。
+
+### 設計 (rv_fpu.sv 内に局所完結; busy プロトコル不変 = rv_core 無改変)
+2 つの free-running レジスタ段を FPU 内に挿入:
+- **stage A** = `fa_q/fb_q/int_a_q <= fa/fb/int_a` (forward 後のオペランドを登録)。`fa_s_q/fb_s_q` は登録値の
+  NaN-box ビュー。u_misc は `fa_s_q/fb_s_q/int_a_q`、u_misc_d は `fa_q/fb_q/int_a_q` を読む。
+- **stage B** = `misc_result_f_q/misc_result_i_q/misc_fflags_q` (+ D 版) <= 組合せ misc 出力。出力 mux は `_q` 版を選ぶ。
+  FMV.X.W の直接 `fa` 読み出しも `fa_q` に差し替え (mux 内で他の登録結果と整合)。
+- **free-running が安全 = レイテンシ無追加の根拠**: 全 FP compute op は COMB_LAT=2 の busy 窓 (T+1,T+2 busy,
+  T+3 capture) で EX に滞在し、rv_core は stall 中 `id_ex_*_data <= fwd_*_data` (`rv_core.sv:733`) でオペランドを
+  毎サイクル refresh → 窓全体で安定。よって stage A は T+1 で確定、stage B は T+2 で確定し T+3 capture に間に合う
+  (`mul_result_q` と同じ流儀)。div/sqrt/mul/add/fma はライブオペランドのまま不変。
+- **3 区間に分割**: `D$→forward→operand_q` (front, ~11ns) / `operand_q→misc→misc_q` (misc compute, ~18ns) /
+  `misc_q→出力 mux→ex_mem` (~5ns)。worst は misc compute ~18ns へ低下する見込み。
+
+### コスト/非破壊
+- **レイテンシ追加ゼロ** (COMB_LAT=2 据置、busy/result_valid/comb_done 不変、rv_core 1 行も触らず)。
+- **TB 修正 1 箇所** (`tb_rv_fpu.sv` の inline FCVT.S.W): 旧 TB は `result_valid` を待たず valid 解除直後に
+  `result_f` を即サンプリングしていた (組合せ misc が即結果を出すのに依存)。misc 正規多サイクル化で他テスト
+  (check_i/check_f) 同様 `wait_result(60)` を要するよう修正。RTL バグではなく TB 側の非代表的サンプリング。
+
+### 検証 (第13セッション; 全 PASS)
+- **FPU ユニット**: sim_fpu 94/94・sim_fpu_d 33/33・sim_fpu_pipe 7/7。
+- **全ユニット (非FP)**: pipeline/intr/dcache(64)/amo(64)/mmu(64)/csr/cdecode(64)/icache(64)/cache_soc(64)/sv(64)/
+  mext(64) 全 PASS (bit 一致)。
+- **compliance FP**: rv64uf 11・rv64ud 12・rv32uf 11・rv32ud 10 = 44/44。
+- **full Linux NET=y gate**: `LINUX-USERSPACE-OK` + HARM=0 + amo_prem=0 + chars=11428 (~480M cyc, baseline bit 一致;
+  Linux は FP 未使用)。
+
+### ✅ 実 impl 測定 (第13セッション; FPU misc 経路は切れ、worst は整数 MUL へ移動)
+`build_step5` (25MHz=40ns; `boards/reports/build_step5.log` / `report_worst_step5.log`):
+**timing met (WNS=5.774 / WHS=0.017, 0 failing endpoints)**。step 1+2 の WNS=2.782 から **+2.99ns 改善**
+(worst data path ~37.2→34.2ns)。
+
+- **✅ FPU misc 経路は worst から消失**: step 1+2 の worst (`...→u_fpu u_misc→ex_mem_fpu_result_f`, 36.37ns) が
+  消え、2 段化が効いた。
+- **新 worst = 整数 MUL (単サイクル DSP 乗算)** (33.509ns, logic 15.9ns/47% + route 17.6ns/53%, 30 levels,
+  DSP48E1=4 + CARRY4=13):
+  ```
+  D$ data read (gen_dcache data_reg -> dc_c_rdata) -> u_periph periph_rdata
+    -> wb_data[25] (整数 regfile writeback) -> fwd_rs2_data[25] (MEM/WB->EX forward)
+    -> u_muldiv (prod_ss = signed-signed 乗算 DSP cascade + 符号補正 CARRY4) -> ex_mem_alu_result_reg[56]/D
+  ```
+  = **整数 load 結果が MUL/MULH 命令へ forward され、単サイクル DSP 乗算が ex_mem_alu_result に確定する経路**。
+  FPU misc と同族 (D$ load→forward→組合せ compute→ex_mem) だが、今度は `rv_muldiv` の MUL (CLAUDE.md: MUL=
+  single-cycle DSP、DIV/REM は既に多サイクル radix-2)。
+
+**結論 = step 5 達成 (FPU 経路除去・+2.99ns)。binding constraint は単サイクル整数 MUL 経路へ移った。**
+→ **次段 (step 6) = 単サイクル MUL の段化** (DSP48E1 の内部 pipeline レジスタ MREG/PREG を活かし、MUL/MULH/MULW を
+1-2 サイクル化して muldiv の busy プロトコルへ統合; DIV 同様)。20ns まではあと ~13ns、複数段が必要。
+
+## 13. step 6 = 単サイクル整数 MUL の段化 (第13セッション; `rv_muldiv.sv` + `rv_core.sv`)
+
+### 設計 (DSP を入力+出力レジスタで挟む正準パイプライン構成; DIV と同じ busy プロトコル)
+step 5 後の worst (`report_worst_step5.log`, 33.5ns) = `rsN_data (load forward) → 64x64 乗算 (+MULH 加算木) →
+result → ex_mem_alu_result`。MUL を DIV/FPU と同じ多サイクル化:
+- **stage A** = `rs1_q/rs2_q <= rs1_data/rs2_data` (DSP 入力レジスタ)。products (prod_ss/su/uu) は registered
+  operand から組合せ算出。**stage B** = `prod_*_q <= prod_*` (DSP 出力レジスタ)。`mul_result` は registered products
+  から選択 (low half は符号非依存 → MUL/MULW は prod_uu_q)。
+- **busy 統合**: `mul_cnt` カウンタ (MUL_LAT=2)、`mul_busy=(mul_cnt!=0)`。出力 `div_busy = div FSM busy | mul_busy`。
+  D_IDLE は `valid_in && is_div_op` でのみ divider 起動 (MUL は mul_cnt が処理)。`rv_core`: `muldiv_valid_in` の
+  `muldiv_is_divide` ゲートを除去 → MUL も start_stall + busy 経路を通る。**busy/start_stall/was_busy/done は
+  divider と完全共有** = restart-livelock 対策 (#14) も MUL に自動適用。
+- **free-running が安全**: オペランドは stall 中 id_ex で安定 (step 5 と同根)、両 stage は capture cycle (busy 立下り)
+  までに確定。**結果等価性で検証** (no-op ではなくレイテンシ変更)。
+
+### コスト
+- **MUL レイテンシ = 1→約4 サイクル** (start + MUL_LAT busy + capture)。Linux userspace 到達 433M→442M cyc =
+  **+9M (+2.1%)**。MUL は load/branch より低頻度なので許容。
+- **TB 修正 1 箇所** (`tb_rv_mext.sv`): MUL も busy ハンドシェイクを持つので multiply 分岐を divide と同じ
+  valid_in/div_busy 待ちに統一 (旧は `#1` 即サンプル = 組合せ前提)。`sim_mdrand`(busy 対応済) は無修正で PASS。
+
+### 検証 (第13セッション; 全 PASS)
+- **M ユニット**: sim_mext 29/29・sim_mext64 40/40・sim_mdrand 200K・sim_mdrand64 400K (vs golden)。
+- **統合**: sim_pipeline・sim_intr PASS。**compliance**: rv64um 13/13・rv32um 8/8。
+- **full Linux NET=y gate**: `LINUX-USERSPACE-OK` + HARM=0 + amo_prem=0 + chars=11428 (+2.1% cyc; restart-livelock
+  /オペランド安定性 問題なし)。
+
+### ✅ 実 impl 測定 (第13セッション; MUL 経路は切れ、worst は I$ 内部へ)
+`build_step6` (25MHz=40ns; `boards/reports/build_step6.log` / `report_worst_step6.log`):
+**timing met (WNS=7.859 / WHS=0.022, 0 failing)**。step 5 の WNS=5.774 から **+2.085ns 改善** (worst ~34.2→30.7ns)。
+step 1+2 起点では **WNS 2.782→7.859 = 累計 +5.08ns** (step5 FPU + step6 MUL)。
+
+- **✅ 整数 MUL 経路は worst から消失**: step 5 の worst (`...→u_muldiv prod_ss→ex_mem_alu_result`, 33.5ns) が消え、
+  入力+出力レジスタ化が効いた。
+- **新 worst = I$ 内部のフィルタグ経路** (30.689ns, logic 29%/route 71%, 38 levels, **CARRY4=23**):
+  ```
+  gen_icache.u_ic/addr_q_reg (I$ 登録フェッチアドレス) -> fill_tag CARRY4 チェーン (×23, アドレス/タグ演算)
+    -> gen_icache.u_ic/line_reg ADDRARDADDR (I$ line BRAM 読出アドレスポート)
+  ```
+  = **I$ の登録フェッチアドレスから、fill_tag (フィル時タグ/アドレス算術) を経て line BRAM の index へ至る経路**。
+  これまでの「D$ load→forward→組合せ compute→ex_mem」族とは異なり、**I$ ルックアップ内部**の経路。route 71% 支配。
+
+**結論 = step 6 達成 (MUL 経路除去・+2.085ns)。binding constraint は I$ 内部 (fill_tag→line BRAM index) へ移った。**
+20ns まではあと ~10.7ns。→ **次段 (step 7) = I$ ルックアップ経路の段化** (fill_tag 算術 / addr_q→line BRAM index の
+分割)。I$ はフェッチ critical path 上で step 1+2 で既に再構成済 = delicate、慎重設計要。route 71% 支配は floorplan も検討。
+
+## 14. step 7 解析: 真の binding path = IF フェッチ変換ループ (第14セッション)
+
+### §13 サマリの訂正 (重要)
+`report_worst_step6.log` の worst を §13 は「I$ 内部 fill_tag→line BRAM index」と要約したが、これは
+**Vivado の中間ネット名による誤読**。フルパスを精読すると実体は **IF フェッチ変換ループ全体** (単サイクル):
+
+```
+I$ addr_q (登録PA)
+  -> I$ hit/straddle 判定 (tg_next 53bit incrementer 含む)   [FF 3.6 -> 15.9ns]
+  -> c_ready = imem_ready  (fo=81 大ファンアウト)
+  -> rv_core: imem_addr=core_imem_va (advance mux, VA) 選択    [15.9 -> 21.4ns]
+  -> rv_mmu: if_va -> if_pa (組合せ 16-way TLB lookup, ~10ns)  [21.4 -> 31.3ns]
+  -> mmu_imem_pa (PA) -> I$ c_addr -> { rd_set->line BRAM, addr_q<=c_addr } [31.3 -> 33.8ns]
+```
+
+結線: `rv_core.imem_addr=core_imem_va`(VA) -> MMU `if_va`; MMU `if_pa=({ppn}<<12)|va[11:0]`(下位12bit=
+ページオフセット素通り) -> `rv_cpu.imem_addr=mmu_imem_pa` -> `rv_soc`: `u_ic.c_addr=mmu_imem_pa`,
+`u_ic.c_ready=imem_ready` (ループに戻る)。= **addr_q(reg) -> hit -> imem_ready -> VA -> MMU -> PA -> addr_q(reg)**
+の register-to-register 単サイクル経路 (~30.7ns, route 71%)。
+
+### 試行1: 1エントリ登録 micro-ITLB (rv_mmu のみ) -> full Linux で Oops、revert
+16-way TLB をループから外すため、直近フェッチページの変換を1エントリ登録 (`ifx_vpn/ifx_ppn`)、同一ページは
+`{ifx_ppn,off}` concat で高速ヒット、ページ跨ぎのみ1サイクル refresh stall (= mmu_stall、16-way TLB から
+再 capture)。**ユニット全 PASS (sim_mmu/mmu64/sv/sv64/icache/cache_soc/pipeline/intr/...) + compliance 8/8
+(rv64uc-p straddle/rv64si-p ma_fetch 含む)**。しかし **full Linux NET=y で 0.007s に Oops -> panic**:
+`Unable to handle kernel paging request at tk_core` / `Fatal exception in interrupt` (タイマ割込ハンドラ内で
+PC が tk_core データへジャンプ = 制御フロー破壊)。
+- 真因: refresh stall の `if_req_out=0` (1サイクル) が、I$ の **EXTRA-2 addr_q 再アーム** (priv 遷移時の
+  フェッチ補正、`c_req=1` 必須) と **FIFO wrong-path push / redirect_settle 整合** と**位相不整合**。
+  「presented address についての stall」と「I$ の1サイクル遅れ配信」がずれ、割込/SBI の S<->M 遷移で誤フェッチ。
+- 教訓: refresh stall を後付けすると I$/core の既存フェッチ機構 (TLB-miss=多サイクル前提) と噛み合わない。
+  I$ との co-design 必須。-> revert (第14セッションで方針Bへ)。
+
+### 試行2予定: 2段 VIPT フェッチ (ユーザ選択、第14)
+- **VIPT**: I$ BRAM の index は VA[10:5] (= PA[10:5]、4KB ページオフセット内 = 未変換) で引く。tag は **登録PA**。
+- **登録変換**: MMU `if_pa` を登録 (`if_pa_q`)。I$ は `c_vaddr`(VA, index・combinational) と `c_paddr=if_pa_q`
+  (登録PA, tag) を別ポートで受ける。serve サイクルで `vaddr_q`(=前サイクルの c_vaddr) と `c_paddr`(=その VA の
+  登録変換) が整合 -> hit。**1サイクルレイテンシ・スループット不変** (index は VA で combinational、seq_pc も
+  imem_rdata=line_q reg から combinational なのでバブル無)。
+- 変更範囲: rv_mmu (if_pa/req/fault 登録) + rv_cpu (VA+登録PA を渡す) + rv_soc (結線) + **rv_icache (index/tag
+  分離 = 要 rewrite、straddle/EXTRA-2 と整合)** + rv_core (登録 req/fault のタイミング調整)。delicate・多ファイル。
+
+### ⚠️ 重要な timing 上限の発見 (2段 VIPT 単独では 20ns に届かない)
+2段 VIPT で MMU は BRAM-index 経路から消えるが、**binding loop は別経路に残る**:
+```
+Path B: {regs} -> I$ hit -> imem_ready -> core_imem_va(次VA) -> MMU translate -> if_pa_q (register)
+        ~= hit(~12) + core fetch(~5.5) + MMU(~10) = ~27ns
+```
+= 次フェッチ VA (`core_imem_va`) が `imem_ready`(現 hit) に依存し (advance mux: `fetch_hold=~imem_ready|...`)、
+その VA を MMU が変換して登録するため、**MMU が依然 imem_ready の後ろ**。よって 2段 VIPT は **~27ns (~36MHz)
+で頭打ち**。20ns へは **step 8 = フェッチアドレス生成を imem_ready から分離** (next-PC 投機 + miss 時 replay の
+decoupled fetch、または same-page 投機変換) が追加で必要。campaign は元々「複数段必要」。
+- step 7 (2段 VIPT) = 31->~27ns の正攻法な1段。step 8 (fetch decouple) で ~27->~20ns。
+- 補助: straddle `tg_next` 53bit incrementer 除去 (hit 前段の数 ns)、imem_ready fo=81 削減、floorplan (route 71%)。
+
+## 15. step 8 設計: decoupled fetch (imem_ready を imem_addr から分離) — 第14セッション方針
+
+### 目的 (§14 の binding loop を断つ)
+真の 20ns 阻害は `{regs} → I$ hit → imem_ready → core_imem_va(次VA) → MMU → if_pa_q` の loop。
+**imem_addr が imem_ready に依存しなくなれば MMU は登録駆動アドレスで叩かれ loop から外れる** (推定 ~15ns 経路へ)。
+
+### 中核変更 (2 つ、協調必須)
+1. **rv_core `imem_addr` select から `~imem_ready` を除去**: `fetch_hold = ~imem_ready | redirect_stall |
+   fetch_full` → imem_addr 用は `redirect_stall | fetch_full` のみ。I$ miss 中 (`~imem_ready`) は
+   `imem_addr = seq_pc` (= `fetch_pc + len(直近 imem_rdata)` = 次の逐次 PC、登録駆動)。fetch_pc の前進は
+   従来通り `imem_ready` ゲート (miss 中は保持)、FIFO push も `imem_ready` ゲート → **重複なし**
+   (§11(C) の over-stall 重複は「SELECT 登録」由来; ここは登録せず除去なので over-stall しない)。
+2. **rv_icache EXTRA-2 (`S_FILL & m_done & c_req` の addr_q 再アーム) を除去/改修**: 除去すると addr_q は
+   fill 中 held → S_FILL2/再 lookup が missed PC を正しく供給。core が miss 中に imem_addr=seq_pc へ進めても
+   I$ は自前 addr_q を保持するので非干渉。delivery 後 `addr_q <= c_addr(=translate(seq_pc))` で両者 seq_pc に整合前進。
+
+### ⚠️ 設計上のハザード (各々 full Linux gate 必須; §11 / micro-ITLB Oops の教訓)
+- **(H1) 投機 seq_pc の命令ページフォールト**: miss 中に seq_pc を MMU へ提示 → seq_pc が未マップ页なら
+  `if_fault` 偽発火 → ifpf が未コミットの投機アドレスでトラップ = 誤り。**対策**: ifpf_take を「コミット済
+  フェッチ (= imem_ready の delivery、または fetch_pc に対応する fault のみ)」にゲート。投機 seq_pc の fault は抑止。
+- **(H2) priv 遷移の EXTRA-2 喪失**: EXTRA-2 は MRET/SRET で同一 fetch_pc の PA が fill 中に変わる件を救済
+  (core が fetch_pc を c_addr に保持する前提)。decoupled 化で core は保持しない → EXTRA-2 は別機構が要。
+  **仮説**: step 2 の登録 redirect + redirect_settle(2cyc) が priv 確定後に target を提示するので EXTRA-2 不要に
+  なる可能性 → 要検証 (rv64si 系 + full Linux)。不足なら I$ 側で「fill 中の priv/satp 変化検出 → 再 lookup」を実装。
+- **(H3) 投機 seq_pc の spurious PTW**: miss 中の seq_pc が TLB miss なら PTW 起動 (次ページ prefetch 相当)。
+  I$ fill と並行 (別ポート) で機能的には可だが、PTW×fill×割込の衝突 (#15/#16 族) に注意。HARM=0/amo_prem=0 で監視。
+- **(H4) redirect/flush 整合**: redir_eff の squash 窓と seq_pc 投機の wrong-path push 抑止 (ff_push は imem_ready
+  ゲート済) の整合を icache straddle/redirect テスト + Linux で確認。
+
+### 検証順序
+sim_icache(64)/sim_pipeline (重複・基本) → sim_mmu(64)/sim_sv(64) (H2 priv) → sim_cache_soc(64) →
+compliance rv64uc-p(straddle)/rv64si-p(ma_fetch/icache-alias/priv) → **full Linux NET=y (H1-H4 総合;
+LINUX-USERSPACE-OK + HARM=0 + amo_prem=0 + chars=11428)** → 実 impl で worst 再測定 (MMU が loop から外れ
+~27→~20ns 圏か、新 worst (D$/seq_pc/I$ 内部) へ移ったか)。
+
+### 期待効果
+imem_addr 登録駆動化で `imem_ready→VA→MMU` が切れ、MMU は `{regs}→MMU→I$/addr_q` の短経路へ。
+2段 VIPT (§14) と併用すれば BRAM-index も VA 化でき更に短縮。20ns 圏を狙える唯一の正攻法 (campaign 最難関)。
+
+### ⚠️⚠️ 重要訂正 (実装着手で判明): 可変長フェッチでは「中核変更1 (~imem_ready 除去)」は不成立
+miss 中は `imem_rdata` が無効 (`c_ready=0`) なので `seq_pc = fetch_pc + len(imem_rdata)` は **garbage**。
+RVC 可変長では「次 PC = 現命令長依存」のため、**missed 命令を取得するまで次 PC を計算できない** → imem_addr は
+miss 中 fetch_pc を再提示 (hold) せざるを得ず、**`~imem_ready` 依存は本質的に除去不能**。投機 seq_pc 提示は
+garbage アドレスを MMU に流す (spurious fault/PTW) = H1 が致命的。**= §11 がぶつかった可変長フェッチの結合の核**。
+
+#### 正しい decoupled fetch の前提 = ブロック整列フェッチ + アライナ (大規模)
+imem_addr の前進を**データ非依存**にするには、**32bit 整列ブロックを PC&~3 で取得し +4 固定前進** + 別 ALIGN
+段で 2/4byte 命令をブロック列から抽出 (ブロック跨ぎ命令も結合) する方式が必須。+4 は命令長非依存なので miss 中も
+block_pc+4 (有効アドレス) を投機提示でき、Fetch Target Queue が outstanding ブロックを追跡・replay。
+= **IF 段の本格再設計** (新アライナ + ブロック FIFO/FTQ)。専用セッション規模。
+
+#### 代替 (より低リスク、要 impl 実測): 2段 VIPT + front-end trim
+§14 の「~27ns 上限」見積りは **hit→imem_ready を 12ns (straddle tg_next 53bit incrementer + fo=81 route 込)**
+とした悲観値。**straddle incrementer 除去 + imem_ready fanout 削減**で hit→imem_ready を ~5-6ns に縮めれば、
+2段 VIPT 後の loop `hit(5) + select + core(5.5) + MMU(10) = ~21ns`、floorplan (route 71%) 併用で 20ns 圏も
+あり得る (analytical には route 支配で不確実、**impl 実測が唯一の信頼信号**)。block-fetch 大改造を避けられる
+可能性。**判断: まず 2段 VIPT + trim を実装し impl 実測 → 20ns 未達なら block-fetch decoupled へ**、が現実的。
+
+**第14セッション結論**: 真 critical path=IF フェッチ変換ループを確定。micro-ITLB 試行は unit/compliance PASS だが
+Linux Oops (refresh×EXTRA-2 位相不整合) で revert。decoupled fetch の「~imem_ready 除去」は可変長フェッチで
+不成立 (要 block-fetch+aligner=大規模)。**現実解 = 2段 VIPT (登録変換+VIPT index) + straddle/fanout trim を実装し
+impl 実測で 20ns 可否を判定**。全解析・設計・ハザードは §14-15 に集約。ツリーは clean。
+
+## 16. step 7 実装: full VIPT (BRAM read index を VA 化) = 機能検証完了 (第14セッション)
+§15 の「2段 VIPT + trim」のうち **VIPT 部分を実装・全検証 PASS**。設計の核 (再確認):
+- I$ の BRAM read index `rd_set` は唯一 MMU(`c_addr=mmu_imem_pa`) に依存していた箇所。index bits [OFFW+IDXW-1:OFFW]
+  はページオフセット内=未変換なので **VA から引ける** → `rd_set = c_vaddr[OFFW+:IDXW]` (= 同一 index、ただし
+  MMU 非依存)。BRAM read setup から MMU が外れる。
+- **⚠️ minimal 版 (addr_q=PA のまま rd_set だけ VA) は TLB miss/fault で破綻**: その時 `c_addr=if_pa=0` だが
+  `c_vaddr=VA` → rd_set(VA) と addr_q(=c_addr=0) の idx が不一致 → 誤ライン。実際 **full Linux で init SIGSEGV**
+  (userspace 到達後 6.0s に "Attempted to kill init exitcode=0xb")。
+- **full VIPT で修正**: `addr_q` に **VA** を登録 (index/offset; rd_set=c_vaddr と常に整合、TLB miss でも一致) +
+  新 `paddr_q` に **PA** を同 enable で登録 (tag/hit/line_base/fill)。`tg=paddr_q[tag]`, `line_base=paddr_q`。
+  変更: rv_cpu (imem_vaddr 出力) + rv_soc (mmu_imem_va 配線, I$ .c_vaddr) + rv_icache (addr_q=VA, paddr_q=PA) +
+  tb_rv_icache (.c_vaddr=c_addr)。
+- **✅ 機能検証 (全 PASS, baseline 完全一致)**: sim_icache(64) 50 / cache_soc(64) 6 / pipeline 19 / mmu(64) /
+  sv(64) / intr 10 / amo64 / dcache64 / csr / cdecode64 / fpu_pipe + compliance rv64uc-p 1 + rv64si-p 7 +
+  **full Linux NET=y LINUX-USERSPACE-OK chars=11428 pc=0x1016a HARM=0 amo_prem=0 (baseline 完全一致)**。
+- **⚠️ 期待 timing 利得は小 (~2.5ns, BRAM tail のみ)**: §15 の通り MMU は依然 binding loop (hit→imem_ready→
+  core_imem_va→MMU→paddr_q) に残る (paddr_q の tag を hit が使い、その PA は MMU 由来、core_imem_va は imem_ready
+  依存)。VIPT は BRAM-index 経路から MMU を外すのみ。**実 impl 測定中 (build_vipt.log)**。
+- **次**: impl で新 worst を確認 → trim (straddle tg_next 53b incrementer 除去・imem_ready fo=81 削減) を新 worst
+  狙いで追加 → 更なる短縮。20ns には最終的に decoupled fetch (block, §15) が必要。
+
+### ✅ 実 impl 測定 (build_vipt, 30.303MHz=33ns): VIPT は timing 利得ゼロ (予測通り)
+**WNS 3.478→3.413ns (placement noise 内、実質不変)**。VIPT が外した BRAM-index 経路は **binding でなかった**
+(binding = フェッチループの paddr_q/line BRAM enable 捕捉)。worst (`report_worst_vipt.log`, 28.417ns@33ns 制約,
+**route 75.7%**/logic 24.3%, 29 levels, CARRY4=11):
+```
+gen_icache.u_ic/addr_q_reg[6] (I$ VA 登録, fo=96 route 2.3ns)
+  -> fetch_pc hit 比較 -> imem_ready (fo=81, route 2.07ns)        [3.6 -> 15.1ns]
+  -> u_core ff_tail/ff_count -> addr_q (core fetch) -> ... -> MMU -> line_reg ENARDEN (I$ BRAM enable)
+```
+= §14 と同じ IF フェッチループ。VIPT で endpoint は ADDRARDADDR→ENARDEN・CARRY4 23→11 に変化したが**ループ
+不変・MMU 依然内在**。**route 75.7% 支配** (高 fanout: addr_q fo=96/imem_ready fo=81/p_9_in fo=62 が各 ~2ns route)。
+
+### 第14セッション最終結論 (step 7)
+- **VIPT = 機能的に正しい (baseline 完全一致) が単独 timing 利得ゼロ**。binding は IF フェッチループ (MMU 内在)、
+  **route 75.7% 支配**。
+- **route 支配 = floorplan が最有力の次手** (I$ logic + line BRAM + core fetch + MMU を pblock で近接配置 → 高 fanout
+  net の route 短縮)。RTL 無改変=機能リスク 0。trim (straddle incrementer/fanout) は route 支配下では効果限定的。
+- **論理ループ (MMU) を割るには decoupled fetch (block, §15) が必要** (20ns の本命、大規模)。
+- VIPT は decoupled fetch (VA index 化) の foundation でもある。単独利得 0 なので keep/revert は方針次第。
+
+### ❌ floorplan (pblock) は非viable = 設計が xc7z020 に対して大きすぎる (第14セッション、実測で確定)
+route 75.7% 支配を pblock で攻める案を検証 (`validate_pblock*.tcl` を routed dcp に適用、util 実測):
+- **CPU complex (u_cpu+I$+D$) = LUT 33134 (xc7z020 の 53200 の 62%)**。clustering に有効な領域 (SLICE_X0Y0:X75Y124)
+  に入れると **LUT 119.19% = 溢れる**。fit する大きさ (~85%) では現状の ~100% spread と大差なく clustering 無効。
+- **targeted (fetch loop = u_core−FPU + u_mmu + I$) でも LUT 124.94% / DSP 120%** (SLICE_X0Y0:X55Y124)。
+  内訳: u_core(all) 27895 LUT (u_fpu 10097 / u_muldiv 3756 除いても ~14K) + u_mmu 1236 + I$ 2526 = ~20K LUT、
+  DSP 48 (>40)。compact 領域に入らない。
+- **結論: RV64GC コア (62% LUT) は xc7z020 に対して大きく、pblock で clustering すると congestion (>100%) になる。
+  route 支配は device に対する設計サイズが本質的原因で、floorplan では解消不能**。
+- → **20ns の残る現実的な道は decoupled fetch (§15、論理ループを割れば route があっても経路長が短くなる) のみ**。
+  他: aggressive phys_opt/impl strategy で高 fanout net の route を自動最適化 (低リスク、数 ns 期待、要 impl 実測)。

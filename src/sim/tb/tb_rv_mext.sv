@@ -79,8 +79,9 @@ module tb_rv_mext;
 
     // Drive with 64-bit literals; auto-truncated to XLEN for XLEN=32.
     // Expected values chosen so xlen_t'(exp64) is correct for both widths.
-    // Multiply ops are combinational; divide ops use the valid_in/div_busy
-    // handshake (wait for busy to rise then fall, then sample the result).
+    // Both multiply and divide ops now use the valid_in/div_busy handshake (50MHz
+    // step 6: MUL is pipelined behind input+output registers, so it asserts busy
+    // like the divider).  Wait for busy to rise then fall, then sample the result.
     task automatic test(
         input string   name,
         input muldiv_op_t top,
@@ -89,19 +90,14 @@ module tb_rv_mext;
         rs1 = xlen_t'(a);
         rs2 = xlen_t'(b);
         op  = top;
-        if (is_divide(top)) begin
-            // Hold valid_in until the FSM accepts (busy rises); this is robust to
-            // starting from any state (e.g. the prior divide's D_DONE cycle).
-            @(negedge clk);
-            valid_in = 1'b1;
-            do @(negedge clk); while (!div_busy);   // iteration started
-            valid_in = 1'b0;
-            do @(negedge clk); while (div_busy);    // finished, result registered
-            check(name, result, xlen_t'(exp));      // sampled at negedge (stable)
-        end else begin
-            #1;
-            check(name, result, xlen_t'(exp));
-        end
+        // Hold valid_in until the unit accepts (busy rises); this is robust to
+        // starting from any state (e.g. the prior op's done cycle).
+        @(negedge clk);
+        valid_in = 1'b1;
+        do @(negedge clk); while (!div_busy);   // op started
+        valid_in = 1'b0;
+        do @(negedge clk); while (div_busy);    // finished, result registered
+        check(name, result, xlen_t'(exp));      // sampled at negedge (stable)
     endtask
 
     // =========================================================================

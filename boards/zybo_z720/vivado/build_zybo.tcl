@@ -31,10 +31,17 @@ set PART  "xc7z020clg400-1"
 set XLEN64 1           ;# 1 = RV64 (target for Linux); HP ports are 64-bit.
 
 # PL clock (FCLK_CLK0) target.  OOC est (C-2d) WNS -20.246 ns @100 MHz => path
-# ~30.2 ns => max Fmax ~33 MHz.  Start conservative at 25 MHz (40 ns period,
-# ~10 ns OOC margin) to close on the first P&R pass; raise (30 -> ...) once routed
-# timing is confirmed positive.  See CLAUDE.md "C-3" / memory linux-boot-roadmap.
-set PL_FREQMHZ 25
+# ~30.2 ns => max Fmax ~33 MHz.  Started conservative at 25 MHz to close on the
+# first P&R pass.  After the 50MHz-roadmap timing work (steps: D$/MMU/fetch/FPU/MUL
+# pipelining) the routed worst path fell to ~30.7 ns (WNS +7.859 @25 MHz), so the
+# clock is raised here.  PL_FREQMHZ=30 -> PCW realizes FCLK_CLK0 = IO PLL (1000 MHz)
+# / 33 = 30.303 MHz (33.0 ns); routed WNS = +3.478 ns (timing met) for ~21% faster
+# real-HW boot while the full 50 MHz push continues.  The mtime / UART-baud / DT
+# constants follow the ACTUAL realized PL clock (rv_soc_linux_hw.dts +
+# docs/opensbi/rv_soc_hw.dts: timebase-frequency + serial clock-frequency =
+# 30303030; baud divisor = round(PL/(16*baud))); keep them in sync with the
+# realized FCLK, not the request.
+set PL_FREQMHZ 30
 
 create_project $proj_name $proj_dir -part $PART -force
 set_property target_language Verilog [current_project]

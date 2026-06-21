@@ -3,18 +3,22 @@
 /* Real-HARDWARE Linux device tree for the Zybo Z7-20 bitstream.
  *
  * Derived from rv_soc_linux_lo.dts (the sim-verified, base-relocated 0x0020_0000
- * copy).  IDENTICAL to rv_soc_linux_lo.dts EXCEPT for the three CLOCK constants,
- * which on real silicon must reflect the actual PL clock instead of the sim
- * placeholders.  See docs/opensbi/rv_soc_hw.dts for the full derivation; in
- * brief, with PL clock = 25 MHz and rv_soc MTIME_DIV = 1:
+ * copy).  IDENTICAL to rv_soc_linux_lo.dts EXCEPT for the three CLOCK constants
+ * (timebase-frequency, serial clock-frequency, current-speed), which on real
+ * silicon must reflect the ACTUAL PL clock rather than the sim placeholders.
+ * See docs/opensbi/rv_soc_hw.dts for the full derivation; in brief, with
+ * MTIME_DIV=1 the real FCLK_CLK0 = IO PLL (1000 MHz) / divisor (set by
+ * build_zybo.tcl PL_FREQMHZ via PCW; ps7_init 0xF8000170):
  *
- *   - timebase-frequency = 25000000 (mtime runs at 25 MHz on HW; the sim used
- *       1 MHz only because BOOT_MTIME_DIV=64 slows mtime in the boot harness).
- *   - serial clock-frequency = 25000000 (= PL clock; the 8250 divisor is
- *       clock-frequency/(16*baud), and actual_baud = PL/(divisor*16), so the two
- *       must match for the baud to be correct).
- *   - current-speed = 57600 (25 MHz cannot make a clean 115200; 57600 -> divisor
- *       27 -> 57870 baud = +0.47%, safe; 115200 would be +/-4% = unreliable).
+ *   - timebase-frequency / serial clock-frequency = the ACTUAL FCLK in Hz (mtime
+ *       ticks at FCLK; the 8250 divisor = clock-frequency/(16*baud) and
+ *       actual_baud = FCLK/(16*divisor), so both must equal the real FCLK or the
+ *       wall-clock / baud come out wrong).
+ *   - current-speed = console baud (the live values + the baud error are in the
+ *       inline comments on each property below).
+ *
+ * These three constants are rewritten by boards/zybo_z720/set_pl_freq.py <MHz> on
+ * a clock retarget -- do NOT hand-edit them out of sync with PL_FREQMHZ.
  *
  * The kernel Image is relocatable / base-independent; only this DTB + the OpenSBI
  * wrapper depend on the firmware base.  /memory is kept at 64 MiB for bring-up
@@ -35,7 +39,7 @@
     cpus {
         #address-cells = <1>;
         #size-cells = <0>;
-        timebase-frequency = <25000000>;  /* mtime = PL/MTIME_DIV = 25 MHz/1 */
+        timebase-frequency = <30303030>;  /* mtime = PL/MTIME_DIV = 30.303 MHz/1 */
 
         cpu0: cpu@0 {
             device_type = "cpu";
@@ -87,8 +91,8 @@
             reg-io-width = <4>;
             interrupt-parent = <&plic0>;
             interrupts = <1>;
-            clock-frequency = <25000000>;  /* = PL clock; sets the 8250 divisor */
-            current-speed = <57600>;       /* 25e6/(16*27)=57870, +0.47% */
+            clock-frequency = <30303030>;  /* = PL clock; sets the 8250 divisor */
+            current-speed = <57600>;  /* 30.303e6/(16*33)=57392, -0.36% */
         };
     };
 };

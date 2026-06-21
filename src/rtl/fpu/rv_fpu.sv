@@ -72,6 +72,43 @@ module rv_fpu
     assign fb_s = (fb[63:32] == 32'hFFFFFFFF) ? fb[31:0] : CANONICAL_NAN_S;
     assign fc_s = (fc[63:32] == 32'hFFFFFFFF) ? fc[31:0] : CANONICAL_NAN_S;
 
+    // -------------------------------------------------------------------------
+    // MISC operand/result pipeline registers (50MHz step 5)
+    //
+    // FCVT.S.W / FMV.W.X (and the D variants) read the integer operand int_a,
+    // which arrives through the EX forward mux -- on a load->FCVT pair its worst
+    // input is the D$ load result forwarded combinationally.  The misc units are
+    // purely combinational, so without a register the path
+    //   D$ data -> EX forward -> u_misc compute -> output mux -> EX/MEM FP reg
+    // is a single ~36 ns combinational run (the post-step4 FPU critical path).
+    //
+    // Split it with TWO free-running register stages local to the FPU: register
+    // the forwarded operands (fa_q/fb_q/int_a_q) feeding the misc units, and
+    // register the misc results (misc_*_q) feeding the output mux.  Free-running
+    // is safe and adds NO latency: every FP compute op occupies EX for the fixed
+    // COMB_LAT busy window, and rv_core holds the operands stable in ID/EX across
+    // that window (it refreshes id_ex_*_data with the resolved forward each stall
+    // cycle), so by the capture cycle (busy falling, T+3) the two registered
+    // stages have settled to the correct value -- exactly how mul_result_q is
+    // captured for the FMADD multiply.  Only the misc path changes; the add / mul
+    // / fma / div / sqrt sub-units keep reading the live operands.
+    // -------------------------------------------------------------------------
+    logic [63:0]     fa_q, fb_q;      // forwarded FP operands, registered (misc only)
+    logic [XLEN-1:0] int_a_q;         // forwarded integer operand, registered
+
+    logic [31:0] fa_s_q, fb_s_q;      // NaN-boxed S-view of the registered operands
+    assign fa_s_q = (fa_q[63:32] == 32'hFFFFFFFF) ? fa_q[31:0] : CANONICAL_NAN_S;
+    assign fb_s_q = (fb_q[63:32] == 32'hFFFFFFFF) ? fb_q[31:0] : CANONICAL_NAN_S;
+
+    // Registered misc results (S and D), driven below from the combinational
+    // u_misc / u_misc_d outputs; consumed by the output mux.
+    logic [31:0]     misc_result_f_q;
+    logic [XLEN-1:0] misc_result_i_q;
+    logic [4:0]      misc_fflags_q;
+    logic [63:0]     misc_d_result_f_q;
+    logic [XLEN-1:0] misc_d_result_i_q;
+    logic [4:0]      misc_d_fflags_q;
+
     // =========================================================================
     // Single-precision sub-units
     // =========================================================================
@@ -190,9 +227,9 @@ module rv_fpu
     );
 
     rv_fpu_misc #(.XLEN(XLEN)) u_misc (
-        .fa        (fa_s),
-        .fb        (fb_s),
-        .int_a     (int_a),
+        .fa        (fa_s_q),
+        .fb        (fb_s_q),
+        .int_a     (int_a_q),
         .fpu_op    (fpu_op),
         .rm        (rm),
         .rs2_sel   (rs2_sel),
@@ -312,9 +349,9 @@ module rv_fpu
     );
 
     rv_fpu_misc_d #(.XLEN(XLEN)) u_misc_d (
-        .fa        (fa),
-        .fb        (fb),
-        .int_a     (int_a),
+        .fa        (fa_q),
+        .fb        (fb_q),
+        .int_a     (int_a_q),
         .fpu_op    (fpu_op),
         .rm        (rm),
         .rs2_sel   (rs2_sel),
@@ -377,6 +414,15 @@ module rv_fpu
             mul_fflags_q   <= '0;
             mul_d_result_q <= '0;
             mul_d_fflags_q <= '0;
+            fa_q           <= '0;
+            fb_q           <= '0;
+            int_a_q        <= '0;
+            misc_result_f_q   <= '0;
+            misc_result_i_q   <= '0;
+            misc_fflags_q     <= '0;
+            misc_d_result_f_q <= '0;
+            misc_d_result_i_q <= '0;
+            misc_d_fflags_q   <= '0;
         end else begin
             comb_busy_q <= comb_busy;
             // Free-running capture of the pipelined multiply product / flags.
@@ -384,6 +430,20 @@ module rv_fpu
             mul_fflags_q   <= mul_fflags;
             mul_d_result_q <= mul_d_result;
             mul_d_fflags_q <= mul_d_fflags;
+
+            // Free-running operand stage (stage A): forwarded operands feeding the
+            // misc units.  Stable across the FP stall (ID/EX refresh in rv_core).
+            fa_q    <= fa;
+            fb_q    <= fb;
+            int_a_q <= int_a;
+            // Free-running misc-result stage (stage B): the combinational misc
+            // outputs computed from the registered operands above.
+            misc_result_f_q   <= misc_result_f;
+            misc_result_i_q   <= misc_result_i;
+            misc_fflags_q     <= misc_fflags;
+            misc_d_result_f_q <= misc_d_result_f;
+            misc_d_result_i_q <= misc_d_result_i;
+            misc_d_fflags_q   <= misc_d_fflags;
 
             if (comb_op_in && comb_cnt == 2'd0)
                 comb_cnt <= COMB_LAT[1:0];      // start: span COMB_LAT busy cycles
@@ -423,16 +483,16 @@ module rv_fpu
                 sp_fflags   = mul_fflags_q | fma_add_fflags;
             end
             FPU_SGNJ, FPU_MINMAX: begin
-                sp_result_f = misc_result_f;
-                sp_fflags   = misc_fflags;
+                sp_result_f = misc_result_f_q;
+                sp_fflags   = misc_fflags_q;
             end
             FPU_CMP, FPU_CLASS, FPU_MVXW, FPU_CVTWS: begin
                 sp_to_int   = 1'b1;
-                sp_fflags   = misc_fflags;
+                sp_fflags   = misc_fflags_q;
             end
             FPU_MVWX, FPU_CVTSW: begin
-                sp_result_f = misc_result_f;
-                sp_fflags   = misc_fflags;
+                sp_result_f = misc_result_f_q;
+                sp_fflags   = misc_fflags_q;
             end
             default: ;
         endcase
@@ -447,11 +507,13 @@ module rv_fpu
             // Single-precision path: output is NaN-boxed
             if (sp_to_int) begin
                 // FMV.X.W transfers the raw low 32 bits (not the NaN-box-checked
-                // fa_s); all other int-producing ops use the misc result.
+                // fa_s); all other int-producing ops use the misc result.  Use the
+                // registered operand (fa_q) so this path is pipelined like the misc
+                // result it is muxed against.
                 if (fpu_op == FPU_MVXW)
-                    result_i = {{(XLEN-32){fa[31]}}, fa[31:0]};
+                    result_i = {{(XLEN-32){fa_q[31]}}, fa_q[31:0]};
                 else
-                    result_i = misc_result_i;
+                    result_i = misc_result_i_q;
             end else begin
                 result_f = {32'hFFFFFFFF, sp_result_f};
             end
@@ -481,17 +543,17 @@ module rv_fpu
                     fflags   = mul_d_fflags_q | fma_d_add_fflags;
                 end
                 FPU_SGNJ, FPU_MINMAX: begin
-                    result_f = misc_d_result_f;
-                    fflags   = misc_d_fflags;
+                    result_f = misc_d_result_f_q;
+                    fflags   = misc_d_fflags_q;
                 end
                 FPU_CMP, FPU_CLASS, FPU_MVXW, FPU_CVTWS: begin
-                    result_i = misc_d_result_i;
-                    fflags   = misc_d_fflags;
+                    result_i = misc_d_result_i_q;
+                    fflags   = misc_d_fflags_q;
                 end
                 FPU_MVWX, FPU_CVTSW,
                 FPU_CVTSD, FPU_CVTDS: begin
-                    result_f = misc_d_result_f;
-                    fflags   = misc_d_fflags;
+                    result_f = misc_d_result_f_q;
+                    fflags   = misc_d_fflags_q;
                 end
                 default: ;
             endcase

@@ -76,17 +76,37 @@ module rv_muldiv
     end
 
     // =========================================================================
-    // Multiply (combinational, single-cycle)
+    // Multiply (pipelined: input + output registers; 50MHz step 6)
+    //
+    // The single-cycle DSP multiply on a load-forwarded operand
+    //   D$ load -> EX forward -> rsN_data -> 64x64 multiply (+ MULH summation)
+    //   -> result -> ex_mem_alu_result
+    // was the post-step5 FPGA critical path (~33.5 ns).  Pipeline it like the FPU
+    // combinational ops: register the operands (stage A) and the products
+    // (stage B) so the DSP sits behind an input AND an output register (the
+    // canonical high-Fmax DSP48E1 config), and run the multiply through the same
+    // busy / start-stall handshake as the divider (MUL_LAT busy cycles; the
+    // EX/MEM register captures `result` when busy drops).  Free-running capture
+    // is safe and adds the fixed latency only: the operands are held stable in
+    // ID/EX across the stall (rv_core refreshes id_ex_*_data with the resolved
+    // forward each stall cycle), so both stages settle by the capture cycle --
+    // exactly how the FPU misc operand/result stages settle within COMB_LAT.
+    // This is a LATENCY change for MUL (it now occupies EX for MUL_LAT+ cycles
+    // like a short divide), validated by result equivalence, not structural no-op.
     // =========================================================================
-    logic [2*XLEN-1:0] rs1_sx, rs2_sx;  // sign-extended
+    localparam int unsigned MUL_LAT = 2;   // multiply busy cycles
+
+    // Stage A: registered operands feeding the multipliers (DSP input register).
+    logic [XLEN-1:0]   rs1_q, rs2_q;
+    logic [2*XLEN-1:0] rs1_sx, rs2_sx;  // sign-extended (from registered operands)
     logic [2*XLEN-1:0] rs1_ux, rs2_ux;  // zero-extended
 
-    assign rs1_sx = {{XLEN{rs1_data[XLEN-1]}}, rs1_data};
-    assign rs2_sx = {{XLEN{rs2_data[XLEN-1]}}, rs2_data};
-    assign rs1_ux = {{XLEN{1'b0}},              rs1_data};
-    assign rs2_ux = {{XLEN{1'b0}},              rs2_data};
+    assign rs1_sx = {{XLEN{rs1_q[XLEN-1]}}, rs1_q};
+    assign rs2_sx = {{XLEN{rs2_q[XLEN-1]}}, rs2_q};
+    assign rs1_ux = {{XLEN{1'b0}},           rs1_q};
+    assign rs2_ux = {{XLEN{1'b0}},           rs2_q};
 
-    logic [2*XLEN-1:0] prod_ss;   // signed   x signed
+    logic [2*XLEN-1:0] prod_ss;   // signed   x signed   (combinational)
     logic [2*XLEN-1:0] prod_su;   // signed   x unsigned (MULHSU)
     logic [2*XLEN-1:0] prod_uu;   // unsigned x unsigned
 
@@ -94,17 +114,53 @@ module rv_muldiv
     assign prod_su = $signed(rs1_sx) * $signed(rs2_ux);  // rs2_ux MSB=0 -> non-neg
     assign prod_uu = rs1_ux * rs2_ux;
 
+    // Stage B: registered products feeding the result select (DSP output register).
+    logic [2*XLEN-1:0] prod_ss_q, prod_su_q, prod_uu_q;
+
+    // Result select from the REGISTERED products.  The low half of a product is
+    // independent of operand sign / upper bits, so MUL/MULW read prod_uu_q.
     logic [XLEN-1:0] mul_result;
     always_comb begin
         mul_result = '0;
         unique case (op)
-            MDU_MUL:    mul_result = rs1_data * rs2_data;
-            MDU_MULH:   mul_result = prod_ss[2*XLEN-1:XLEN];
-            MDU_MULHSU: mul_result = prod_su[2*XLEN-1:XLEN];
-            MDU_MULHU:  mul_result = prod_uu[2*XLEN-1:XLEN];
-            MDU_MULW:   mul_result = XLEN'($signed(rs1_data[31:0] * rs2_data[31:0]));
+            MDU_MUL:    mul_result = prod_uu_q[XLEN-1:0];
+            MDU_MULH:   mul_result = prod_ss_q[2*XLEN-1:XLEN];
+            MDU_MULHSU: mul_result = prod_su_q[2*XLEN-1:XLEN];
+            MDU_MULHU:  mul_result = prod_uu_q[2*XLEN-1:XLEN];
+            MDU_MULW:   mul_result = XLEN'($signed(prod_uu_q[WBITS-1:0]));
             default:    mul_result = '0;  // divide ops use div_result mux below
         endcase
+    end
+
+    // Multiply busy window (mirrors the divider handshake; MUL_LAT cycles).  Free-
+    // running operand/product registers below; counter starts on a multiply
+    // valid_in and counts down to the capture cycle (busy falling).
+    logic [1:0] mul_cnt;
+    logic       mul_busy;
+    assign mul_busy = (mul_cnt != 2'd0);
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rs1_q     <= '0;
+            rs2_q     <= '0;
+            prod_ss_q <= '0;
+            prod_su_q <= '0;
+            prod_uu_q <= '0;
+            mul_cnt   <= 2'd0;
+        end else begin
+            // Free-running stage A (operands) and stage B (products).
+            rs1_q     <= rs1_data;
+            rs2_q     <= rs2_data;
+            prod_ss_q <= prod_ss;
+            prod_su_q <= prod_su;
+            prod_uu_q <= prod_uu;
+            // Busy counter: a multiply spans MUL_LAT busy cycles (busy is still 0
+            // on the start cycle, rising next edge -- like the divider's D_RUN).
+            if (valid_in && !is_div_op && mul_cnt == 2'd0)
+                mul_cnt <= MUL_LAT[1:0];
+            else if (mul_cnt != 2'd0)
+                mul_cnt <= mul_cnt - 2'd1;
+        end
     end
 
     // =========================================================================
@@ -125,7 +181,9 @@ module rv_muldiv
     logic            a_sign_q, b_sign_q, is_rem_q, is_w_q, special_q;
     logic [XLEN-1:0] special_res_q;
 
-    assign div_busy = (state == D_RUN) || (state == D_CORR);
+    // Output busy = divider iteration OR multiply pipeline in flight.  rv_core
+    // ties this to muldiv_busy_int (stalls EX while a MUL or DIV is in flight).
+    assign div_busy = (state == D_RUN) || (state == D_CORR) || mul_busy;
 
     // ---- Start-cycle operand/special preparation (combinational) ----
     logic [XLEN-1:0] a_ext, b_ext, a_mag, b_mag, divd_init, dvsr_init;
@@ -203,8 +261,9 @@ module rv_muldiv
         end else begin
             unique case (state)
                 D_IDLE: begin
-                    if (valid_in) begin
+                    if (valid_in && is_div_op) begin
                         // Latch operands/attributes and start iterating.
+                        // (Multiply valid_in is handled by the mul busy counter.)
                         rem_q         <= '0;
                         quot_q        <= '0;
                         divd_q        <= divd_init;

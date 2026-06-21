@@ -4,25 +4,27 @@
  *
  * Derived from rv_soc_lo.dts (the sim-verified, base-relocated 0x0020_0000 copy).
  * IDENTICAL to rv_soc_lo.dts EXCEPT for the three CLOCK constants below, which on
- * real silicon must reflect the actual PL clock rather than the sim placeholders:
+ * real silicon must reflect the ACTUAL PL clock rather than the sim placeholders.
+ * With rv_soc MTIME_DIV=1 the real FCLK_CLK0 = IO PLL (1000 MHz) / divisor, where
+ * the divisor is chosen by PCW from build_zybo.tcl PL_FREQMHZ (ps7_init register
+ * 0xF8000170); e.g. PL_FREQMHZ=30 realizes 1000/33 = 30.303 MHz, =40 realizes
+ * 1000/25 = 40.0 MHz, =50 realizes 1000/20 = 50.0 MHz.
  *
- *   PL clock (FCLK_CLK0) = 25 MHz  (build_zybo.tcl PL_FREQMHZ=25)
- *   mtime tick rate      = PL/MTIME_DIV = 25 MHz/1 = 25 MHz  (rv_soc MTIME_DIV=1)
- *
- *   - timebase-frequency = 25000000  (was 1000000): Linux/OpenSBI convert mtime
- *       deltas to wall time with this; the sim used 1 MHz only because the boot
+ *   - timebase-frequency = the ACTUAL FCLK in Hz: Linux/OpenSBI convert mtime
+ *       deltas to wall time with it; the sim used 1 MHz only because the boot
  *       harness slows mtime via BOOT_MTIME_DIV=64.  Real HW has no such override,
- *       so mtime genuinely runs at 25 MHz and the DT must say so, or every delay
- *       / tick period is 25x off (and the HZ tick can re-enter the livelock the
- *       sim avoided with BOOT_MTIME_DIV).
- *   - serial clock-frequency = 25000000 (was 1843200): the 16550 bit period is
+ *       so mtime runs at the real FCLK and the DT must say so, or every delay /
+ *       tick period is off (and the HZ tick can re-enter the livelock the sim
+ *       avoided with BOOT_MTIME_DIV).
+ *   - serial clock-frequency = the ACTUAL FCLK in Hz: the 16550 bit period is
  *       divisor*16 PL clocks and the 8250 driver programs divisor =
- *       clock-frequency/(16*baud).  actual_baud = PL/(divisor*16) =
- *       25e6*baud/clock-frequency, so clock-frequency MUST equal the PL clock for
- *       the baud to come out right.
- *   - current-speed = 57600 (was 115200): 25 MHz does not divide 115200 cleanly
- *       (divisor 13.56 -> +/-4%, unreliable 8N1).  57600 -> divisor 27 ->
- *       25e6/(16*27)=57870 baud = +0.47% error, safely inside tolerance.
+ *       clock-frequency/(16*baud); actual_baud = FCLK/(divisor*16), so
+ *       clock-frequency MUST equal the real FCLK for the baud to come out right.
+ *   - current-speed = console baud (live values + baud error in the inline
+ *       comments on each property below).
+ *
+ * These three constants are rewritten by boards/zybo_z720/set_pl_freq.py <MHz> on
+ * a clock retarget -- do NOT hand-edit them out of sync with PL_FREQMHZ.
  *
  * Everything else (memory @ 0x200000 64 MiB == the sim BFM DEPTH, the 0xC0xx
  * peripheral nodes) is base/clock-independent and unchanged from rv_soc_lo.dts.
@@ -44,7 +46,7 @@
     cpus {
         #address-cells = <1>;
         #size-cells = <0>;
-        timebase-frequency = <25000000>;  /* mtime = PL/MTIME_DIV = 25 MHz/1 */
+        timebase-frequency = <30303030>;  /* mtime = PL/MTIME_DIV = 30.303 MHz/1 */
 
         cpu0: cpu@0 {
             device_type = "cpu";
@@ -96,8 +98,8 @@
             reg-io-width = <4>;
             interrupt-parent = <&plic0>;
             interrupts = <1>;
-            clock-frequency = <25000000>;  /* = PL clock; sets the 8250 divisor */
-            current-speed = <57600>;       /* 25e6/(16*27)=57870, +0.47% */
+            clock-frequency = <30303030>;  /* = PL clock; sets the 8250 divisor */
+            current-speed = <57600>;  /* 30.303e6/(16*33)=57392, -0.36% */
         };
 
         gpio@c0020000 {

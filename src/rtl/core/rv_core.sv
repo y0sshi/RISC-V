@@ -925,23 +925,16 @@ module rv_core
     // =========================================================================
     logic [XLEN-1:0] muldiv_result;
 
-    // Detect DIVIDE ops (DIV/DIVU/REM/REMU + W-types).  Multiply ops execute in
-    // one combinational cycle and must NOT stall.  Mirrors the FPU FDIV protocol:
-    //   muldiv_valid_in : a divide entering EX that may start (gated by busy/was).
+    // Both MULTIPLY and DIVIDE now stall (50MHz step 6: the single-cycle DSP
+    // multiply was the critical path, so MUL/MULH/MULW are pipelined behind input
+    // + output registers and run through the same busy handshake as the divider).
+    // Mirrors the FPU FDIV protocol:
+    //   muldiv_valid_in : an M-ext op entering EX that may start (gated by busy/was).
     //   muldiv_start_stall : holds IF/ID for the start cycle (busy is still low,
-    //     it goes high on the next edge) so the divide is not lost from ID/EX.
-    logic muldiv_is_divide;
-    always_comb begin
-        unique case (id_ex_ctrl.muldiv_op)
-            MDU_DIV, MDU_DIVU, MDU_REM, MDU_REMU,
-            MDU_DIVW, MDU_DIVUW, MDU_REMW, MDU_REMUW: muldiv_is_divide = 1'b1;
-            default:                                  muldiv_is_divide = 1'b0;
-        endcase
-    end
-
+    //     it goes high on the next edge) so the op is not lost from ID/EX.
+    // rv_muldiv routes valid_in to the divider FSM or the multiply counter by op.
     assign muldiv_valid_in    = id_ex_valid
                                 && id_ex_ctrl.is_muldiv
-                                && muldiv_is_divide
                                 && !muldiv_busy_int
                                 && !muldiv_was_busy
                                 && !muldiv_done;

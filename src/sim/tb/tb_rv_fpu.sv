@@ -688,6 +688,7 @@ module tb_rv_fpu;
         valid_in = 1'b1;
         @(posedge clk);
         valid_in = 1'b0;
+        wait_result(60);   // multi-cycle handshake (misc result is registered)
         if (result_f[31:0] === 32'h40400000 && fflags === 5'b00000) begin
             $display("  PASS: FCVT.S.W(3)=3.0 -> f=%h flags=%b", result_f[31:0], fflags);
             pass_cnt++;
