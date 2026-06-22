@@ -93,12 +93,26 @@ module rv_fpu
     // captured for the FMADD multiply.  Only the misc path changes; the add / mul
     // / fma / div / sqrt sub-units keep reading the live operands.
     // -------------------------------------------------------------------------
-    logic [63:0]     fa_q, fb_q;      // forwarded FP operands, registered (misc only)
-    logic [XLEN-1:0] int_a_q;         // forwarded integer operand, registered
+    // 50MHz step 7: the FP adders (u_add/u_add_d direct FADD, u_fma_add/_d FMADD
+    // tail) read their operands LIVE off the EX forward mux.  The post-step6
+    // critical path is exactly that:
+    //   ex_mem_rd_addr -> FP forward select (fwd_frs3_sel) -> fpld_data forward
+    //   -> adder operand -> classify/align/exponent-subtract -> mantissa-add
+    //   CARRY4 chain -> sum_q   (~21.4 ns @20ns probe, route ~70%).
+    // Register the adder operands the SAME way step 5 registered the misc operands
+    // (fa_q/fb_q already exist): make the direct adders read fa_q/fb_q (D) and
+    // fa_s_q/fb_s_q (S), and register fc (the rs3/FMADD addend) into fc_q/fc_s_q.
+    // This cuts the forward-mux+fpld routing OFF the front of the adder stage-0
+    // cloud.  LATENCY-NEUTRAL: FADD result now lands at T+2 (still captured at the
+    // T+3 busy-drop), and FMADD is gated by the registered product (mul_*_result_q,
+    // ready T+2) so the earlier-ready fc_q (T+1) adds no cycles -> COMB_LAT unchanged.
+    logic [63:0]     fa_q, fb_q, fc_q;  // forwarded FP operands, registered
+    logic [XLEN-1:0] int_a_q;           // forwarded integer operand, registered
 
-    logic [31:0] fa_s_q, fb_s_q;      // NaN-boxed S-view of the registered operands
+    logic [31:0] fa_s_q, fb_s_q, fc_s_q;  // NaN-boxed S-view of the registered operands
     assign fa_s_q = (fa_q[63:32] == 32'hFFFFFFFF) ? fa_q[31:0] : CANONICAL_NAN_S;
     assign fb_s_q = (fb_q[63:32] == 32'hFFFFFFFF) ? fb_q[31:0] : CANONICAL_NAN_S;
+    assign fc_s_q = (fc_q[63:32] == 32'hFFFFFFFF) ? fc_q[31:0] : CANONICAL_NAN_S;
 
     // Registered misc results (S and D), driven below from the combinational
     // u_misc / u_misc_d outputs; consumed by the output mux.
@@ -160,8 +174,8 @@ module rv_fpu
     rv_fpu_add u_add (
         .clk    (clk),
         .rst_n  (rst_n),
-        .a      (fa_s),
-        .b      (fb_s),
+        .a      (fa_s_q),   // step 7: registered operands (off the EX forward mux)
+        .b      (fb_s_q),
         .rm     (rm),
         .is_sub (add_is_sub),
         .result (add_result),
@@ -181,12 +195,12 @@ module rv_fpu
     // FMADD add reads the REGISTERED product (mul_result_q) so the multiply and
     // the add+round execute in separate pipeline stages (C-2c).
     always @(*) begin
-        case (fpu_op)
-            FPU_MADD:  begin fma_add_a = mul_result_q;                            fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
-            FPU_MSUB:  begin fma_add_a = mul_result_q;                            fma_add_b = fc_s; fma_add_is_sub = 1'b1; end
-            FPU_NMSUB: begin fma_add_a = {!mul_result_q[31], mul_result_q[30:0]}; fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
-            FPU_NMADD: begin fma_add_a = {!mul_result_q[31], mul_result_q[30:0]}; fma_add_b = fc_s; fma_add_is_sub = 1'b1; end
-            default:   begin fma_add_a = mul_result_q;                            fma_add_b = fc_s; fma_add_is_sub = 1'b0; end
+        case (fpu_op)  // step 7: fc_s_q = registered addend (off the EX forward mux)
+            FPU_MADD:  begin fma_add_a = mul_result_q;                            fma_add_b = fc_s_q; fma_add_is_sub = 1'b0; end
+            FPU_MSUB:  begin fma_add_a = mul_result_q;                            fma_add_b = fc_s_q; fma_add_is_sub = 1'b1; end
+            FPU_NMSUB: begin fma_add_a = {!mul_result_q[31], mul_result_q[30:0]}; fma_add_b = fc_s_q; fma_add_is_sub = 1'b0; end
+            FPU_NMADD: begin fma_add_a = {!mul_result_q[31], mul_result_q[30:0]}; fma_add_b = fc_s_q; fma_add_is_sub = 1'b1; end
+            default:   begin fma_add_a = mul_result_q;                            fma_add_b = fc_s_q; fma_add_is_sub = 1'b0; end
         endcase
     end
 
@@ -283,8 +297,8 @@ module rv_fpu
     rv_fpu_add_d u_add_d (
         .clk    (clk),
         .rst_n  (rst_n),
-        .a      (fa),
-        .b      (fb),
+        .a      (fa_q),   // step 7: registered operands (off the EX forward mux)
+        .b      (fb_q),
         .rm     (rm),
         .is_sub (add_d_is_sub),
         .result (add_d_result),
@@ -303,12 +317,12 @@ module rv_fpu
 
     // FMADD.D add reads the REGISTERED product (mul_d_result_q), see S-prec note.
     always @(*) begin
-        case (fpu_op)
-            FPU_MADD:  begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
-            FPU_MSUB:  begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end
-            FPU_NMSUB: begin fma_d_add_a = {!mul_d_result_q[63], mul_d_result_q[62:0]}; fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
-            FPU_NMADD: begin fma_d_add_a = {!mul_d_result_q[63], mul_d_result_q[62:0]}; fma_d_add_b = fc; fma_d_add_is_sub = 1'b1; end
-            default:   begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc; fma_d_add_is_sub = 1'b0; end
+        case (fpu_op)  // step 7: fc_q = registered addend (off the EX forward mux)
+            FPU_MADD:  begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc_q; fma_d_add_is_sub = 1'b0; end
+            FPU_MSUB:  begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc_q; fma_d_add_is_sub = 1'b1; end
+            FPU_NMSUB: begin fma_d_add_a = {!mul_d_result_q[63], mul_d_result_q[62:0]}; fma_d_add_b = fc_q; fma_d_add_is_sub = 1'b0; end
+            FPU_NMADD: begin fma_d_add_a = {!mul_d_result_q[63], mul_d_result_q[62:0]}; fma_d_add_b = fc_q; fma_d_add_is_sub = 1'b1; end
+            default:   begin fma_d_add_a = mul_d_result_q;                              fma_d_add_b = fc_q; fma_d_add_is_sub = 1'b0; end
         endcase
     end
 
@@ -416,6 +430,7 @@ module rv_fpu
             mul_d_fflags_q <= '0;
             fa_q           <= '0;
             fb_q           <= '0;
+            fc_q           <= '0;
             int_a_q        <= '0;
             misc_result_f_q   <= '0;
             misc_result_i_q   <= '0;
@@ -435,6 +450,7 @@ module rv_fpu
             // misc units.  Stable across the FP stall (ID/EX refresh in rv_core).
             fa_q    <= fa;
             fb_q    <= fb;
+            fc_q    <= fc;
             int_a_q <= int_a;
             // Free-running misc-result stage (stage B): the combinational misc
             // outputs computed from the registered operands above.

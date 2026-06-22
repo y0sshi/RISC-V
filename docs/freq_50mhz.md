@@ -1088,3 +1088,93 @@ hw_pc 連続性 (`h1_pc==h0_pc+2`) で結合 = アライナがハンドル (旧 
   周波数を met させる、(b) FPU `sum_q` 第1段の段化 (step5/6 同型・局所・低リスク) で FPU path を削り 50MHz へ。
   あるいはロードマップ③ (RootFS) へ移行。`build_physopt.tcl` で任意周波数を impl 実測可能 (probe; 真の build は
   build_zybo)。
+
+## 19. ✅ step 7 = FPU 加算器オペランドのレジスタ化 (第16セッション; `rv_fpu.sv` のみ・実装+検証完了)
+
+§18 が確定した 50MHz binding = FPU 加算器 (`u_add`/`u_fma_add_d` の `sum_q` 第1段) を、step5/6 と同型の
+**オペランド・レジスタ化**で除去した。
+
+### 19.1 変更 (rv_fpu.sv のみ、レイテンシ中立)
+4 加算器が EX forward mux から**生で**読んでいたオペランドを、レジスタ済みに差し替え:
+| 加算器 | 変更前 | 変更後 |
+|--------|--------|--------|
+| `u_add` (S FADD) | `fa_s`/`fb_s` | `fa_s_q`/`fb_s_q` (既存) |
+| `u_add_d` (D FADD) | `fa`/`fb` | `fa_q`/`fb_q` (既存) |
+| `u_fma_add` (S FMADD) | `fc_s` | `fc_s_q` (新規) |
+| `u_fma_add_d` (D FMADD) | `fc` | `fc_q` (新規) |
+`fc_q` を free-running 登録 (fa_q/fb_q と同所)、`fc_s_q` は NaN-box S-view。**COMB_LAT 不変・rv_core 無改変**。
+- レイテンシ中立の根拠: FADD はレジスタ操作で結果が T+1→**T+2** に遅れるが capture は T+3 (busy 立下り) のままで
+  間に合う。FMADD は積 (`mul_*_result_q`, T+2) が律速ゆえ、より早く揃う `fc_q` (T+1) は無影響。step5 (misc が
+  `fa_s_q` を読む) と完全同型。binding path 前半 (`ex_mem_rd_addr → fwd_frs3_sel → fpld_data → 加算器`) を
+  レジスタ境界で切る。
+
+### 19.2 検証 (全 PASS・非破壊)
+- ユニット: sim_fpu 94/94, sim_fpu_d 33/33, sim_fpu_pipe 7/7 (FMADD rs3 fwd・FP load-use stall 含む),
+  sim_pipeline 19/19, sim_intr 10/10。
+- compliance FP: RV64 23/23 (uf 11 + ud 12) + RV32 21/21 (uf 11 + ud 10) — fadd/fmadd/ldst/move/structural。
+- **full Linux NET=y**: `LINUX-USERSPACE-OK` + HARM=0 + amo_prem=0 + **chars=11428** (baseline 完全一致)。
+
+### 19.3 実 impl 効果 (20ns aggr probe; 再synth 後)
+| | step7 前 (aggr 20ns) | step7 後 (aggr 20ns) |
+|---|---|---|
+| post-route WNS | -1.374ns | **-0.454ns** (+0.92ns) |
+| post-route + phys_opt | (未到達) | **+0.021ns (MEET)** |
+| worst path | FPU FMA-D `u_fma_add_d/sum_q[56]` (21.38ns) | **I$ フェッチループ** `u_ic/addr_q→line BRAM` (19.845ns) |
+
+**FPU 加算器は top-10 worst から完全消失** (top-10 すべて I$ フェッチループへ移行)。
+- **50MHz default 本番ビルド (Performance なし)**: **WNS -2.458ns** (worst 21.4ns, 2091 failing, 同 I$ ループ)。
+  default strategy は net-delay aware place も post-route phys_opt も行わないため、この動作点で aggr との差が ~2ns。
+- **結論**: 50MHz の唯一の残 binding は **I$ フェッチループ**。aggr+physopt なら +0.021ns で MEET (margin 薄) /
+  Performance strategy で本番 50MHz は可能だが実機 margin 不安。default で 50MHz は I$ ループが壁 (~46MHz)。
+
+## 20. step 8 確定設計: FTQ 型 block fetch (第16セッション設計確定; 実装は専用セッション)
+
+§18 で棚上げした fetch ループが step7 後の**唯一の 50MHz binding** として復活。§17→§17.8 の経緯を踏まえ、
+**正しい解は案 (B) FTQ 型**であることを現行 RTL (step1-7) の信号レベルで再確認した。**実装は専用セッション** (ユーザ判断)。
+
+### 20.1 現行 fetch ループの実体 (step1-7 後、§17.1 と同型)
+`rv_core.sv` IF 段:
+```
+imem_addr = redir_pend_q ? tgt : (fetch_hold ? fetch_pc : seq_pc)   // 組合せ mux
+  seq_pc     = fetch_pc + (if_is_compressed ? 2 : 4)   // imem_rdata(命令長) 依存
+  fetch_hold = ~imem_ready | redirect_stall | fetch_full  // imem_ready 依存
+```
+= imem_addr が `~imem_ready` (mux select) と `imem_rdata` (seq_pc 命令長) の両方に組合せ依存。
+ループ: `I$ addr_q(reg) → hit → imem_ready/imem_rdata → rv_core seq_pc/fetch_hold → imem_addr → MMU →
+c_addr → addr_q(reg)`。decoupled FIFO (ff_*, step4) は**データ stall (dmem_wait) を fetch から分離済み**だが
+**fetch ループ自体は未分割**。
+
+### 20.2 §17.8 の throughput ジレンマ (再確認済み = 設計の核心)
+「imem_addr をレジスタ駆動 (bpc+4)」+「imem_ready で enable」は **half-throughput**:
+I$ は N 提示→N+1 配信の 1cyc 契約ゆえ、bpc が imem_ready (N+1 着) を待って前進すると次提示が N+2 にずれ、
+1命令/2cyc になる。full throughput には「現フェッチ完了を組合せで知り即次提示」= 切りたい imem_ready 組合せ前進が要る。
+→ 素朴な bpc レジスタ化は不可。bpc 投機前進 (毎cyc +4) は miss 時に未配信アドレスを飛ばす (roll-back 必要)。
+
+### 20.3 解 = FTQ 型 (案 B; imem_addr をレジスタ配列読みに)
+```
+gen_pc (word 整列 reg) : 毎サイクル +4 を生成し FTQ に push (imem_ready 非依存、FTQ-not-full で gate)
+FTQ (アドレス reg 列)  : 先行生成アドレスのキュー
+imem_addr = FTQ[head]  : レジスタ配列読み = ループ外 (imem_ready は head pop ポインタ更新のみ)
+  I$ hit (imem_ready)  → FTQ head pop (次の先行生成アドレスへ = 1/cyc throughput 維持)
+  I$ miss (~imem_ready)→ head 保持 = 同アドレス replay
+bpc(=FTQ head) → MMU → c_addr → addr_q : register-to-register (MMU がループから外れる)
+```
++ **halfword buffer**: 到着 word を 2 halfword 単位で push (各 hw_pc タグ付与)。
++ **アライナ**: buffer 先頭の組合せ抽出で命令境界 (2/4byte・ワード跨ぎ結合 = 旧 I$ straddle の役) → IF/ID 直接駆動。
+  decode 以降は無改変 (`decode_inst = is_compressed ? expand(...) : inst32`)。
++ **fault marker**: 投機 word の命令ページフォールトは marker を push、**head 到達 (コミット時) のみ** taken = precise。
++ **redirect**: 既存登録 redirect (redir_pend_q) 流用、適用時に FTQ + halfword buffer を flush、gen_pc=target&~3。
+- **I$ 無改変**: word 整列ゆえ straddle (boff==LINE_BYTES-2) は不発 = dead 化 (コードは変えない)。MMU/cpu/soc も
+  imem_addr=FTQ head が VA レジスタなら従来結線で register-to-register 化 (§14 の登録翻訳と同型だが VA が +4
+  データ非依存になった点が決定的; §16 VIPT は seq_pc データ依存で 0 利得だった)。
+
+### 20.4 リスク・検証 (専用セッション)
+- **規模**: rv_core IF 段全書換 (~200 行)。all-or-nothing (増分検証困難)。前例 = micro-ITLB は full Linux で
+  panic (§14 試行1)、§17 設計も実装直前に throughput 欠陥発覚 (§17.8)。
+- **利得不確実**: worst は **route 61-66% 支配** (device 混雑・LUT 62%、§16)。ループ2分割で各 cone が縮み route 減の
+  見込みはあるが、**§16 VIPT は 0 利得**の前科。**切っても 50MHz 未達の可能性が残る** (実 impl 実測のみが信号)。
+- **検証順** (§17.5 準拠): sim_icache(64)/sim_pipeline (アライナ基本) → sim_mmu/sv (priv/PTW) →
+  sim_cache_soc/intr/amo64 (統合・割込×fetch) → compliance rv64uc-p (RVC corner)/rv64si-p (ma_fetch) →
+  **full Linux NET=y** (`LINUX-USERSPACE-OK`+HARM=0+amo_prem=0+chars=11428+pc=0x1016a) → 実 impl 20ns probe で
+  I$ ループ消失 + 新 worst 確認 → set_pl_freq.py 50 + build_all bit で本番 WNS≥0。
+- **fallback**: full Linux で詰む / IPC 劣化大 / 利得不足なら revert (ツリー clean 起点)。worktree 推奨。
