@@ -1297,3 +1297,83 @@ LZC64+バレルシフト+丸め+組立 → 指数ビット `result_f[56]`) と F
 ### 22.4 コミット範囲 (第18セッション)
 `src/rtl/fpu/rv_fpu_misc_d.sv` (2 段化) + `src/rtl/fpu/rv_fpu.sv` (u_misc_d に clk/rst_n) のみ。board 設定 (50MHz)
 は §21 で適用済 (本コミットでは RTL のみ)。実機 bring-up は load→branch 経路 closure 後。
+
+## 23. ✅ step 10 = 整数 load->分岐インターロック (第19セッション; default 50MHz timing MET)
+
+### 23.1 課題 (§22 の積み残し = 非 FPU の load->branch->flush 経路)
+step9 (FPU misc-D 段化) 後、default 50MHz の binding は FPU を離れ、`build_physopt.tcl 20.0 def` で
+**WNS -0.203ns / 失敗 EP 4 (全て同一経路族)**:
+```
+D$ BRAM (gen_dcache.u_dc/data_reg) -> dc_c_rdata -> load 整形 (fpld_data_q/byte_offset/funct3 符号拡張)
+  -> MEM/WB forward (fwd_rs2_data) -> u_branch 比較 (CARRY4x4) -> branch_taken_ex
+  -> redir_eff/flush_ex -> id_ex_csr_addr_reg/CE
+```
+= 同期 BRAM ロード -> 整形 -> MEM/WB フォワード -> 分岐解決 -> flush -> ID/EX クロックイネーブル の単一サイクル
+経路。logic 30% / route 70%、19 levels。条件分岐の taken が同サイクルで redirect/flush を駆動し、それが ID/EX
+レジスタの CE をゲートするため、ロードの組合せ整形値が分岐比較に入ると long path になる。
+
+### 23.2 修正 = FP load (fpld) と同型の「登録済みオペランドで分岐」手法
+FP load は既にこの種の D$->データパス long path を **fpld レジスタ + rv_hazard の load-in-MEM 延長**で解決済み
+(値を 1 サイクル登録してから forward、消費側はそれまで stall)。整数分岐に同じ考えを適用:
+
+1. **`rv_hazard.sv` 整数 load->条件分岐インターロック** (新規 1 ルール): 整数 load/AMO が **MEM (ex_mem)** に
+   あり、ID の **条件分岐 (id_ctrl.branch)** がその rd を読むとき stall。既存の汎用 load-use (load-in-EX) と
+   合わせ、分岐が「ロードと同サイクル WB に整列して MEM/WB 組合せ forward を読む」位置に来るのを 1 サイクル遅らせ、
+   **ロードが retire してから分岐を EX に入れる** -> 分岐はロード値を **regfile write-bypass 経由で id_ex_rs*_data
+   に登録された形**で読む。FP load-in-MEM 延長の整数分岐版。strict refinement (stall を足すだけ、データパス不変)。
+   1-old 分岐: 既存(load-in-EX)+新規(load-in-MEM) = 2 stall。2-old 分岐: 新規 = 1 stall。3-old 以降: 変化なし。
+   JALR は対象外 (target は ALU 経由で登録済み redirect-target ラッチに落ち、taken はデータ非依存)。
+2. **`rv_core.sv` 分岐比較を登録済みオペランドから読む** (`br_rs1_data`/`br_rs2_data`): forward mux と同型だが
+   **MEM/WB tier がライブのロード整形値 (wb_data の WB_SRC_MEM) を絶対に流さない** (登録済み mem_wb_alu_result で
+   代替)。インターロックにより条件分岐は依存ロードが EX/MEM/WB に居る間は EX に入らないので、分岐の MEM/WB tier が
+   ロードを選ぶことは機能的に起こらない -> 代替は全到達ケースで `fwd_rs*_data` と同値、かつ **D$ 組合せ経路を分岐
+   比較から物理的に除去**。ALU/store/JALR-target は従来どおりライブ `fwd_rs*_data` を使う (分岐比較に限定)。
+   u_branch の rs1_data/rs2_data に `br_rs*_data` を結線 (比較=cond_met のみ。target は不変)。
+
+### 23.3 ⚠️ 重要な落とし穴 = probe (build_physopt) は実 default flow より楽観的 + wb_data リーク
+最初の試行は `wb_data_brn = (wb_src==WB_SRC_MEM) ? mem_wb_alu_result : wb_data` と書いた。これだと **`wb_data`
+(WB_SRC_MEM arm が組合せ `dmem_shifted`) への依存が残り**、合成器が wb_data ネットを共有して D$ 経路が分岐比較に
+**逆流**する。2 つの教訓:
+- **`build_physopt.tcl 20.0 def` probe は実 default flow (`launch_runs impl_1`) より ~0.27ns 楽観的**。probe は
+  +0.031ns (MET) を出したが、**実 impl_1 は WNS -0.241ns = NOT MET** (worst はまだ load→branch: routed report で
+  `dmem -> ... -> wb_data[34] -> br_rs2_data[34] -> u_branch -> branch_taken -> ... -> id_ex_*/CE`)。probe は phys_opt
+  でこのリークを最適化してしまい隠れた。**→ 以後 default 50MHz の合否は probe でなく実 impl_1 routed WNS で判定する。**
+- **修正**: `wb_data_brn` を `wb_data` 経由でなく**登録済み WB ソース (mem_wb_alu_result / mem_wb_pc4 /
+  mem_wb_csr_rdata / mem_wb_fpu_result_i) から直接再構成**し、WB_SRC_MEM (load) ケースを default=mem_wb_alu_result
+  に潰す (インターロックにより分岐が選ぶことはない)。これで合成器に dmem→分岐の物理経路が一切無くなる。
+  (`mem_wb_csr_rdata`/`mem_wb_fpu_result_i` の宣言を forward-decl ブロックへ前方移動 = iverilog の宣言順要件。)
+
+### 23.4 検証 (全 PASS・非破壊)
+- ユニット: sim_pipeline 19/intr 10/dcache64 54/dcache 64/amo64 38/amo 29/mmu64 11/mext64 40/soc 3 +
+  FP (fpu 94/fpu_d 33/fpu_pipe 7) すべて PASS。 (sim_cache_soc(64) の 2 fail はクリーンツリーでも同一に発生する
+  既存ハーネス問題で本変更とは無関係 = 前後でカウンタ完全一致。sim_core TIMEOUT も既定プログラムのループで既存挙動。)
+- compliance: **RV64 117/117・RV32 88/88 PASS**。
+- **full Linux NET=y (必須ゲート)**: 修正前の wb_data 版で `LINUX-USERSPACE-OK: init running`・chars=11428
+  (baseline ビット一致)・HARM=0・AMO premature-write=0 を確認済。修正後 (wb_data_brn 再構成版) も
+  **`make boot-linux` で 455M〜456M cyc に LINUX-USERSPACE-OK 到達 (ユーザー確認)**。wb_data_brn は到達ケースで
+  fwd_rs*_data と同値ゆえ挙動不変。
+
+### 23.5 実 impl 効果 (本番 default flow = `build_zybo.tcl impl` の routed setup WNS; 真の合否基準)
+| | step9 | step10 (wb_data リーク版) | step10 (wb_data_brn 修正版) |
+|---|---|---|---|
+| 実 impl_1 routed WNS | (未測) | **-0.241ns (NOT MET)** | **+0.042ns (MET)** |
+| 失敗 EP | — | 多数 (全て load→branch→id_ex CE 族) | **0** |
+| worst binding | — | load→branch→flush (wb_data リーク) | **FPU FMA-D (mul_d_result_q -> u_fma_add_d/sum_q)** |
+
+- **本番 default strategy が 50MHz で timing MET (WNS +0.042ns, 0 failing endpoints, TNS 0)** を達成。
+  load→branch 経路は worst から完全消失し、新 worst は FPU FMA-D の reg→reg 単一サイクル経路 (FP-only、
+  カーネル非使用ゆえ余裕)。margin は薄い (Vivado は met で停止) が 0 failing EP の正真正銘の MET。
+- ⚠️ 教訓: build_physopt probe は **方向性の確認用**に留め、closure 判定は必ず `build_zybo.tcl impl` (= launch_runs
+  impl_1) の routed WNS で行う。
+
+### 23.6 コミット範囲 (第19セッション)
+- RTL: `src/rtl/core/rv_hazard.sv` (整数 load->条件分岐インターロック) + `src/rtl/core/rv_core.sv`
+  (br_rs*_data を登録済み WB ソースから再構成 + u_branch 結線 + mem_wb_csr_rdata/fpu_result_i の前方宣言)。
+- ビルドフロー (ユーザー要望でステージ役割分離): `boards/zybo_z720/vivado/build_zybo.tcl` を
+  **project / synth / impl / bit / all** に分割。**`create_project -force` を廃止**し project 作成を独立ステージ化
+  (冪等: あれば再利用)、synth/impl/bit は既存プロジェクトを open して再開。各 run は reset-if-stale
+  (complete だが out-of-date なら reset、current なら skip)。impl は route_design まで (WNS を
+  `boards/reports/build_zybo_impl_timing.rpt` に出力)、bit は write_bitstream + XSA。`build_all.py` の `--stage` を
+  `{all,fpga,synth,impl,bit,xsa,fsbl,bootbin}` に拡張 (fpga=build_zybo all、synth/impl/bit を 1:1)。
+  途中再開例: `--stage impl bit` / `--stage bit`。(暫定の `impl_only.tcl` は本分割で不要となり削除。)
+- board 設定 (50MHz) は §21 で適用済。実機 bring-up は ps7_init/firmware を 50MHz 用に再生成後 (ユーザー)。

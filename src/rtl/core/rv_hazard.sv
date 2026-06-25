@@ -100,6 +100,34 @@ module rv_hazard
             if (id_fp_reads_rs3 && (ex_mem_rd_addr == id_rs3_addr))
                 load_use_hazard = 1'b1;
         end
+
+        // ---- Integer load -> conditional-branch interlock (50 MHz timing) ----
+        // A conditional branch resolves taken/not-taken in EX, and branch_taken
+        // drives the redirect/flush that gates the ID/EX clock-enable IN THE SAME
+        // CYCLE.  If the branch compares a value forwarded combinationally from a
+        // load still in MEM/WB (the live D$-read shaped data), the path
+        //   D$ BRAM -> load shape -> MEM/WB forward -> branch compare -> flush ->
+        //   ID/EX CE
+        // is the 50 MHz binding path (docs/freq_50mhz.md sec 22).  The generic
+        // integer load-use rule above already holds the branch one cycle while the
+        // load is in EX (so the branch would otherwise reach EX aligned with the
+        // load's WB and read the MEM/WB combinational forward).  Add a second hold
+        // while the load is in MEM so the branch reaches EX only AFTER the load has
+        // retired and its value is captured into id_ex_rs*_data via the regfile
+        // write bypass -- the branch then compares a REGISTERED operand (rv_core
+        // feeds the branch from br_rs*_data, whose MEM/WB tier never sources the
+        // live load-shaped data).  This is the integer-branch analog of the FP
+        // load-in-MEM extension above.  Strict refinement: only adds stalls; data
+        // paths are unchanged.  Limited to conditional branches (id_ctrl.branch):
+        // JALR resolves its target via the ALU (a path that ends at the registered
+        // redirect-target latch, not the flush CE) and its taken is data-independent.
+        if (ex_mem_valid && (ex_mem_ctrl.mem_read || ex_mem_ctrl.is_amo)
+                         && (ex_mem_rd_addr != '0) && id_ctrl.branch) begin
+            if (id_rs1_used && (ex_mem_rd_addr == id_rs1_addr))
+                load_use_hazard = 1'b1;
+            if (id_rs2_used && (ex_mem_rd_addr == id_rs2_addr))
+                load_use_hazard = 1'b1;
+        end
     end
 
 endmodule

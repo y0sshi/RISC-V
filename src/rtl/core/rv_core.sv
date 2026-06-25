@@ -902,6 +902,11 @@ module rv_core
     reg_addr_t       mem_wb_rd_addr;
     logic [XLEN-1:0] mem_wb_pc4;
     logic            mem_wb_valid;
+    // Forward-declared here (their MEM/WB-register section is further down) so the
+    // branch operand mux (br_rs*_data, below) can read them: iverilog requires
+    // declaration before use, unlike the wb_data forward references.
+    logic [XLEN-1:0] mem_wb_csr_rdata;
+    logic [XLEN-1:0] mem_wb_fpu_result_i;
 
     // --- Data to forward from EX/MEM ---
     // For loads in EX/MEM: alu_result is the load address, NOT the data.
@@ -958,6 +963,62 @@ module rv_core
             2'b01:   fwd_rs2_data = ex_mem_fwd_data;   // EX/MEM forward
             2'b10:   fwd_rs2_data = wb_data;            // MEM/WB forward
             default: fwd_rs2_data = id_ex_rs2_data;     // register file
+        endcase
+    end
+
+    // --- Conditional-branch comparison operands (registered-only forward) ---
+    // 50 MHz step 10 (docs/freq_50mhz.md sec 22/23): a conditional branch's
+    // taken/not-taken (branch_taken_ex) drives the redirect/flush that gates the
+    // ID/EX clock-enable in the SAME cycle.  Feeding the comparison a value
+    // forwarded combinationally from an in-flight load (the live D$-read shaped
+    // data on the MEM/WB path, wb_data for WB_SRC_MEM) is the binding path:
+    //   D$ BRAM -> load shape -> MEM/WB forward -> branch compare -> flush ->
+    //   ID/EX CE.
+    // The rv_hazard integer load->branch interlock guarantees a conditional
+    // branch is NEVER in EX while a load it depends on is still in EX/MEM/WB: it
+    // is stalled until the load retires and its value is captured into
+    // id_ex_rs*_data via the regfile write bypass.  So the branch's MEM/WB
+    // forward tier can never legitimately source the live load-shaped data;
+    // substitute the REGISTERED mem_wb_alu_result for the WB_SRC_MEM (load) case
+    // to physically remove that combinational D$ route from the comparison.  For
+    // every functionally-reachable branch case br_rs*_data == fwd_rs*_data (the
+    // EX/MEM tier ex_mem_fwd_data is already a pure register mux, and the MEM/WB
+    // tier differs only for the load case, which a branch can never select).  The
+    // ALU / store / JALR-target datapaths still use the live fwd_rs*_data, so this
+    // is confined to the branch comparison.
+    //
+    // wb_data_brn is the MEM/WB forward value for the branch, REBUILT from the
+    // registered writeback sources ONLY -- it must NOT reference `wb_data`, whose
+    // WB_SRC_MEM arm is the combinational dmem_shifted: referencing wb_data lets
+    // synthesis share that net and the live D$ route leaks back into the branch
+    // comparison (observed in routed timing: dmem -> ... -> wb_data -> br_rs2_data
+    // -> u_branch).  The WB_SRC_MEM (load) case maps to the default
+    // (mem_wb_alu_result, a register) and is never selected for a branch (the
+    // rv_hazard interlock guarantees it), so this is functionally identical while
+    // physically removing every dmem path from the branch.
+    logic [XLEN-1:0] wb_data_brn;
+    always_comb begin
+        case (mem_wb_ctrl.wb_src)
+            WB_SRC_PC4: wb_data_brn = mem_wb_pc4;
+            WB_SRC_CSR: wb_data_brn = mem_wb_csr_rdata;
+            WB_SRC_FPU: wb_data_brn = mem_wb_fpu_result_i;
+            default:    wb_data_brn = mem_wb_alu_result;  // WB_SRC_ALU + WB_SRC_MEM(never selected)
+        endcase
+    end
+
+    logic [XLEN-1:0] br_rs1_data, br_rs2_data;
+    always_comb begin
+        unique case (fwd_rs1_sel)
+            2'b01:   br_rs1_data = ex_mem_fwd_data;
+            2'b10:   br_rs1_data = wb_data_brn;
+            default: br_rs1_data = id_ex_rs1_data;
+        endcase
+    end
+    always_comb begin
+        unique case (fwd_rs2_sel)
+            2'b01:   br_rs2_data = ex_mem_fwd_data;
+            2'b10:   br_rs2_data = wb_data_brn;
+            default: br_rs2_data = id_ex_rs2_data;
         endcase
     end
 
@@ -1653,8 +1714,12 @@ module rv_core
     rv_branch #(.XLEN(XLEN)) u_branch (
         .ctrl          (id_ex_ctrl),
         .funct3        (id_ex_funct3),
-        .rs1_data      (fwd_rs1_data),
-        .rs2_data      (fwd_rs2_data),
+        // Branch comparison reads REGISTERED-only forwarded operands (see
+        // br_rs*_data above): removes the combinational D$-load route from the
+        // branch_taken -> flush path (50 MHz binding).  The JALR target still
+        // uses the live alu_result (computed from fwd_rs*_data) -- unaffected.
+        .rs1_data      (br_rs1_data),
+        .rs2_data      (br_rs2_data),
         .pc            (id_ex_pc),
         .imm           (id_ex_imm),
         .alu_result    (ex_alu_result),
@@ -1818,11 +1883,11 @@ module rv_core
     // =========================================================================
     // MEM/WB Pipeline Register  (between MEM and WB)
     // =========================================================================
-    logic [XLEN-1:0] mem_wb_csr_rdata;
+    // mem_wb_csr_rdata declared earlier (forward-decl for the branch operand mux)
     logic [2:0]      mem_wb_funct3;
     logic [BYTE_LANE_W-1:0] mem_wb_byte_offset;  // addr[BYTE_LANE_W-1:0] — byte lane selector for sub-word loads
     // mem_wb_fpu_result_f declared earlier (forward-decl for FP forwarding mux, 64-bit)
-    logic [XLEN-1:0] mem_wb_fpu_result_i;
+    // mem_wb_fpu_result_i declared earlier (forward-decl for the branch operand mux)
     // mem_wb_fresh: 1 only on the cycle MEM/WB just advanced (the WB instruction's
     // FIRST cycle in WB).  A load's dmem_rdata is valid on this cycle; on later
     // (held) cycles the live dmem_rdata reflects a YOUNGER load re-issuing from MEM
