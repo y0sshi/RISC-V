@@ -3,17 +3,27 @@
 # build_all.py - Cross-platform one-shot FPGA build orchestrator for the Zybo
 #                Z7-20 RISC-V SoC.  Runs the Vivado + Vitis flow end to end:
 #
-#   bit     -> Vivado build_zybo.tcl : synth + impl + bitstream (+ XSA)   [~30-40 min]
-#   xsa     -> Vivado export_xsa.tcl : emit XSA from an existing impl     [~10 s]
-#   fsbl    -> Vitis  fsbl.py        : standalone platform + boot FSBL    [~3-5 min]
+#   fpga    -> Vivado build_zybo.tcl all : synth + impl + bitstream (+ XSA) [~30-40 min]
+#   synth   -> Vivado build_zybo.tcl synth: synthesize only                [~5-6 min]
+#   impl    -> Vivado build_zybo.tcl impl : place + route, REUSE synth_1   [~20-30 min]
+#   bit     -> Vivado build_zybo.tcl bit  : write_bitstream + XSA, REUSE impl_1 [~5 min]
+#   xsa     -> Vivado export_xsa.tcl : emit XSA from an existing impl      [~10 s]
+#   fsbl    -> Vitis  fsbl.py        : standalone platform + boot FSBL     [~3-5 min]
 #   bootbin -> make_bootbin.py       : FSBL + bitstream + firmware -> BOOT.bin
+#
+# The FPGA build is role-separated into synth/impl/bit so a run can RESUME from an
+# intermediate point (e.g. after tweaking a placement/route knob, re-run only
+# `--stage bit`; after an RTL change that re-synthesizes, `--stage impl bit`).
 # =============================================================================
 # Works on Windows AND Linux: it drives the tools via subprocess (no Git-Bash/MSYS
 # path translation, which is what crashes Vivado synth -- so this replaces the old
 # PowerShell-only entry point).  Standard library only -- no venv / pip install.
 #
 # Usage (from anywhere; paths are derived from this script's location):
-#   python boards/zybo_z720/build_all.py                          # all: bit -> fsbl -> bootbin
+#   python boards/zybo_z720/build_all.py                          # all: fpga -> fsbl -> bootbin
+#   python boards/zybo_z720/build_all.py --stage synth            # synthesize only
+#   python boards/zybo_z720/build_all.py --stage impl bit         # resume: place/route then bitstream
+#   python boards/zybo_z720/build_all.py --stage bit              # resume: bitstream only (reuse impl)
 #   python boards/zybo_z720/build_all.py --stage xsa fsbl bootbin # reuse the existing impl
 #   python boards/zybo_z720/build_all.py --stage bootbin --firmware <fw.bin>
 #
@@ -83,7 +93,7 @@ def run_stage(name, argv, log):
 def main():
     ap = argparse.ArgumentParser(description="One-shot FPGA build for the Zybo Z7-20 RISC-V SoC.")
     ap.add_argument("--stage", nargs="+", default=["all"],
-                    choices=["all", "bit", "xsa", "fsbl", "bootbin"])
+                    choices=["all", "fpga", "synth", "impl", "bit", "xsa", "fsbl", "bootbin"])
     ap.add_argument("--firmware", help="firmware .bin for the bootbin stage (default: real-HW OpenSBI)")
     ap.add_argument("--vivado", help="path to vivado(.bat); else env/PATH")
     ap.add_argument("--vitis", help="path to vitis(.bat); else env/PATH")
@@ -97,20 +107,24 @@ def main():
                  "processes fail there (\"couldn't read file ... : No error\").  Run this from\n"
                  "PowerShell or cmd instead." % os.environ["MSYSTEM"])
 
-    stages = ["bit", "fsbl", "bootbin"] if "all" in args.stage else list(args.stage)
+    stages = ["fpga", "fsbl", "bootbin"] if "all" in args.stage else list(args.stage)
     firmware = args.firmware or str(REPO / "tests/opensbi/work/fw_payload_hw.bin")
 
+    # Vivado stages map 1:1 onto build_zybo.tcl's stage argument (fpga -> "all").
+    vivado_stages = {"fpga": "all", "synth": "synth", "impl": "impl", "bit": "bit"}
+
     vivado = vitis = None
-    if any(s in stages for s in ("bit", "xsa")):
+    if any(s in stages for s in tuple(vivado_stages) + ("xsa",)):
         vivado = resolve_tool(args.vivado, ["VIVADO_BIN", "XILINX_VIVADO"], "vivado")
     if "fsbl" in stages:
         vitis = resolve_tool(args.vitis, ["VITIS_BIN", "XILINX_VITIS"], "vitis")
 
     for s in stages:
-        if s == "bit":
-            run_stage("bit", [vivado, "-mode", "batch",
-                              "-source", str(BDIR / "build_zybo.tcl"), "-tclargs", "bit"],
-                      BDIR / "build_zybo.log")
+        if s in vivado_stages:
+            run_stage(s, [vivado, "-mode", "batch",
+                          "-source", str(BDIR / "build_zybo.tcl"),
+                          "-tclargs", vivado_stages[s]],
+                      BDIR / ("build_zybo_%s.log" % s))
         elif s == "xsa":
             run_stage("xsa", [vivado, "-mode", "batch", "-source", str(BDIR / "export_xsa.tcl")],
                       BDIR / "export_xsa.log")

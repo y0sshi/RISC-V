@@ -25,6 +25,7 @@ set repo       [file normalize "$script_dir/../../.."]
 set rtl        "$repo/src/rtl"
 set proj_name  "rv_riscv_zybo"
 set proj_dir   "$script_dir/$proj_name"
+set bd_name    "bd_riscv"   ;# also (re)set in the create branch; needed early for reuse stages
 
 # Zybo Z7-20: Zynq-7000 XC7Z020-1CLG400C
 set PART  "xc7z020clg400-1"
@@ -43,7 +44,36 @@ set XLEN64 1           ;# 1 = RV64 (target for Linux); HP ports are 64-bit.
 # realized FCLK, not the request.
 set PL_FREQMHZ 50
 
-create_project $proj_name $proj_dir -part $PART -force
+# ---------------------------------------------------------------------------
+# Stage dispatch.  Project creation is its OWN stage; synth/impl/bit only OPEN
+# the project already on disk, so no stage ever recreates it and there is no
+# `create_project -force` (no stage silently destroys synth/impl results).  A
+# build can resume from any point:
+#   project : create project + block design + sources (idempotent: reuse if present)
+#   synth   : open project -> synthesize                -> synth_1
+#   impl    : open project -> place + route (REUSE synth_1) -> routed impl_1
+#   bit     : open project -> write_bitstream + XSA     (REUSE routed impl_1)
+#   all     : project + synth + impl + bit
+# `bd` is accepted as an alias for `project`.  build_all.py maps its
+# --stage {synth,impl,bit} 1:1 onto these (fpga -> all).
+# ---------------------------------------------------------------------------
+if {$build_to eq "bd"} { set build_to "project" }
+if {$build_to ni {project synth impl bit all}} {
+    error "unknown stage '$build_to' (use: project | synth | impl | bit | all)"
+}
+set proj_xpr   "$proj_dir/$proj_name.xpr"
+set do_project [expr {$build_to in {project all}}]
+set do_synth   [expr {$build_to in {synth all}}]
+set do_impl    [expr {$build_to in {impl all}}]
+set do_bit     [expr {$build_to in {bit all}}]
+
+# ---- PROJECT: create (no -force) or reuse an existing project --------------
+if {$do_project} {
+if {[file exists $proj_xpr]} {
+    puts "INFO: reusing existing project $proj_xpr (delete $proj_dir to rebuild the BD/source list)."
+    open_project $proj_xpr
+} else {
+create_project $proj_name $proj_dir -part $PART
 set_property target_language Verilog [current_project]
 
 # ---- Digilent Zybo Z7-20 board part (vendored; no Vivado-install pollution) ----
@@ -194,11 +224,6 @@ regenerate_bd_layout
 validate_bd_design
 save_bd_design
 
-if {$build_to eq "bd"} {
-    puts "INFO: Block design created. Stop (build_to=bd)."
-    return
-}
-
 set bd_file [get_files "$bd_name.bd"]
 
 # Synthesize the BD in GLOBAL (flat) mode rather than per-IP out-of-context.
@@ -215,22 +240,83 @@ set wrapper "$proj_dir/$proj_name.gen/sources_1/bd/$bd_name/hdl/${bd_name}_wrapp
 add_files -norecurse $wrapper
 set_property top ${bd_name}_wrapper [current_fileset]
 update_compile_order -fileset sources_1
-
-if {$build_to eq "synth"} {
-    launch_runs synth_1 -jobs 4
-    wait_on_run synth_1
-    puts "INFO: Synthesis done."
+}  ;# end create-new-project (else branch of file-exists)
+if {$build_to eq "project"} {
+    puts "INFO: project ready ($proj_xpr)."
     return
 }
+}  ;# end do_project
 
-launch_runs impl_1 -to_step write_bitstream -jobs 4
-wait_on_run impl_1
-puts "INFO: Bitstream generation done."
+# Stages that did NOT run the project step open the existing project now.
+if {!$do_project} {
+    if {![file exists $proj_xpr]} {
+        error "project not found: $proj_xpr  (run the 'project' stage first)"
+    }
+    open_project $proj_xpr
+}
 
-# ---- Export a fixed HW platform (.xsa) for Vitis (FSBL/BOOT.bin/JTAG) ----
-# Bundles ps7_init (PS DDR/MIO/clock bring-up) + the implemented bitstream.  This
-# is the hand-off Vitis consumes (prep-C/D).  To (re-)emit the XSA from an existing
-# build without re-running impl, use export_xsa.tcl instead.
-open_run impl_1
-write_hw_platform -fixed -include_bit -force "$proj_dir/$proj_name.xsa"
-puts "INFO: Wrote HW platform $proj_dir/$proj_name.xsa"
+# ---- SYNTH: synthesize (synth / all) ---------------------------------------
+# A completed run cannot be re-launched without reset_run (Vivado errors "needs to
+# be reset"), so: reuse synth_1 only if it is complete AND current (NEEDS_REFRESH
+# 0); otherwise reset (when an out-of-date result exists) and synthesize.  This
+# makes RTL edits get picked up while an unchanged project resumes instantly.
+if {$do_synth} {
+    if {[get_property PROGRESS [get_runs synth_1]] eq "100%"
+        && ![get_property NEEDS_REFRESH [get_runs synth_1]]} {
+        puts "INFO: synth_1 already complete and current; reused."
+    } else {
+        catch {reset_run synth_1}
+        launch_runs synth_1 -jobs 4
+        wait_on_run synth_1
+        puts "INFO: Synthesis done."
+    }
+    if {$build_to eq "synth"} { return }
+}
+
+# ---- IMPL: place + route, REUSING synth_1 (stops BEFORE bitstream) ----------
+# launch_runs ... -to_step route_design runs opt/place/route only; write_bitstream
+# is deferred to the 'bit' stage so the two roles are separable / resumable.  Reuse
+# a routed impl_1 only if current; else reset (when stale) and re-route.
+if {$do_impl} {
+    if {[get_property PROGRESS [get_runs synth_1]] ne "100%"
+        || [get_property NEEDS_REFRESH [get_runs synth_1]]} {
+        error "synth_1 is not complete/current; run the 'synth' stage first"
+    }
+    if {[get_property PROGRESS [get_runs impl_1]] eq "100%"
+        && ![get_property NEEDS_REFRESH [get_runs impl_1]]} {
+        puts "INFO: impl_1 already routed and current; reused."
+    } else {
+        catch {reset_run impl_1}
+        launch_runs impl_1 -to_step route_design -jobs 4
+        wait_on_run impl_1
+        puts "INFO: Implementation (place+route) done."
+    }
+    open_run impl_1
+    set wns [get_property SLACK [get_timing_paths -delay_type max -nworst 1 -max_paths 1]]
+    puts "==== IMPL routed setup WNS = $wns ns ===="
+    report_timing_summary -delay_type max -max_paths 1 \
+        -file "$script_dir/../../../boards/reports/build_zybo_impl_timing.rpt"
+    close_design  ;# release the in-memory design so the 'bit' step can relaunch the run
+    if {$build_to eq "impl"} { return }
+}
+
+# ---- BIT: write_bitstream from the routed impl_1, then export the XSA --------
+# Advances the routed impl_1 to write_bitstream (no reset needed: a later step is
+# allowed without reset; reset only when impl_1 is stale).  The XSA bundles
+# ps7_init (PS DDR/MIO/clock bring-up) + the implemented bitstream and is the
+# hand-off Vitis consumes (FSBL/BOOT.bin/JTAG).  To (re-)emit only the XSA from an
+# existing build, use export_xsa.tcl instead.
+if {$do_bit} {
+    set bitfiles [glob -nocomplain "$proj_dir/$proj_name.runs/impl_1/*.bit"]
+    if {[llength $bitfiles] > 0 && ![get_property NEEDS_REFRESH [get_runs impl_1]]} {
+        puts "INFO: bitstream already present and current; reused."
+    } else {
+        if {[get_property NEEDS_REFRESH [get_runs impl_1]]} { catch {reset_run impl_1} }
+        launch_runs impl_1 -to_step write_bitstream -jobs 4
+        wait_on_run impl_1
+        puts "INFO: Bitstream generation done."
+    }
+    open_run impl_1
+    write_hw_platform -fixed -include_bit -force "$proj_dir/$proj_name.xsa"
+    puts "INFO: Wrote HW platform $proj_dir/$proj_name.xsa"
+}
