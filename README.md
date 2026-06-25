@@ -65,7 +65,7 @@ tests/
 └── linux/              # build.sh: minimal RV64 Linux Image -> fw_payload
 
 boards/
-├── zybo_z720/          # Zybo Z7-20: top, XDC, vivado/ BD, vitis/ (FSBL, JTAG bring-up), build_all.ps1
+├── zybo_z720/          # Zybo Z7-20: top, XDC, vivado/ BD, vitis/ (FSBL, JTAG bring-up), build_all.py
 └── kv260/              # KV260: top, XDC, vivado/ BD
 
 archive/                # retired, out-of-build code (legacy RV32I project)
@@ -80,7 +80,7 @@ Commands are split into **two entry points** (a hard constraint: Vivado/Vitis mu
 PowerShell, everything else is bash/docker):
 
 - **Top-level `Makefile`** (bash/docker) — firmware, sim boots, tests, dependencies. Run `make help`.
-- **PowerShell** — FPGA bitstream and on-board bring-up (`boards/zybo_z720/build_all.ps1`).
+- **PowerShell** — FPGA bitstream and on-board bring-up (`python boards/zybo_z720/build_all.py`).
 
 ### Entry points — top-level `make` (run from repo root)
 
@@ -145,10 +145,10 @@ python boards/zybo_z720/build_all.py               # all: bit -> FSBL -> BOOT.bi
 python boards/zybo_z720/build_all.py --stage xsa fsbl bootbin   # reuse the existing impl
 ```
 ```powershell
-# Windows / PowerShell ($env: instead of export; build_all.ps1 is a thin shim that forwards here):
+# Windows / PowerShell ($env: instead of export):
 $env:XILINX_VIVADO = "C:\Xilinx\Vivado\2024.2"
 $env:XILINX_VITIS  = "C:\Xilinx\Vitis\2024.2"
-python boards\zybo_z720\build_all.py        # or the shim:  .\boards\zybo_z720\build_all.ps1
+python boards\zybo_z720\build_all.py        # retarget clock first: python boards\zybo_z720\set_pl_freq.py 50
 ```
 
 Then bring up on the board over JTAG (loads firmware to PS-DDR, configures the PL, prints to

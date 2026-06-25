@@ -105,6 +105,14 @@ module rv_icache #(
     // ---- Registered fetch address (1-cycle, BRAM-equivalent) ----------------
     logic [XLEN-1:0] addr_q;
     logic            req_q;
+    // fill_unserved: 1 = a line fill for the held addr_q has COMPLETED but addr_q
+    // has not been served yet (c_ready never fired for it).  This happens when the
+    // MMU withdraws c_req (an IF-TLB miss / PTW for the NEXT, FTQ-pre-generated
+    // address) WHILE this line is being filled: req_q drops, so the post-fill
+    // S_LOOKUP cannot serve.  It must NOT let the resume-prime advance addr_q to
+    // the next address (that would SKIP this completed-but-unserved fetch), so it
+    // gates the resume-prime term below.  Cleared the moment addr_q is served.
+    logic            fill_unserved;
 
     wire [OFFW-1:0]  boff = addr_q[OFFW-1:0];
     wire [IDXW-1:0]  idx  = addr_q[OFFW +: IDXW];
@@ -141,12 +149,28 @@ module rv_icache #(
     logic [XLEN-1:0] fill_base;
 
     // ---- Fetch-address register enable --------------------------------------
-    // addr_q advances when this fetch completes (c_ready), when a request is
-    // (re)presented after an idle gap (resume priming), or when a fill completes
-    // with a request still presented (mid-flight translation re-arm).
+    // addr_q advances when this fetch completes (c_ready) or when a request is
+    // (re)presented after an idle gap (resume priming).
+    //
+    // 50 MHz step 8 (FTQ/block fetch): the old EXTRA-2 term
+    // (state==S_FILL && m_done && c_req) re-armed addr_q from the core's LIVE
+    // c_addr at fill completion.  That required the core to re-present the MISSED
+    // address for the whole fill (imem_addr = ~imem_ready ? fetch_pc : seq_pc),
+    // which is exactly the combinational ~imem_ready dependence that put the I$
+    // fetch loop (addr_q -> hit -> imem_ready -> core fetch addr -> MMU -> addr_q)
+    // on the binding 50 MHz path.  Removing the term makes the I$ HOLD its own
+    // addr_q (= the missed physical address, latched when the miss was accepted)
+    // across the fill, so S_FILL2 re-reads line[idx(addr_q)] and S_LOOKUP re-looks
+    // up the SAME missed address -> hit.  The core no longer needs to re-present
+    // the missed address: imem_addr becomes a pure register (the block fetch
+    // pres/bfpc engine), breaking the loop.  The MRET/SRET mid-fill re-translation
+    // case the EXTRA-2 term used to cover is now handled by the registered redirect
+    // re-presenting the target after the privilege/SATP change settles (the fill of
+    // the stale-translation line completes but its line is re-looked-up under the
+    // new PA after the redirect: tag mismatch -> proper refill).  Validated by full
+    // Linux NET=y boot (the same MRET-return path that used to need EXTRA-2).
     wire addr_q_en = c_ready
-                   || (state == S_LOOKUP && c_req && !req_q)
-                   || (state == S_FILL && m_done && c_req);
+                   || (state == S_LOOKUP && c_req && !req_q && !fill_unserved);
 
     // ---- BRAM read port (registered output = line_q) ------------------------
     // Hit path: clocked with addr_q_en reading set(c_addr) -- the line being
@@ -221,7 +245,13 @@ module rv_icache #(
             miss_cnt <= '0;
             fill_idx <= '0; fill_tag <= '0; fill_base <= '0;
             valid <= '0;
+            fill_unserved <= 1'b0;
         end else begin
+            // Track a completed-but-unserved fill so the resume-prime cannot skip
+            // it (see addr_q_en / fill_unserved comments).  Set when a fill
+            // finishes (S_FILL m_done), cleared the cycle addr_q is served.
+            if (c_ready)                       fill_unserved <= 1'b0;
+            else if (state == S_FILL && m_done) fill_unserved <= 1'b1;
             // Track the fetch address with the SAME enable the core uses for
             // fetch_pc (advance only when this fetch completes, c_ready).  This
             // keeps addr_q == fetch_pc even when imem_addr transiently changes
@@ -240,21 +270,14 @@ module rv_icache #(
             // during a fill (state!=S_LOOKUP), so the redirect protection
             // above is preserved.
             //
-            // EXTRA-2: re-arm addr_q from the live c_addr when a FILL
-            // completes (m_done) with a request still presented.  The physical
-            // address of the SAME held fetch_pc can change underneath a multi-
-            // cycle fill: an MRET/SRET privilege switch translates the first
-            // post-redirect fetch with the stale privilege for one cycle (bare
-            // physical), the I$ commits to filling that wrong-translation line,
-            // and the correct translation appears on c_addr while the fill is
-            // in flight.  Without the re-arm the post-fill re-lookup would serve
-            // the stale addr_q line as if it were the live request (this is how
-            // a Linux MRET return fetched OpenSBI firmware bytes and panicked).
-            // With it, the re-lookup uses the live address: tag mismatch ->
-            // proper refill.  When c_addr is held stable across the fill (every
-            // bare/M-mode run; any VM fetch without an in-flight translation
-            // change) c_addr == addr_q here, so this writes the same value back
-            // -- a structural no-op.
+            // (The old EXTRA-2 m_done re-arm term was removed in 50 MHz step 8;
+            // see the addr_q_en comment above.  addr_q now HOLDS its own missed
+            // address across the fill, so the core's block-fetch engine no longer
+            // re-presents the missed address and imem_addr can be a pure register.
+            // The MRET/SRET mid-fill re-translation case is covered by the
+            // registered redirect re-presenting the target after the privilege
+            // change settles: the stale-translation line fill completes but is
+            // re-looked-up under the new PA -> tag mismatch -> proper refill.)
             if (addr_q_en)
                 addr_q <= c_addr;
             req_q    <= c_req;

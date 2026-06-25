@@ -50,6 +50,7 @@ module tb_rv_axi_ifetch;
         .clk (clk), .rst_n (rst_n),
         .imem_addr (imem_addr), .imem_req (imem_req),
         .imem_rdata (imem_rdata), .imem_ready (imem_ready),
+        .imem_gnt        (1'b1),
         .dmem_addr (dmem_addr), .dmem_wdata (dmem_wdata), .dmem_wstrb (dmem_wstrb),
         .dmem_req (dmem_req), .dmem_we (dmem_we),
         .dmem_rdata (dmem_rdata), .dmem_ready (dmem_ready),

@@ -479,7 +479,7 @@ module tb_rv_boot_soc;
                 u_soc.u_cpu.u_core.load_use_hazard, u_soc.u_cpu.u_core.redirect_stall,
                 u_soc.u_cpu.u_core.id_ex_pc, u_soc.u_cpu.u_core.id_ex_valid,
                 u_soc.u_cpu.u_core.ex_mret_en,
-                u_soc.u_cpu.u_core.fetch_pc, u_soc.u_cpu.u_core.imem_addr,
+                u_soc.u_cpu.u_core.bfpc, u_soc.u_cpu.u_core.imem_addr,
                 u_soc.gen_icache.u_ic.state, u_soc.gen_icache.u_ic.c_req,
                 u_soc.gen_icache.u_ic.c_ready, u_soc.gen_icache.u_ic.addr_q,
                 u_soc.gen_icache.u_ic.m_req, u_soc.gen_icache.u_ic.m_done,
@@ -524,9 +524,9 @@ module tb_rv_boot_soc;
 `ifdef BOOT_CYCTRACE
         if (tcyc < 50)
             $display("[c%0d] fpc=%h ir=%b ird=%08h memwin=%08h sid=%b sex=%b idxpc=%h idxv=%b",
-                tcyc, u_soc.u_cpu.u_core.fetch_pc, u_soc.imem_ready, u_soc.imem_rdata,
-                (^u_soc.u_cpu.u_core.fetch_pc !== 1'bx && u_soc.u_cpu.u_core.fetch_pc >= MEM_BASE)
-                    ? mem_win(u_soc.u_cpu.u_core.fetch_pc) : 32'hDEADDEAD,
+                tcyc, u_soc.u_cpu.u_core.bfpc, u_soc.imem_ready, u_soc.imem_rdata,
+                (^u_soc.u_cpu.u_core.bfpc !== 1'bx && u_soc.u_cpu.u_core.bfpc >= MEM_BASE)
+                    ? mem_win(u_soc.u_cpu.u_core.bfpc) : 32'hDEADDEAD,
                 u_soc.u_cpu.u_core.stall_id, u_soc.u_cpu.u_core.stall_ex,
                 u_soc.u_cpu.u_core.id_ex_pc, u_soc.u_cpu.u_core.id_ex_valid);
 `endif
@@ -537,7 +537,7 @@ module tb_rv_boot_soc;
 `ifdef BOOT_IPROBE
       if (tcyc >= `BOOT_EXEC_LO && tcyc <= `BOOT_EXEC_LO + 40)
         $display("c%0d fpc=%h ifhit=%b iffault=%b | PTW st=%0d forif=%b faultr=%b | idexv=%b idexpc=%h exmemv=%b memwbv=%b sif=%b sid=%b sex=%b",
-          tcyc, u_soc.u_cpu.u_core.fetch_pc,
+          tcyc, u_soc.u_cpu.u_core.bfpc,
           u_soc.u_cpu.u_mmu.if_tlb_hit, u_soc.u_cpu.u_mmu.if_fault,
           u_soc.u_cpu.u_mmu.ptw_state, u_soc.u_cpu.u_mmu.ptw_for_if,
           u_soc.u_cpu.u_mmu.ptw_fault_r,
@@ -565,7 +565,7 @@ module tb_rv_boot_soc;
 `ifdef BOOT_WIN
         if (tcyc >= `BOOT_WIN && tcyc <= `BOOT_WIN + 30)
             $display("c%0d fpc=%h rdy=%b sid=%b sex=%b fexm=%b fex=%b | EX pc=%h v=%b rs1=%0d rs1sel=%b rs1d=%h | EXMEM pc=%h rd=%0d v=%b fwd=%h | MEMWB rd=%0d v=%b wb=%h",
-                tcyc, u_soc.u_cpu.u_core.fetch_pc, u_soc.imem_ready,
+                tcyc, u_soc.u_cpu.u_core.bfpc, u_soc.imem_ready,
                 u_soc.u_cpu.u_core.stall_id, u_soc.u_cpu.u_core.stall_ex,
                 u_soc.u_cpu.u_core.flush_ex_mem, u_soc.u_cpu.u_core.flush_ex,
                 u_soc.u_cpu.u_core.id_ex_pc, u_soc.u_cpu.u_core.id_ex_valid,
@@ -606,13 +606,13 @@ module tb_rv_boot_soc;
 `ifndef BOOT_NO_ICACHE
         // Verify the instruction the I$ delivers matches the shared-DDR window at
         // fetch_pc (only valid while satp=0 / VA==PA, i.e. early M-mode boot).
-        if (u_soc.imem_ready && (^u_soc.u_cpu.u_core.fetch_pc !== 1'bx)
-            && (u_soc.u_cpu.u_core.fetch_pc >= MEM_BASE)
-            && (u_soc.imem_rdata !== mem_win(u_soc.u_cpu.u_core.fetch_pc)) && nmis < 20) begin
+        if (u_soc.imem_ready && (^u_soc.u_cpu.u_core.bfpc !== 1'bx)
+            && (u_soc.u_cpu.u_core.bfpc >= MEM_BASE)
+            && (u_soc.imem_rdata !== mem_win(u_soc.u_cpu.u_core.bfpc)) && nmis < 20) begin
             nmis <= nmis + 1;
             $display("[IMIS @%0d] pc=%h I$=%h mem=%h",
-                     tcyc, u_soc.u_cpu.u_core.fetch_pc, u_soc.imem_rdata,
-                     mem_win(u_soc.u_cpu.u_core.fetch_pc));
+                     tcyc, u_soc.u_cpu.u_core.bfpc, u_soc.imem_rdata,
+                     mem_win(u_soc.u_cpu.u_core.bfpc));
         end
         // PTE-store watch: any DRAM store whose low byte has the valid bit set
         // (a plausible page-table entry).  Localizes where (if anywhere) the
@@ -963,12 +963,12 @@ module tb_rv_boot_soc;
             ring_rcy[rwh % 64] <= tcyc;
             rwh <= rwh + 1;
         end
-        if (^u_soc.u_cpu.u_core.fetch_pc !== 1'bx) begin
-            if (u_soc.u_cpu.u_core.fetch_pc !== prev_pc) begin
-                ring_pc[rh % 64] <= u_soc.u_cpu.u_core.fetch_pc;
+        if (^u_soc.u_cpu.u_core.bfpc !== 1'bx) begin
+            if (u_soc.u_cpu.u_core.bfpc !== prev_pc) begin
+                ring_pc[rh % 64] <= u_soc.u_cpu.u_core.bfpc;
                 ring_cy[rh % 64] <= tcyc;
                 rh <= rh + 1;
-                prev_pc <= u_soc.u_cpu.u_core.fetch_pc;
+                prev_pc <= u_soc.u_cpu.u_core.bfpc;
             end
         end else if (!seen_x) begin
             seen_x <= 1;
@@ -989,7 +989,7 @@ module tb_rv_boot_soc;
 `ifdef BOOT_DUMP_AT
         // One-shot dump of all integer registers at a given cycle (spin diagnosis).
         if (tcyc == `BOOT_DUMP_AT) begin
-            $display("[REGDUMP @%0d] pc=%h", tcyc, u_soc.u_cpu.u_core.fetch_pc);
+            $display("[REGDUMP @%0d] pc=%h", tcyc, u_soc.u_cpu.u_core.bfpc);
             for (i = 1; i < 32; i = i + 1)
                 $display("   x%0d = %h", i, u_soc.u_cpu.u_core.u_regfile.regs[i]);
         end
@@ -997,11 +997,11 @@ module tb_rv_boot_soc;
 `ifdef BOOT_HANG_PC
         // One-shot dump when fetch_pc first reaches a known hang address (e.g.
         // OpenSBI _start_hang) — same rings as the X dump, to find the branch in.
-        if ((^u_soc.u_cpu.u_core.fetch_pc !== 1'bx)
-            && (u_soc.u_cpu.u_core.fetch_pc === `BOOT_HANG_PC) && !seen_hang) begin
+        if ((^u_soc.u_cpu.u_core.bfpc !== 1'bx)
+            && (u_soc.u_cpu.u_core.bfpc === `BOOT_HANG_PC) && !seen_hang) begin
             seen_hang <= 1;
             $display("[HANG @%0d] fetch_pc reached %h. Last 64 distinct fetch_pc:",
-                     tcyc, u_soc.u_cpu.u_core.fetch_pc);
+                     tcyc, u_soc.u_cpu.u_core.bfpc);
             for (i = 0; i < 64; i = i + 1)
                 $display("   cy=%0d  pc=%h", ring_cy[(rh + i) % 64], ring_pc[(rh + i) % 64]);
             $display("[HANG] Last 64 register writes (cy, x<rd>=data):");
@@ -1012,12 +1012,12 @@ module tb_rv_boot_soc;
 `endif
         // One-shot dump when fetch_pc first runs away above the firmware image
         // (>= 0x8004_0000, below the 0x8020_0000 payload) -- to find the bad jump.
-        if ((^u_soc.u_cpu.u_core.fetch_pc !== 1'bx)
-            && (u_soc.u_cpu.u_core.fetch_pc >= 64'h0000_0000_8004_0000)
-            && (u_soc.u_cpu.u_core.fetch_pc <  64'h0000_0000_8020_0000) && !seen_run) begin
+        if ((^u_soc.u_cpu.u_core.bfpc !== 1'bx)
+            && (u_soc.u_cpu.u_core.bfpc >= 64'h0000_0000_8004_0000)
+            && (u_soc.u_cpu.u_core.bfpc <  64'h0000_0000_8020_0000) && !seen_run) begin
             seen_run <= 1;
             $display("[RUNAWAY @%0d] fetch_pc=%h left firmware. Last 64 distinct fetch_pc:",
-                     tcyc, u_soc.u_cpu.u_core.fetch_pc);
+                     tcyc, u_soc.u_cpu.u_core.bfpc);
             for (i = 0; i < 64; i = i + 1)
                 $display("   cy=%0d  pc=%h", ring_cy[(rh + i) % 64], ring_pc[(rh + i) % 64]);
             $display("[RUNAWAY] Last 64 register writes (cy, x<rd>=data):");
@@ -1049,7 +1049,7 @@ module tb_rv_boot_soc;
             @(posedge clk);
             if ((cyc % 1_000_000) == 999_999) begin
                 $display("\n[progress @%0dM cyc] pc=%010h if_fills=%0d d_reads=%0d chars=%0d mtime=%0d vpe=%0d",
-                         (cyc+1)/1_000_000, u_soc.u_cpu.u_core.fetch_pc, if_ar, d_ar, nchars,
+                         (cyc+1)/1_000_000, u_soc.u_cpu.u_core.bfpc, if_ar, d_ar, nchars,
                          u_soc.u_cpu.u_core.time_val, nvpe);
                 $display("  [IRQCHAIN] ier1=%b uirq=%b plic_en1=%b plic_pend=%b ext1=%b ext0=%b | seip=%0d meip=%0d stip=%0d | en1=%b th1=%0d pr1=%0d",
                          ever_ier1, ever_uirq, ever_en1, ever_pend1, ever_extirq1, ever_extirq0,

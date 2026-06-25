@@ -45,6 +45,14 @@ module rv_core
     output logic             imem_req,
     input  wire  [31:0]      imem_rdata,
     input  wire              imem_ready,
+    // imem_gnt: the fetch request was FORWARDED downstream (MMU did not block it on
+    // a TLB miss / PTW / fault).  In bare mode (no VM) this is the request itself (=1
+    // whenever imem_req=1), so it is a structural no-op.  Under VM it gates the FTQ
+    // head advance so the head does not run past an address whose translation is
+    // still being walked (the MMU, unlike the I$, follows imem_addr and does not hold
+    // a missed address -- advancing the head would fetch the next word and mis-tag it
+    // with the held VA).  Tie to 1'b1 for direct (no-MMU) instantiations.
+    input  wire              imem_gnt,
 
     // Data memory interface
     output logic [XLEN-1:0]  dmem_addr,
@@ -328,35 +336,38 @@ module rv_core
     // =========================================================================
     // Stage 1: Instruction Fetch (IF) — variable-length (C-extension capable)
     // =========================================================================
-    // fetch_pc : the address presented to IMEM in the PREVIOUS cycle = PC of the
-    //            instruction now appearing on imem_rdata (invariant: fetch_pc is
-    //            the byte address whose 32-bit window is in imem_rdata this cycle).
+    // 50 MHz step 8: BLOCK-ALIGNED FETCH (FTQ) + HALFWORD ALIGNER.
+    // ------------------------------------------------------------------------
+    // The old variable-length engine derived the next fetch address as
+    //   seq_pc     = fetch_pc + len(imem_rdata)   // depends on imem_rdata (data)
+    //   imem_addr  = ~imem_ready ? fetch_pc : seq_pc  // depends on imem_ready
+    // so imem_addr -> MMU -> I$ sat on a recursive loop
+    //   I$ addr_q -> hit -> imem_ready/imem_rdata -> seq_pc/fetch_hold -> imem_addr
+    //   -> MMU -> I$ addr_q
+    // that bound the 50 MHz timing (docs/freq_50mhz.md sec 18-20).  Block fetch
+    // breaks BOTH dependences:
+    //   (a) imem_rdata: addresses advance by a FIXED word (+4), not by the decoded
+    //       instruction length.  2/4-byte RVC boundaries (incl. word-straddling
+    //       4-byte instructions) are recovered downstream by an in-core ALIGNER
+    //       fed from a HALFWORD BUFFER, so decode/EX are unchanged.
+    //   (b) imem_ready: the next address is PRE-GENERATED into a Fetch Target Queue
+    //       (FTQ).  imem_addr = ftq[head] is a pure register-array read; the I$
+    //       ready only advances the head POINTER (a flop enable), never imem_addr
+    //       combinationally.  Crucially the head advances PAST an address as soon as
+    //       the I$ accepts it, so during a miss fill imem_addr already presents the
+    //       NEXT address while the I$ holds (and re-looks-up) the missed address in
+    //       its own addr_q (rv_icache EXTRA-2 removed) -- no re-presentation by the
+    //       core, no duplicate fetch, full 1-instruction/cycle throughput.
     //
-    // C-extension makes instructions 2 or 4 bytes long.  The length of the
-    // instruction currently on imem_rdata is known from imem_rdata[1:0]:
-    //   imem_rdata[1:0] == 2'b11  -> 4-byte (uncompressed)
-    //   otherwise                 -> 2-byte (compressed)
-    // The next sequential fetch address is therefore fetch_pc + (2 or 4).
+    // A simple registered "present address" that advances on imem_ready does NOT
+    // work: on a miss it would hold the missed address and the I$ would re-accept it
+    // (duplicate) -> half throughput.  The FTQ (pre-generation) is what keeps the
+    // presented address one ahead of the served address.  (docs/freq_50mhz.md 17.8.)
     //
-    // Unlike the old fixed-+4 design (where a separate leading pc_reg held the
-    // already-advanced address), the next address is derived combinationally from
-    // the arriving instruction, so a single register (fetch_pc) suffices.  The
-    // redirect target is driven onto imem_addr combinationally the same cycle the
-    // redirect resolves; thus the target instruction arrives on the next cycle and
-    // only a 1-cycle IF/ID flush is required (see flush_id).
-    //
-    // NOTE: This assumes the instruction memory returns the 32-bit window starting
-    // at any 2-byte-aligned byte address (true for rv_unified_mem in ACT mode and
-    // for the behavioral IMEMs in the unit testbenches).  A strictly word-addressed
-    // BRAM (rv_imem) would additionally need a half-word realignment buffer to fetch
-    // a 4-byte instruction that straddles a 4-byte boundary; that is out of scope
-    // here since RVC compliance runs in ACT mode.
-
-    logic [XLEN-1:0] fetch_pc;  // PC of the instruction currently on imem_rdata
-
-    // Length of the instruction currently on imem_rdata (2 or 4 bytes)
-    wire             if_is_compressed = (imem_rdata[1:0] != 2'b11);
-    wire [XLEN-1:0]  seq_pc           = fetch_pc + (if_is_compressed ? XLEN'(2) : XLEN'(4));
+    // bfpc : the WORD address whose 32-bit window is on imem_rdata this cycle
+    //        (= the old fetch_pc role: the SERVED address, advances at a fetch
+    //        boundary).  Used to tag pushed halfwords with their byte PC.
+    logic [XLEN-1:0] bfpc;
 
     // ---- Redirect request (this cycle), priority order ----------------------
     logic            redir_req;
@@ -448,109 +459,237 @@ module rv_core
         end
     end
 
-    // Next IMEM address (combinational).  A REGISTERED redirect (redir_pend_q) is
-    // presented first; otherwise hold the in-flight PC while the front end can't
-    // advance (fetch_hold); otherwise the sequential next PC.  Note: redir_pend_q
-    // and fetch_pc/seq_pc are all register-driven, and fetch_hold is register/I$-
-    // local, so imem_addr carries no EX datapath leak (the step-4 goal).
+    // ---- Fetch Target Queue (FTQ): pre-generated WORD fetch addresses --------
+    // gen_pc generates the next sequential word address (+4) every cycle and pushes
+    // it into the FTQ (when there is room); imem_addr = ftq[ftq_head] is a registered
+    // array read.  The head advances (pop) when the I$ ACCEPTS the presented address
+    // (imem_ready) -- a flop ENABLE, never a combinational input to imem_addr -- so
+    // the head is already ONE AHEAD of the served address during a miss fill: the
+    // missed address is held and re-looked-up by the I$ itself (rv_icache EXTRA-2
+    // removed), and imem_addr already presents the NEXT address.  A plain register
+    // that advances on imem_ready cannot do this (it would re-present the missed
+    // address and the I$ would re-accept it = duplicate / half throughput); the FTQ
+    // pre-generation is what keeps the presented address ahead (docs/freq_50mhz.md
+    // 17.8 / 20).  redir_pend_q presents the (registered) redirect target through the
+    // mux; the FTQ is reloaded to continue sequential generation from target+4 the
+    // moment the redirect is applied.
+    localparam int FTQ_DEPTH = 4;
+    localparam int FQ_AW     = $clog2(FTQ_DEPTH);
+    logic [XLEN-1:0]  ftq [FTQ_DEPTH];
+    logic [FQ_AW-1:0] ftq_head, ftq_tail;
+    logic [FQ_AW:0]   ftq_count;
+    logic [XLEN-1:0]  gen_pc;
+    wire ftq_full  = (ftq_count == (FQ_AW+1)'(FTQ_DEPTH));
+    wire ftq_empty = (ftq_count == '0);
+
+    wire [XLEN-1:0] reload_addr = redir_pend_tgt_q & ~XLEN'(3); // word-aligned target
+    wire            ftq_reload  = redir_pend_q & imem_ready;    // redirect applied this boundary
+
+    // ---- Halfword buffer occupancy (declared here so hb_full can gate the fetch
+    //      hold / FTQ pop below; the buffer storage + FF are defined further down).
+    localparam int HB_DEPTH = 8;                  // 4 words = 8 halfwords
+    localparam int HB_AW    = $clog2(HB_DEPTH);
+    logic [15:0]      hb_hw [HB_DEPTH];
+    logic [XLEN-1:0]  hb_pc [HB_DEPTH];
+    logic [HB_AW-1:0] hb_head, hb_tail;
+    logic [HB_AW:0]   hb_count;
+    logic             skip_low_q;                 // skip leading halfword of first post-redirect word
+    wire hb_full  = (hb_count >= (HB_AW+1)'(HB_DEPTH-1)); // keep room for a 2-halfword push
+    wire hb_empty = (hb_count == '0);
+
+    // Backpressure / settle HOLD: re-present the SERVED word (bfpc) so the held I$
+    // window stays available to push, exactly like the old fetch_pc hold.  NOTE:
+    // ~imem_ready is NOT a hold reason any more -- a miss is replayed by the I$
+    // itself, and the FTQ head already presents the next address during the fill.
+    assign fetch_full = hb_full;
+    assign fetch_hold = redirect_stall | fetch_full;
+
+    // imem_addr: registered redirect target while pending; else (backpressure/settle)
+    // re-present the served word; else the pre-generated FTQ head.  EVERY operand is
+    // a register (redir_pend_q / reload_addr / fetch_hold / bfpc / ftq[head]) -- no
+    // imem_ready, no imem_rdata in the fetch-address cone -> the 50 MHz loop is cut.
     always_comb begin
-        if      (redir_pend_q) imem_addr = redir_pend_tgt_q; // registered redirect (step 4)
-        else if (fetch_hold)   imem_addr = fetch_pc;         // hold / re-fetch in-flight PC
-        else                   imem_addr = seq_pc;
+        if      (redir_pend_q) imem_addr = reload_addr;     // present target while pending
+        else if (fetch_hold)   imem_addr = bfpc;            // hold (backpressure / settle)
+        else                   imem_addr = ftq[ftq_head];   // pre-generated sequential word
     end
-
-    // fetch_pc = PC of the in-flight fetch (held stable during the transaction so
-    // the AXI bridge fetches a consistent address and if_id_pc tags it correctly).
-    // It advances only at a fetch boundary (imem_ready), to the redirect target,
-    // the next sequential PC, or holds when the front end can't accept yet.
-    // For a 1-cycle IF (imem_ready=1 every cycle) this reduces to the original
-    // "fetch_pc <= imem_addr" capture.
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) fetch_pc <= RST_ADDR[XLEN-1:0];
-        else if (imem_ready) fetch_pc <= imem_addr;
-    end
-
     assign imem_req = 1'b1;
 
-    // =========================================================================
-    // Decoupled fetch FIFO (approach B / 50 MHz step 4)
-    // =========================================================================
-    // The FETCH engine above runs FREELY with the I$: its hold (fetch_hold) is
-    // fetch-domain ONLY (redirect settle + this FIFO's backpressure) -- it NEVER
-    // contains the data stall dmem_wait.  Fetched {pc,inst} are pushed here; DECODE
-    // pops a head entry into IF/ID when ~stall_id.  A decode/pipeline stall (incl.
-    // dmem_wait) simply stops the pop -> the FIFO fills -> fetch_full backpressures
-    // the fetch.  Because fetch_full is a REGISTER-derived occupancy (ff_count), the
-    // data stall reaches imem_addr only THROUGH that register, never combinationally:
-    // the ex_mem_alu_result -> dc_c_wait -> stall -> imem_addr -> IF-TLB -> I$ worst
-    // path is split by the ff_count flop.  No over-stall / duplication: the
-    // fetched-ahead instructions are REAL (buffered), not re-fetched copies.
-    localparam int FF_DEPTH = 4;
-    logic [31:0]     ff_inst [FF_DEPTH];
-    logic [XLEN-1:0] ff_pc   [FF_DEPTH];
-    logic [1:0]      ff_head, ff_tail;      // $clog2(FF_DEPTH) bits, wrap naturally
-    logic [2:0]      ff_count;              // 0 .. FF_DEPTH
-    wire ff_empty = (ff_count == 3'd0);
-    assign fetch_full = (ff_count == FF_DEPTH[2:0]);
-    // Fetch holds for fetch-domain reasons only (NOT the pipeline/data stall dmem_wait):
-    //   ~imem_ready    = the I$ is busy (fill / first fetch) -> re-present fetch_pc.
-    //                    This is the I$'s OWN ready (near the I$ = short route), not the
-    //                    data leak; the original held the fetch on it via stall_if.
-    //   redirect_stall = 2-cycle wrong-path settle after a redirect.
-    //   fetch_full     = FIFO backpressure (registered occupancy).
-    assign fetch_hold = ~imem_ready | redirect_stall | fetch_full;
-
-    // Flush wrong-path entries when a redirect is APPLIED (redir_eff & imem_ready,
-    // matching flush_id and the fetch_pc<=target capture).  Push the instruction the
-    // fetch just produced when it advances to seq_pc.  Pop into IF/ID when decode
-    // accepts (~stall_id) and the FIFO has an entry.
-    wire ff_flush = redir_eff & imem_ready;
-    wire ff_push  = imem_ready & ~redir_eff & ~redirect_stall & ~fetch_full;
-    wire ff_pop   = ~stall_id & ~ff_empty;
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n || ff_flush) begin
-            ff_head <= 2'd0; ff_tail <= 2'd0; ff_count <= 3'd0;
-        end else begin
-            if (ff_push) begin
-                ff_inst[ff_tail] <= imem_rdata;
-                ff_pc  [ff_tail] <= fetch_pc;
-                ff_tail          <= ff_tail + 2'd1;
-            end
-            if (ff_pop) ff_head <= ff_head + 2'd1;
-            ff_count <= ff_count + (ff_push ? 3'd1 : 3'd0) - (ff_pop ? 3'd1 : 3'd0);
-        end
-    end
-
-    // -------------------------------------------------------------------------
-    // Instruction page fault (rv_mmu if_fault)
-    // -------------------------------------------------------------------------
-    // A faulting instruction fetch never completes (the MMU blocks the request,
-    // so imem_ready stays 0 and the would-be instruction never enters ID/EX to
-    // raise the trap the normal way).  Latch the MMU's if_fault and TAKE the trap
-    // directly here as a one-cycle event: it commits the CSR trap (cause=12,
-    // mepc/mtval = faulting VA) without waiting for imem_ready, and redirects the
-    // fetch to trap_vector via the standard latched-redirect path (redir_pend),
-    // which then re-fetches the handler under the now-correct translation.  The
-    // SATP-write fetch barrier (below) guarantees this fault is precise: the
-    // faulting instruction is the first fetched after the address space changed,
-    // so nothing younger has been (incorrectly) committed and nothing older is
-    // still in flight.  ifpf_take is 0 whenever if_fault never fires (bare mode).
+    // FTQ head pops on accept (not while holding); gen_pc pushes when there is room.
+    // imem_gnt gates the pop: if the MMU is blocking the presented address on a TLB
+    // miss (imem_gnt=0 while imem_ready=1 from the PREVIOUS fetch), the head must NOT
+    // advance -- it holds the committed address so it is re-presented (and re-walked /
+    // re-fetched) instead of being skipped while the next word is fetched and
+    // mis-tagged.  This also keeps if_fault non-speculative (the head holds the
+    // committed faulting address rather than running ahead into speculative faults).
+    wire ftq_pop  = imem_ready & imem_gnt & ~ftq_reload & ~redir_pend_q & ~fetch_hold & ~ftq_empty;
+    wire ftq_push = ~ftq_full  & ~ftq_reload & ~redir_pend_q;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            ifpf_take <= 1'b0;
-            ifpf_pc   <= '0;
-        end else if (ifpf_take) begin
-            ifpf_take <= 1'b0;                     // one-shot: cleared after the commit cycle
-        end else if (if_fault && !redir_eff) begin
-            ifpf_take <= 1'b1;
-            ifpf_pc   <= fetch_pc;                 // faulting instruction VA (== translated VA)
+            ftq[0]    <= RST_ADDR[XLEN-1:0] & ~XLEN'(3);
+            ftq_head  <= '0;
+            ftq_tail  <= FQ_AW'(1);
+            ftq_count <= (FQ_AW+1)'(1);
+            gen_pc    <= (RST_ADDR[XLEN-1:0] & ~XLEN'(3)) + XLEN'(4);
+        end else if (ftq_reload) begin
+            // redirect applied: put the TARGET itself at the FTQ head so it stays
+            // presented (the head holds while imem_ready=0) until it is actually
+            // fetched -- critical when the target needs a multi-cycle MMU page-table
+            // walk.  The registered redirect (redir_pend_q) clears on the PREVIOUS
+            // fetch's imem_ready, one cycle after it is applied, but the target's own
+            // fetch (PTW) is still in flight; if the FTQ head were target+4 the head
+            // would advance off the target before it is fetched and the held target
+            // VA (bfpc) would be mis-tagged with target+4's data.  Holding the target
+            // at the head re-presents it until fetched; the duplicate presentation in
+            // the fast (no-PTW) path is dropped by hb_dup.
+            ftq[0]    <= reload_addr;
+            ftq_head  <= '0;
+            ftq_tail  <= FQ_AW'(1);
+            ftq_count <= (FQ_AW+1)'(1);
+            gen_pc    <= reload_addr + XLEN'(4);
+        end else begin
+            if (ftq_push) begin
+                ftq[ftq_tail] <= gen_pc;
+                ftq_tail      <= ftq_tail + FQ_AW'(1);
+                gen_pc        <= gen_pc + XLEN'(4);
+            end
+            if (ftq_pop) ftq_head <= ftq_head + FQ_AW'(1);
+            ftq_count <= ftq_count + (ftq_push ? (FQ_AW+1)'(1) : (FQ_AW+1)'(0))
+                                   - (ftq_pop  ? (FQ_AW+1)'(1) : (FQ_AW+1)'(0));
+        end
+    end
+
+    // bfpc = the SERVED word address (PC of the word currently on imem_rdata).  It
+    // captures imem_addr at each fetch boundary, exactly like the old fetch_pc, and
+    // HOLDS during a miss / backpressure so the delivered word is tagged with the
+    // address it actually belongs to.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)          bfpc <= RST_ADDR[XLEN-1:0] & ~XLEN'(3);
+        else if (imem_ready) bfpc <= imem_addr;
+    end
+
+    // ---- Halfword buffer (skid FIFO of 16-bit halfwords) + ALIGNER -----------
+    // Each fetched 32-bit word pushes its two halfwords (each tagged with its byte
+    // PC).  The aligner extracts a 2-byte (RVC) or 4-byte instruction from the buffer
+    // head, assembling a word-straddling 4-byte instruction from two adjacent
+    // halfwords -- this is what lets imem_addr advance by a FIXED +4.  Decode is
+    // unchanged: a compressed instruction is identified by inst[1:0] != 2'b11, and
+    // the upper 16 bits are don't-care for it.  (Storage / occupancy declared above.)
+
+    // Aligner (combinational) -> drives IF/ID directly.
+    wire [15:0]      h0   = hb_hw[hb_head];
+    wire [15:0]      h1   = hb_hw[(hb_head + HB_AW'(1))];
+    wire [XLEN-1:0]  h0pc = hb_pc[hb_head];
+    wire             h0_avail = (hb_count >= (HB_AW+1)'(1));
+    wire             h1_avail = (hb_count >= (HB_AW+1)'(2));
+    wire             align_is_comp = (h0[1:0] != 2'b11);
+    wire             align_valid   = h0_avail & (align_is_comp | h1_avail);
+    wire [31:0]      align_inst    = {h1, h0};
+    wire [HB_AW:0]   align_consume = align_is_comp ? (HB_AW+1)'(1) : (HB_AW+1)'(2);
+
+    // Push the delivered word (imem_ready) on the committed path with buffer room;
+    // pop the consumed halfwords when decode accepts an aligned instruction.  Flush
+    // (drop wrong-path halfwords) for the whole duration of a redirect (redir_eff),
+    // so the buffer is empty when a faulting/redirect target is being resolved.
+    //
+    // hb_dup: a hold-less synchronous IMEM (rv_imem, used by rv_soc_bram) re-reads
+    // mem[addr] on EVERY req cycle.  Because the FTQ head advances one cycle AFTER an
+    // accept (a flop enable), the very first address is presented for two cycles
+    // while imem_ready ramps 0->1 (the I$ instead HOLDS its addr_q and serves once,
+    // so it never duplicates).  That makes the hold-less IMEM deliver the same word
+    // twice with the same bfpc.  A sequential fetch never re-serves the same byte PC
+    // (PC strictly advances), and a redirect flushes the buffer (hb_last_vld<=0), so
+    // "skip a push whose bfpc equals the immediately preceding pushed PC" drops only
+    // such duplicates -- a structural no-op on the I$ path (bfpc always advances).
+    logic [XLEN-1:0] hb_last_pc;
+    logic            hb_last_vld;
+    wire hb_dup   = hb_last_vld & (bfpc == hb_last_pc);
+    wire hb_flush = redir_eff;
+    wire hb_push  = imem_ready & ~redir_eff & ~redirect_stall & ~hb_full & ~hb_dup;
+    wire hb_pop   = ~stall_id & align_valid;
+    wire [HB_AW:0] hb_push_n = hb_push ? (skip_low_q ? (HB_AW+1)'(1) : (HB_AW+1)'(2)) : (HB_AW+1)'(0);
+    wire [HB_AW:0] hb_pop_n  = hb_pop  ? align_consume : (HB_AW+1)'(0);
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            hb_head <= '0; hb_tail <= '0; hb_count <= '0; skip_low_q <= 1'b0;
+            hb_last_pc <= '0; hb_last_vld <= 1'b0;
+        end else if (hb_flush) begin
+            // drop wrong-path halfwords; the first word after a mid-word redirect
+            // target (target[1]==1) skips its low halfword to start at the target.
+            hb_head    <= '0; hb_tail <= '0; hb_count <= '0;
+            skip_low_q <= redir_pend_tgt_q[1];
+            hb_last_vld <= 1'b0;                     // first post-redirect push is never a dup
+        end else begin
+            if (hb_push) begin
+                hb_last_pc  <= bfpc;
+                hb_last_vld <= 1'b1;
+                if (skip_low_q) begin
+                    hb_hw[hb_tail] <= imem_rdata[31:16];
+                    hb_pc[hb_tail] <= bfpc + XLEN'(2);
+                    hb_tail        <= hb_tail + HB_AW'(1);
+                    skip_low_q     <= 1'b0;
+                end else begin
+                    hb_hw[hb_tail]              <= imem_rdata[15:0];
+                    hb_pc[hb_tail]              <= bfpc;
+                    hb_hw[(hb_tail + HB_AW'(1))] <= imem_rdata[31:16];
+                    hb_pc[(hb_tail + HB_AW'(1))] <= bfpc + XLEN'(2);
+                    hb_tail                    <= hb_tail + HB_AW'(2);
+                end
+            end
+            if (hb_pop) hb_head <= hb_head + align_consume[HB_AW-1:0];
+            hb_count <= hb_count + hb_push_n - hb_pop_n;
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Instruction page fault (rv_mmu if_fault) -- latched, precise (block fetch)
+    // -------------------------------------------------------------------------
+    // imem_gnt holds the FTQ head on the COMMITTED fetch address while its
+    // translation is walked, so if_fault is for the committed (non-speculative)
+    // address: imem_addr == the faulting VA.  LATCH the fault (capturing the 1-cycle
+    // PTW_FAULT transient) and TAKE it when the aligner is STARVED (the buffer has
+    // drained everything older = the fault is the next thing to retire) -> precise.
+    //
+    // BOTH the latch and the take are gated by ~redir_eff (exactly like the original
+    // immediate-take design).  This is load-bearing: when ifpf_take fires it drives a
+    // redirect to trap_vector (redir_eff=1) while the FAULTING fetch's if_fault is
+    // still asserted for one more cycle; without the ~redir_eff latch gate that stale
+    // if_fault would RE-LATCH a pending fault that is then taken again on the handler
+    // fetch (a spurious double instruction-page-fault on the -- mapped -- trap
+    // handler).  redir_eff is NOT set while the (committed) faulting target is held by
+    // the FTQ after the registered redirect has applied (redir_pend_q has cleared),
+    // so the real redirect-target / page-boundary fault is still latched normally.
+    // An OLDER redirect (branch/trap/MRET/SRET/SATP in EX -- fetch_redir_ext) squashes
+    // a pending fault outright (the speculative fetch was wrong-path).
+    wire fetch_redir_ext = branch_taken_ex | trap_or_mret | satp_write_redir;
+    logic            ifpf_pend;
+    logic [XLEN-1:0] ifpf_pc_pend;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ifpf_pend    <= 1'b0;
+            ifpf_pc_pend <= '0;
+            ifpf_take    <= 1'b0;
+            ifpf_pc      <= '0;
+        end else begin
+            ifpf_take <= 1'b0;                          // default: single-cycle pulse
+            if (fetch_redir_ext) begin
+                ifpf_pend <= 1'b0;                      // older redirect squashed the speculative fetch
+            end else if (ifpf_pend && ~align_valid && ~redir_eff) begin
+                // faulting word is the next instruction to retire -> take now
+                ifpf_take <= 1'b1;
+                ifpf_pc   <= (hb_count != '0) ? h0pc : ifpf_pc_pend;
+                ifpf_pend <= 1'b0;
+            end else if (if_fault && ~redir_eff && ~ifpf_pend) begin
+                ifpf_pend    <= 1'b1;                   // capture (incl. PTW_FAULT transient)
+                ifpf_pc_pend <= imem_addr;              // = the committed faulting VA (held by imem_gnt)
+            end
         end
     end
 
 
     // =========================================================================
-    // IF/ID Pipeline Register  (between IF and ID)
+    // IF/ID Pipeline Register  (between IF and ID) -- fed by the aligner
     // =========================================================================
     logic [31:0]     if_id_inst;
     logic [XLEN-1:0] if_id_pc;
@@ -562,10 +701,10 @@ module rv_core
             if_id_pc    <= '0;
             if_id_valid <= 1'b0;
         end else if (!stall_id) begin
-            // Decoupled fetch: decode consumes the FIFO head (a bubble when empty).
-            if_id_inst  <= ff_empty ? 32'h0000_0013 : ff_inst[ff_head];
-            if_id_pc    <= ff_empty ? '0            : ff_pc  [ff_head];
-            if_id_valid <= ~ff_empty;
+            // Block fetch: the aligner emits one instruction (a bubble when starved).
+            if_id_inst  <= align_valid ? align_inst : 32'h0000_0013;
+            if_id_pc    <= align_valid ? h0pc       : '0;
+            if_id_valid <= align_valid;
         end
         // else: stall — hold current value
     end

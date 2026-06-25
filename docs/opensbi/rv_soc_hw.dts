@@ -46,7 +46,7 @@
     cpus {
         #address-cells = <1>;
         #size-cells = <0>;
-        timebase-frequency = <40000000>;  /* mtime = PL/MTIME_DIV = 40 MHz/1 */
+        timebase-frequency = <50000000>;  /* mtime = PL/MTIME_DIV = 50 MHz/1 */
 
         cpu0: cpu@0 {
             device_type = "cpu";
@@ -98,8 +98,8 @@
             reg-io-width = <4>;
             interrupt-parent = <&plic0>;
             interrupts = <1>;
-            clock-frequency = <40000000>;  /* = PL clock; sets the 8250 divisor */
-            current-speed = <57600>;  /* 40e6/(16*43)=58140, +0.94% */
+            clock-frequency = <50000000>;  /* = PL clock; sets the 8250 divisor */
+            current-speed = <57600>;  /* 50e6/(16*54)=57870, +0.47% */
         };
 
         gpio@c0020000 {

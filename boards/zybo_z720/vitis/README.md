@@ -11,8 +11,8 @@ root, where `$PWD\...` gives Vivado the absolute `-source` path it needs.
 
 **One-shot (cross-platform):** `python boards/zybo_z720/build_all.py` (Windows or Linux,
 stdlib only) runs `bit -> fsbl -> bootbin` (use `--stage xsa fsbl bootbin` to reuse an
-existing impl). On Windows the `..\build_all.ps1` shim forwards to it. The bash/docker
-side (firmware, sim, tests) is the top-level `make` -- run `make help` at the repo root.
+existing impl).  Retarget the PL clock first with `python ..\set_pl_freq.py <MHz>`.  The
+bash/docker side (firmware, sim, tests) is the top-level `make` -- run `make help` at the repo root.
 
 ## Clock / UART facts baked into the design (read first)
 

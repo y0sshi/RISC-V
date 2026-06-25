@@ -22,7 +22,7 @@ set repo [file normalize "$here/../../.."]
 
 set ps7_init "$here/ps7_init.tcl"
 set bit      "$repo/boards/zybo_z720/vivado/rv_riscv_zybo/rv_riscv_zybo.runs/impl_1/bd_riscv_wrapper.bit"
-# Real-HW firmware (OpenSBI hello), re-linked to 0x200000 with the 40 MHz /
+# Real-HW firmware (OpenSBI hello), re-linked to 0x200000 with the 50 MHz /
 # 57600 device tree (prep-E).  Swap for fw_payload_linux_hw.elf to boot Linux.
 #set fw       "$repo/tests/opensbi/work/fw_payload_hw.elf"
 set fw       "$repo/tests/linux/work/fw_payload_linux_hw.elf"
@@ -38,7 +38,7 @@ connect
 targets -set -nocase -filter {name =~ "*Cortex-A9*#0"}
 catch { stop };  # may already be stopped from a prior session -> don't abort
 
-# ---- PS init: DDR controller, MIO, clocks (FCLK_CLK0 = 40 MHz) ----
+# ---- PS init: DDR controller, MIO, clocks (FCLK_CLK0 = 50 MHz) ----
 puts "== ps7_init (DDR / MIO / clocks) =="
 source $ps7_init
 ps7_init

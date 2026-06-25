@@ -102,6 +102,7 @@ module rv_cpu
         .imem_req (core_imem_req),
         .imem_rdata (imem_rdata),
         .imem_ready (imem_ready),
+        .imem_gnt (mmu_imem_req),   // MMU forwarded the fetch (0 while a TLB miss walks)
         .dmem_addr (core_dmem_va),
         .dmem_wdata (core_dmem_wdata),
         .dmem_wstrb (core_dmem_wstrb),

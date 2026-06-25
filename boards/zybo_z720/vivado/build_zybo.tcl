@@ -41,7 +41,7 @@ set XLEN64 1           ;# 1 = RV64 (target for Linux); HP ports are 64-bit.
 # docs/opensbi/rv_soc_hw.dts: timebase-frequency + serial clock-frequency =
 # 30303030; baud divisor = round(PL/(16*baud))); keep them in sync with the
 # realized FCLK, not the request.
-set PL_FREQMHZ 40
+set PL_FREQMHZ 50
 
 create_project $proj_name $proj_dir -part $PART -force
 set_property target_language Verilog [current_project]

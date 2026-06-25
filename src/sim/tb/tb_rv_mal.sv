@@ -90,6 +90,7 @@ module tb_rv_mal;
         .imem_req        (imem_req),
         .imem_rdata      (imem_rdata),
         .imem_ready      (imem_ready),
+        .imem_gnt        (1'b1),
         .dmem_addr       (dmem_addr),
         .dmem_wdata      (dmem_wdata),
         .dmem_wstrb      (dmem_wstrb),

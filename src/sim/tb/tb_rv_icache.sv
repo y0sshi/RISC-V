@@ -252,16 +252,19 @@ module tb_rv_icache;
             @(negedge clk);
         end
 
-        // ---- Translation change mid-fill (Linux MRET-return regression) ----
-        // The MMU can retranslate the SAME held fetch_pc to a different
-        // physical address while the I$ is filling: an MRET/SRET privilege
-        // switch translates the first post-redirect fetch with the stale
-        // privilege (bare physical) for one cycle, the I$ commits to filling
-        // that wrong line, and the corrected translation then appears on
-        // c_addr mid-fill.  The data served after the fill MUST be for the
-        // LIVE c_addr, not the stale fill address (serving the stale line is
-        // how a Linux MRET return executed OpenSBI firmware bytes -> decoded
-        // garbage c.sd -> store fault tval=0x30 -> silent panic).
+        // ---- Address change mid-fill: I$ HOLDS its own addr (50 MHz step 8) ----
+        // The old EXTRA-2 term re-armed addr_q from the LIVE c_addr at fill
+        // completion, so a c_addr that changed mid-fill was served after the fill.
+        // That required the core to re-present the missed address for the whole
+        // fill (imem_addr = ~imem_ready ? fetch_pc : seq_pc) -- the very ~imem_ready
+        // combinational dependence that put the I$ fetch loop on the binding 50 MHz
+        // path.  EXTRA-2 was removed so imem_addr can be a pure register (the block
+        // fetch FTQ engine): the I$ now HOLDS its own missed address across the fill,
+        // and a c_addr that changes mid-fill is IGNORED -- the held line is filled and
+        // served.  The MRET/SRET mid-fill re-translation case (the old Linux panic)
+        // is now handled one level up by the core re-presenting the target as a FRESH
+        // fetch after the fill (tag mismatch -> proper refill), validated by full
+        // Linux NET=y boot.
         begin : xlate_mid_fill
             logic [31:0] xd;
             logic        got;
@@ -276,27 +279,28 @@ module tb_rv_icache;
             @(negedge clk);
             c_req = 1; c_addr = XA;          // present XA: lookup -> miss -> fill
             repeat (3) @(negedge clk);       // fill of XA's line is now in flight
-            c_addr = XB;                     // translation "changes" mid-fill
+            c_addr = XB;                     // c_addr changes mid-fill (IGNORED now)
             got = 1'b0; guard = 0;
             while (!got) begin
                 @(negedge clk); #1;
                 if (c_ready) begin
-                    check(c_rdata, 32'hBBBB_0001,
-                          "xlate: first serve after mid-fill addr change is LIVE addr");
+                    check(c_rdata, 32'hAAAA_0001,
+                          "xlate: mid-fill addr change IGNORED, serves HELD addr (EXTRA-2 removed)");
                     got = 1'b1;
                 end
                 guard = guard + 1;
                 if (guard > 200) begin
                     fail_cnt = fail_cnt + 1;
-                    $display("[FAIL] xlate: no c_ready after mid-fill addr change");
+                    $display("[FAIL] xlate: no c_ready after fill");
                     got = 1'b1;
                 end
             end
             c_req = 0;
             @(negedge clk);
-            // both lines must now be cached under their own tags
-            fetch(XA, xd); check(xd, 32'hAAAA_0001, "xlate: XA line cached correctly");
-            fetch(XB, xd); check(xd, 32'hBBBB_0001, "xlate: XB line cached correctly");
+            // XB is then fetched as a FRESH lookup (the core re-presents the target);
+            // both lines end up cached under their own tags.
+            fetch(XB, xd); check(xd, 32'hBBBB_0001, "xlate: XB fetched as a fresh lookup");
+            fetch(XA, xd); check(xd, 32'hAAAA_0001, "xlate: XA line still cached");
             c_req = 0;
             @(negedge clk);
         end
