@@ -423,10 +423,17 @@ module rv_fpu
     logic comb_op_in;
     assign comb_op_in = valid_in && (fpu_op != FPU_DIV) && (fpu_op != FPU_SQRT);
 
-    localparam int unsigned COMB_LAT = 2;  // busy cycles (capture at T+1+COMB_LAT)
-    logic [1:0] comb_cnt;
+    // 50 MHz step 11: rv_fpu_add_d is now a 3-register pipeline (align -> add ->
+    // normalize/round), so the deepest comb op (D-FMADD) is
+    //   mul(T+1) -> mul_d_result_q(T+2) -> add_d.align(T+3) -> add_d.sum_q(T+4)
+    //   -> add_d.result_q(T+5)
+    // = capture at T+5 -> COMB_LAT = 4.  Increasing COMB_LAT only gives every other
+    // (shallower) sub-unit MORE settle time; operands are frozen in ID/EX across the
+    // (now 4-cycle) busy window, so all results are stable by their capture cycle.
+    localparam int unsigned COMB_LAT = 4;  // busy cycles (capture at T+1+COMB_LAT)
+    logic [2:0] comb_cnt;
     logic       comb_busy, comb_busy_q, comb_done;
-    assign comb_busy = (comb_cnt != 2'd0);
+    assign comb_busy = (comb_cnt != 3'd0);
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -469,10 +476,10 @@ module rv_fpu
             misc_d_result_i_q <= misc_d_result_i;
             misc_d_fflags_q   <= misc_d_fflags;
 
-            if (comb_op_in && comb_cnt == 2'd0)
-                comb_cnt <= COMB_LAT[1:0];      // start: span COMB_LAT busy cycles
-            else if (comb_cnt != 2'd0)
-                comb_cnt <= comb_cnt - 2'd1;    // count down to capture cycle
+            if (comb_op_in && comb_cnt == 3'd0)
+                comb_cnt <= COMB_LAT[2:0];      // start: span COMB_LAT busy cycles
+            else if (comb_cnt != 3'd0)
+                comb_cnt <= comb_cnt - 3'd1;    // count down to capture cycle
         end
     end
     // Result ready / capture cycle: busy was high last cycle and is now low.

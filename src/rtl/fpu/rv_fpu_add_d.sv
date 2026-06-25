@@ -1,26 +1,36 @@
 // =============================================================================
 /// @file rv_fpu_add_d.sv
-/// @brief IEEE 754 Double-Precision Adder / Subtractor (combinational)
+/// @brief IEEE 754 Double-Precision Adder / Subtractor (3-stage pipelined)
 ///
-/// Implements FADD.D and FSUB.D.  The is_sub flag negates operand B's sign.
+/// Implements FADD.D and FSUB.D (and the D-extension FMADD family's add step via
+/// rv_fpu).  The is_sub flag negates operand B's sign.
 ///
 /// Format: s(1) | e(11) | f(52), bias=1023, canonical NaN=0x7FF8_0000_0000_0000
 ///
-/// Implemented as a SINGLE always_comb block computing everything from the
-/// primary inputs (a, b, is_sub, rm).  This avoids iverilog delta-cycle races
-/// where a chain of separate always blocks feeding continuous-assign nets can
-/// evaluate with stale intermediate values and never re-trigger.
+/// PIPELINE (50 MHz step 11; see rv_fpu.sv COMB_LAT note).  The double-precision
+/// add was the 50 MHz binding path -- both the stage-0 align+57-bit-add
+/// (-> sum_q) and the stage-1 normalize/round/assemble (-> the FPU result mux ->
+/// ex_mem_fpu_result_f) sat at ~19.6-19.9 ns (route ~64%).  Split into THREE
+/// register stages so each combinational arc is short:
+///   stage 0  (comb): extract / classify / swap / align (the variable barrel
+///                    shift) + decide eff_sub          -> register {sig_l,
+///                    sig_s_shifted, eff_sub, sign, el, classify flags}
+///   stage 1  (comb): the 57-bit significand add        -> sum_q
+///   stage 2  (comb): LZC / normalize / round / assemble-> result_q / fflags_q
+/// result/fflags are valid 3 cycles after stable inputs (was 1).  rv_fpu's
+/// COMB_LAT handshake budgets for the deeper latency; increasing COMB_LAT only
+/// gives every sub-unit MORE settle time (operands are frozen in ID/EX across the
+/// busy window), so this is a pure latency change -- results stay BIT-IDENTICAL.
+///
+/// Each stage keeps its body in a SINGLE always_comb (driven from that stage's
+/// registered inputs) to avoid the iverilog delta-cycle races that plagued the
+/// original split-always design.
 ///
 /// @author Naofumi Yoshinaga
 // =============================================================================
 
 `default_nettype none
 
-// C-2c second step: 1-cycle PIPELINED adder (see rv_fpu_add.sv for the rationale).
-// A pipeline register at the post-add `sum` boundary splits the IEEE add into
-// stage 0 (extract/classify/align/add) and stage 1 (LZC/normalize/round/assemble).
-// `result`/`fflags` are valid 1 cycle after stable inputs; rv_fpu's 2-cycle
-// combinational-op handshake budgets for it.  Pure latency change, bit-identical.
 module rv_fpu_add_d (
     input  wire         clk,
     input  wire         rst_n,
@@ -34,8 +44,9 @@ module rv_fpu_add_d (
 
     localparam logic [63:0] CANONICAL_NAN = 64'h7FF8000000000000;
 
-    // All intermediates are driven and consumed inside the single always_comb
-    // below; declared at module level for waveform visibility.
+    // =========================================================================
+    // Stage 0 (combinational): extract / classify / swap / align
+    // =========================================================================
     logic        sa, sb;
     logic [10:0] ea, eb;
     logic [51:0] fra, frb;
@@ -52,18 +63,6 @@ module rv_fpu_add_d (
     logic [55:0] sig_l, ms_ext, sig_s_shifted;
     logic        sticky_shift;
     logic        eff_sub;
-    logic [56:0] sum;
-    logic        sum_sign;
-    logic [5:0]  lzc;
-    logic [11:0] norm_exp;
-    logic [55:0] norm_sig;
-    logic        is_exact_zero;
-    logic [5:0]  shift_amt;
-    logic [11:0] lzc_ext;
-    logic        G, R, S_bit, round_up;
-    logic [52:0] mant_rounded;
-    logic [11:0] final_exp;
-    logic [51:0] final_frac;
 
     always_comb begin
         // ---- Field extraction; apply is_sub to b's sign ----
@@ -121,19 +120,45 @@ module rv_fpu_add_d (
         end
         sig_s_shifted[0] = sig_s_shifted[0] | sticky_shift;
 
-        // ---- Add or subtract ----
+        // ---- Decide effective add vs subtract ----
         eff_sub = (sl != ss);
-        if (!eff_sub)
-            sum = {1'b0, sig_l} + {1'b0, sig_s_shifted};
-        else
-            sum = {1'b0, sig_l} - {1'b0, sig_s_shifted};
-        sum_sign = sl;
+    end
+
+    // ---- Stage 0 -> Stage 1 register (aligned operands + carried metadata) ----
+    logic [55:0] sig_l_s0, sig_s_shifted_s0;
+    logic        eff_sub_s0, sl_s0;
+    logic [11:0] el_s0;
+    logic        sa_s0, sb_s0;
+    logic        a_nan_s0, b_nan_s0, a_snan_s0, b_snan_s0, a_inf_s0, b_inf_s0;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sig_l_s0 <= '0; sig_s_shifted_s0 <= '0; eff_sub_s0 <= 1'b0;
+            sl_s0 <= 1'b0; el_s0 <= '0; sa_s0 <= 1'b0; sb_s0 <= 1'b0;
+            a_nan_s0 <= 1'b0; b_nan_s0 <= 1'b0; a_snan_s0 <= 1'b0;
+            b_snan_s0 <= 1'b0; a_inf_s0 <= 1'b0; b_inf_s0 <= 1'b0;
+        end else begin
+            sig_l_s0 <= sig_l; sig_s_shifted_s0 <= sig_s_shifted;
+            eff_sub_s0 <= eff_sub; sl_s0 <= sl; el_s0 <= el;
+            sa_s0 <= sa; sb_s0 <= sb;
+            a_nan_s0 <= a_nan; b_nan_s0 <= b_nan; a_snan_s0 <= a_snan;
+            b_snan_s0 <= b_snan; a_inf_s0 <= a_inf; b_inf_s0 <= b_inf;
+        end
     end
 
     // =========================================================================
-    // Pipeline register (stage 0 -> stage 1).  Free-running; rv_fpu's handshake
-    // captures the stage-1 result on the correct cycle (stale fills uncaptured).
+    // Stage 1 (combinational): the 57-bit significand add/subtract
     // =========================================================================
+    logic [56:0] sum;
+    logic        sum_sign;
+    always_comb begin
+        if (!eff_sub_s0)
+            sum = {1'b0, sig_l_s0} + {1'b0, sig_s_shifted_s0};
+        else
+            sum = {1'b0, sig_l_s0} - {1'b0, sig_s_shifted_s0};
+        sum_sign = sl_s0;
+    end
+
+    // ---- Stage 1 -> Stage 2 register (post-add) ----
     logic [56:0] sum_q;
     logic        sum_sign_q;
     logic [11:0] el_q;
@@ -146,14 +171,29 @@ module rv_fpu_add_d (
             a_nan_q <= 1'b0; b_nan_q <= 1'b0; a_snan_q <= 1'b0;
             b_snan_q <= 1'b0; a_inf_q <= 1'b0; b_inf_q <= 1'b0;
         end else begin
-            sum_q <= sum; sum_sign_q <= sum_sign; el_q <= el;
-            sa_q <= sa; sb_q <= sb;
-            a_nan_q <= a_nan; b_nan_q <= b_nan; a_snan_q <= a_snan;
-            b_snan_q <= b_snan; a_inf_q <= a_inf; b_inf_q <= b_inf;
+            sum_q <= sum; sum_sign_q <= sum_sign; el_q <= el_s0;
+            sa_q <= sa_s0; sb_q <= sb_s0;
+            a_nan_q <= a_nan_s0; b_nan_q <= b_nan_s0; a_snan_q <= a_snan_s0;
+            b_snan_q <= b_snan_s0; a_inf_q <= a_inf_s0; b_inf_q <= b_inf_s0;
         end
     end
 
-    // ---- Stage 1: normalize / round / assemble (reads registered *_q) ----
+    // =========================================================================
+    // Stage 2 (combinational): normalize / round / assemble (reads *_q)
+    // =========================================================================
+    logic [5:0]  lzc;
+    logic [11:0] norm_exp;
+    logic [55:0] norm_sig;
+    logic        is_exact_zero;
+    logic [5:0]  shift_amt;
+    logic [11:0] lzc_ext;
+    logic        G, R, S_bit, round_up;
+    logic [52:0] mant_rounded;
+    logic [11:0] final_exp;
+    logic [51:0] final_frac;
+    logic [63:0] result_c;
+    logic [4:0]  fflags_c;
+
     always_comb begin
         // ---- Leading-zero count of sum_q[55:3] (loop-based priority encoder) ----
         // Scan LSB->MSB so the last (highest) set bit wins; all-zero -> 53.
@@ -210,41 +250,59 @@ module rv_fpu_add_d (
         end
 
         // ---- Output assembly with special-case overrides ----
-        result = 64'h0;
-        fflags = 5'h0;
+        result_c = 64'h0;
+        fflags_c = 5'h0;
 
         if (a_nan_q || b_nan_q) begin
-            result    = CANONICAL_NAN;
-            fflags[4] = a_snan_q | b_snan_q;
+            result_c    = CANONICAL_NAN;
+            fflags_c[4] = a_snan_q | b_snan_q;
         end else if (a_inf_q && b_inf_q && (sa_q != sb_q)) begin
-            result    = CANONICAL_NAN;
-            fflags[4] = 1'b1;
+            result_c    = CANONICAL_NAN;
+            fflags_c[4] = 1'b1;
         end else if (a_inf_q) begin
-            result = {sa_q, 11'h7FF, 52'h0};
+            result_c = {sa_q, 11'h7FF, 52'h0};
         end else if (b_inf_q) begin
-            result = {sb_q, 11'h7FF, 52'h0};
+            result_c = {sb_q, 11'h7FF, 52'h0};
         end else if (is_exact_zero) begin
-            result = {(rm == 3'b010) ? 1'b1 : 1'b0, 63'h0};
+            result_c = {(rm == 3'b010) ? 1'b1 : 1'b0, 63'h0};
         end else begin
             if (final_exp >= 12'd2047) begin
-                fflags[2] = 1'b1;
-                fflags[0] = 1'b1;
+                fflags_c[2] = 1'b1;
+                fflags_c[0] = 1'b1;
                 case (rm)
-                    3'b001: result = {sum_sign_q, 11'h7FE, 52'hFFFFFFFFFFFFF};
-                    3'b010: result = sum_sign_q ? {1'b1,11'h7FF,52'h0} : {1'b0,11'h7FE,52'hFFFFFFFFFFFFF};
-                    3'b011: result = sum_sign_q ? {1'b1,11'h7FE,52'hFFFFFFFFFFFFF} : {1'b0,11'h7FF,52'h0};
-                    default: result = {sum_sign_q, 11'h7FF, 52'h0};
+                    3'b001: result_c = {sum_sign_q, 11'h7FE, 52'hFFFFFFFFFFFFF};
+                    3'b010: result_c = sum_sign_q ? {1'b1,11'h7FF,52'h0} : {1'b0,11'h7FE,52'hFFFFFFFFFFFFF};
+                    3'b011: result_c = sum_sign_q ? {1'b1,11'h7FE,52'hFFFFFFFFFFFFF} : {1'b0,11'h7FF,52'h0};
+                    default: result_c = {sum_sign_q, 11'h7FF, 52'h0};
                 endcase
             end else if (final_exp == 0 && norm_exp == 0) begin
-                result    = {sum_sign_q, 11'h000, final_frac};
-                fflags[1] = (G | R | S_bit);
-                fflags[0] = (G | R | S_bit);
+                result_c    = {sum_sign_q, 11'h000, final_frac};
+                fflags_c[1] = (G | R | S_bit);
+                fflags_c[0] = (G | R | S_bit);
             end else begin
-                result    = {sum_sign_q, final_exp[10:0], final_frac};
-                fflags[0] = G | R | S_bit;
+                result_c    = {sum_sign_q, final_exp[10:0], final_frac};
+                fflags_c[0] = G | R | S_bit;
             end
         end
     end
+
+    // ---- Stage 2 -> output register (post normalize/round/assemble) ----
+    // Breaks the long normalize/round + FPU output-mux + ex_mem route into its own
+    // clock period.
+    logic [63:0] result_q;
+    logic [4:0]  fflags_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            result_q <= '0;
+            fflags_q <= '0;
+        end else begin
+            result_q <= result_c;
+            fflags_q <= fflags_c;
+        end
+    end
+
+    assign result = result_q;
+    assign fflags = fflags_q;
 
 endmodule
 

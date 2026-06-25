@@ -1377,3 +1377,51 @@ FP load は既にこの種の D$->データパス long path を **fpld レジス
   `{all,fpga,synth,impl,bit,xsa,fsbl,bootbin}` に拡張 (fpga=build_zybo all、synth/impl/bit を 1:1)。
   途中再開例: `--stage impl bit` / `--stage bit`。(暫定の `impl_only.tcl` は本分割で不要となり削除。)
 - board 設定 (50MHz) は §21 で適用済。実機 bring-up は ps7_init/firmware を 50MHz 用に再生成後 (ユーザー)。
+
+## 24. ✅ step 11 = FMA-D 加算器の 3 段化 = 実 50MHz margin を +0.042->+0.355ns へ (第19セッション後半; rv_fpu_add_d 3段化; docs §24)
+
+### 24.1 課題 = step10 の +0.042ns は実シリコンに薄すぎた
+step10 で本番 default WNS +0.042ns (MET) を得たが、**実機 50MHz boot が `kdevtmpfs/filename_create` で NULL deref
+crash** (ポインタ破損)。OpenSBI/Linux は 50MHz 認識して進むので DTB/baud 不整合ではなく**計算破損**。原因 = +0.042ns
+は STA モデル slack で、実シリコンの PVT ばらつきに対し不足 (40MHz 実機は +0.172ns で安定起動していた)。sim は AXI BFM
+可変レイテンシで full Linux 455-456M cyc userspace 到達 = **logic は健全**ゆえ timing margin 起因と判断。ユーザ方針 =
+50MHz 維持で RTL margin を詰める。
+
+### 24.2 binding = FPU 結果経路 (top-40 が全て FPU、非FPU は +0.471ns 以遠)
+routed impl_1 の near-worst を `report_paths.tcl` (open_run impl_1 + report_timing 40 worst unique) で確認:
+**上位 40 経路すべて FPU** = `*->u_fma_add_d/sum_q` (FMA-D 加算 stage0, +0.042~), `sum_q->ex_mem_fpu_result_f`
+(stage1 normalize+結果mux+EX/MEM route, +0.138~), `*->misc_d_result_i_q / misc_result_i_q` (FCVT, +0.265~)。
+**非FPU の最悪は +0.471ns 以遠** = FPU を詰めれば margin 天井は十分高い。worst は D 精度加算器 (rv_fpu_add_d)。
+
+### 24.3 修正 = rv_fpu_add_d を 2 段 -> 3 段パイプライン化
+`rv_fpu_add_d` は元々 2 段 (stage0=extract/classify/swap/align/**add**->sum_q, stage1=normalize/round/assemble)。
+**両端が ~19.6-19.9ns** だったので 3 レジスタ段へ分割:
+- stage 0 (comb): extract/classify/swap/**align** (可変バレルシフト) + eff_sub 決定 -> `_s0` レジスタ。
+- stage 1 (comb): 57-bit 仮数 **add** -> `sum_q`。
+- stage 2 (comb): LZC/normalize/round/assemble -> `result_q`/`fflags_q` (出力もレジスタ化)。
+= 入力側 (align+add) と出力側 (normalize+結果mux+EX/MEM route) の両クラスタを同時に分断。`rv_fpu.sv` は
+**COMB_LAT 2->4** (comb_cnt [1:0]->[2:0])。D-FMADD 深度 = mul(T+1)->mul_d_result_q(T+2)->align(T+3)->sum_q(T+4)
+->result_q(T+5) = capture T+5。**COMB_LAT 増加は常に安全** (各 sub-unit に settle 余裕が増えるだけ、operand は
+busy 窓で ID/EX freeze)。**bit-identical (ロジック不変・レジスタ挿入のみ)**、FP-only ゆえカーネル無影響。
+
+### 24.4 検証 (全 PASS・非破壊)
+- FP ユニット: sim_fpu_d 33/33・sim_fpu 94/94・sim_fpu_pipe 7/7 (handshake/latency 検証) PASS。
+- compliance: **RV64 uf 11 + ud 12 = 23/23 PASS**。
+- full Linux NET=y: FP-only=bit-identical のため必須ゲート (`make boot-linux`) で再確認。
+- 整数経路は無改変ゆえ pipeline/intr/amo/mmu 等は step10 から不変。
+
+### 24.5 実 impl 効果 (本番 default flow = `build_zybo.tcl impl` routed setup WNS)
+| | step10 (load->branch 修正) | step11 (FMA-D 3段化) |
+|---|---|---|
+| 実 impl_1 routed WNS | +0.042ns (薄、実機 crash) | **+0.355ns (MET, 0 failing EP)** (+0.313) |
+| worst binding | FPU FMA-D (mul_d_result_q->sum_q) | **FPU 単精度加算器 (u_add: fa_q->sum_q)** |
+
+- **+0.355ns >> +0.172ns (40MHz 安定動作時のモデル slack)** = 実シリコン 50MHz で robust と期待。新 worst は
+  単精度加算器 (S は D より浅いが次に出た); 更に必要なら同型 (rv_fpu_add 3段化) で追える。
+- **教訓**: closure 判定は実 impl_1 routed WNS で行い、かつ薄マージン (+0.04 級) は実シリコンで NG = **>= ~+0.2ns
+  を目標**にする (40MHz 実機 +0.172 が経験的下限)。
+
+### 24.6 コミット範囲 (step11)
+RTL = `src/rtl/fpu/rv_fpu_add_d.sv` (3段化) + `src/rtl/fpu/rv_fpu.sv` (COMB_LAT 2->4)。ツール = `report_paths.tcl`
+(新規、routed worst path probe)。docs §24。board 50MHz 設定・firmware・ps7_init は周波数依存 (50MHz 不変) ゆえ再利用
+(bitstream のみ再生成)。
