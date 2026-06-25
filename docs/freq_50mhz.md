@@ -1248,3 +1248,52 @@ AggressiveExplore route):
   misc-D/FMA-D 第2段を step5/7 同型で段化し default 50MHz を WNS≥0 化** (`docs/next_session_prompt.md`)。step5 は misc
   出力 (`misc_*_q`)、step7 は加算器オペランド (`fa_q/fb_q/fc_q`) を登録済 → 残る compute→出力 tail を更に分割。route
   66% 支配ゆえ段化後は default+aggr 両方を impl 実測 (logic を割っても route 支配なら worst が別経路へ移るだけ; §16)。
+
+## 22. ✅ step 9 = FPU misc-D 第2段の段化 (第18セッション; `rv_fpu_misc_d.sv` を 2 段パイプライン化)
+
+§21 の default 50MHz binding (`u_muldiv/rs1_q → misc_d_result_f_q` 等 = **FCVT.D.W / FCVT.W.D の第2段組合せ
+tail**) を、step5/7 と同型の**内部レジスタ 1 段挿入**で段化した。**FPU を worst から完全除去**。
+
+### 22.1 変更 (`rv_fpu_misc_d.sv` を combinational→2 段化、`rv_fpu.sv` は clk/rst_n 結線のみ)
+`rv_fpu_misc_d` はこれまで「rv_fpu の stage A 演算子レジスタ (`fa_q/int_a_q`) → **単一組合せ cloud** →
+stage B 結果レジスタ (`misc_d_result_*_q`)」の 1 アークだった。この cloud の最長 = FCVT.D.W (int→double: 2'scomp+
+LZC64+バレルシフト+丸め+組立 → 指数ビット `result_f[56]`) と FCVT.W.D (double→int: 117bit バレルシフト+丸め+符号補正
+→ `result_i[9]`)。**内部 free-running レジスタ 1 段**で 2 ステージに分割:
+- **stage 1**: 安価 op (FSGNJ/FMINMAX/FCMP/FCLASS/FMV) 全算出、FCVT.D.W の重い部分 (mag+LZC+シフト+GRS 抽出)、
+  FCVT.W.D の special-case 検出 (nan/inf/zero/exp<0/overflow → 結果+flag を先に確定)、FCVT.S.D / FCVT.D.S 全算出。
+- **stage 2** (登録 `s1_*` から組合せ): FCVT.D.W の丸め+組立、FCVT.W.D の in-range normal (シフト+丸め+符号補正+
+  クランプ)、出力 mux。両 FCVT のバレルシフトが別ステージに分かれ各ステージ ~1 シフト分でバランス。
+- **レイテンシ中立 = COMB_LAT 不変 (=2)**: 旧 misc 経路は capture に 1 cycle slack (結果 valid T+2 / capture T+3)
+  があった。内部 1 段で結果は T+3 valid になり capture T+3 = ちょうど一致 (slack を消費)。stage A→s1→stage B の
+  3 レジスタ境界で旧 1 アークを 2 アークに分割。**rv_core 無改変・FMADD/FADD 経路 (adder) も無改変** (adder は
+  別 binding でなくなった → §22.3)。`fa_q` は busy 窓で hold される free-running ゆえ stage1 が cycle T+1 で正値を読む。
+
+### 22.2 検証 (全 PASS・非破壊)
+- ユニット: sim_fpu 94/94, sim_fpu_d 33/33, sim_fpu_pipe 7/7, sim_pipeline 19/19, sim_intr 10/10。
+- compliance FP: RV64 uf 11 + ud 12 = 23/23, RV32 uf 11 + ud 10 = 21/21 (FCVT/FMV/FCMP/FCLASS/FADD/FMADD/ldst)。
+- **full Linux NET=y**: `chars=11428` (baseline ビット一致)・HARM=0・amo_prem=0・ICMIS/HBGAP/JMP0/MIDX 0 発火・
+  pc=0x1016c (userspace idle)。FP-only ゆえ Linux はビット一致。
+
+### 22.3 実 impl 効果 (20ns default probe = `build_physopt.tcl 20.0 def`; 再 synth 後)
+| | step8 (misc-D 未段化) | step9 (misc-D 2 段化) |
+|---|---|---|
+| default post-route WNS | **-0.494ns** | **-0.203ns** (+0.291) |
+| 失敗エンドポイント | 16 | **4** |
+| TNS | -2.121ns | **-0.475ns** |
+| binding | FPU misc-D / FMA-D 第2段 | **load→branch→flush (非 FPU)** |
+
+- **FPU は top-10 worst から完全消失** (FMA-D `sum_q` 第2段 = step8 aggr binding も -0.203 以下に沈み、§19/§21 で
+  「次は adder sum_q を split」と見込んだ adder 段化は**不要**だった)。
+- post-route phys_opt 1 発で +0.089ns (MET) まで到達するが、これは default flow 外の追加ステップ。
+- **新 binding (4 EP, 全て -0.203ns, 単一経路族)**: `gen_dcache.u_dc/data_reg (D$ BRAM) → dc_c_rdata →
+  load 整形 (fpld_data_q / byte_offset / funct3 符号拡張, u_periph 領域に配置) → MEM/WB forward (fwd_rs2_data) →
+  u_branch 比較 (CARRY4×4) → branch_taken_ex → redir_eff/flush_ex → id_ex_csr_addr_reg[6]/CE`。
+  19.736ns, **logic 30% / route 70%**, 19 levels。= **同期 BRAM ロード→整形→MEM/WB フォワード→分岐解決→flush**
+  の単一サイクル経路。FPU 非依存ゆえ FPU 段化では削れない。
+- **次セッション課題 (別タスク化)**: この load→branch→flush 経路を RTL で詰める = ロード結果のレジスタ化
+  (+1 load-use レイテンシ) か branch-resolve/flush の再構成。マイクロアーキ変更ゆえ **full Linux NET=y 必須再ゲート** +
+  IPC 影響注意。route 支配 (§16) ゆえ logic 分割の利得は不確実 → 実 impl 実測必須。gap は -0.203ns / 単一経路族のみ。
+
+### 22.4 コミット範囲 (第18セッション)
+`src/rtl/fpu/rv_fpu_misc_d.sv` (2 段化) + `src/rtl/fpu/rv_fpu.sv` (u_misc_d に clk/rst_n) のみ。board 設定 (50MHz)
+は §21 で適用済 (本コミットでは RTL のみ)。実機 bring-up は load→branch 経路 closure 後。

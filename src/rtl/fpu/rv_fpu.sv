@@ -362,7 +362,15 @@ module rv_fpu
         .fpu_busy     (sqrt_d_busy)
     );
 
+    // 50MHz step 9: u_misc_d is now internally 2-stage pipelined (one free-running
+    // register splits the heavy FCVT.D.W normalize/shift and FCVT.W.D shift/round
+    // clouds -- the default-strategy 50MHz binding).  Latency-neutral: its output
+    // is now valid one cycle later (T+3 instead of T+2), which the stage-B register
+    // (misc_d_result_*_q) plus the COMB_LAT=2 capture window already accommodated
+    // (the old misc path had one cycle of capture slack).  See rv_fpu_misc_d.sv.
     rv_fpu_misc_d #(.XLEN(XLEN)) u_misc_d (
+        .clk       (clk),
+        .rst_n     (rst_n),
         .fa        (fa_q),
         .fb        (fb_q),
         .int_a     (int_a_q),
