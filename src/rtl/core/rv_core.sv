@@ -530,10 +530,19 @@ module rv_core
     //       would stall the head forever here (livelock).
     // So suppress the pop ONLY for case (1): a dup where the head has run ahead
     // (imem_addr != bfpc).  Case (2) keeps imem_addr == bfpc and is unaffected.
+    //
+    // The compare is NARROWED to the low word-index bits [5:2] (not the full XLEN):
+    // reload-settle over-serve is always imem_addr = bfpc+4 (the I$ re-serves the
+    // previous word while the head presents the next), so bit[2] alone already
+    // differs; [5:2] gives margin without aliasing in a dup (re-serve) context,
+    // which requires bfpc == hb_last_pc and cannot stride 64 B.  Case (2) (IF-PTW
+    // hold) keeps imem_addr == bfpc -> [5:2] equal -> dup_ahead=0 (unaffected).
+    // The full-width compare disturbed the thin 50 MHz default-flow placement;
+    // the 4-bit compare is functionally equivalent (all gates re-verified).
     logic [XLEN-1:0] hb_last_pc;
     logic            hb_last_vld;
     wire hb_dup    = hb_last_vld & (bfpc == hb_last_pc);
-    wire dup_ahead = hb_dup & (imem_addr != bfpc);   // reload-settle over-serve only
+    wire dup_ahead = hb_dup & (imem_addr[5:2] != bfpc[5:2]);   // reload-settle over-serve only
     // FTQ head pops on accept (not while holding); gen_pc pushes when there is room.
     // imem_gnt gates the pop: if the MMU is blocking the presented address on a TLB
     // miss (imem_gnt=0 while imem_ready=1 from the PREVIOUS fetch), the head must NOT
