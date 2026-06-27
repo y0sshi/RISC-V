@@ -87,6 +87,48 @@ module rv_axi_dualport_mem_bfm #(
 
     logic [7:0] mem_b [0:DEPTH-1];
 
+    // =========================================================================
+    // Optional per-transaction VARIABLE latency (BFM_RANDLAT): model the real
+    // board, where the instruction master, the data master and the write channel
+    // each see a DIFFERENT, transaction-dependent DDR/SmartConnect latency.  The
+    // default fixed shared ar_delay/r_delay make BOTH read ports respond with the
+    // SAME latency, so the IF fill and the data/PTW responses are PHASE-LOCKED --
+    // they cannot interleave at arbitrary phases the way real concurrent masters
+    // do.  Three INDEPENDENT LFSR streams (one per channel) de-phase the ports so
+    // the I$-fill-vs-PTW corner the step-8 block fetch hits on hardware is
+    // exercised.  Deterministic per BFM_SEED (repeatable repro).  Strict no-op
+    // when undefined (lat == the fixed input delay).
+    //   lat = base_delay + (lfsr % (BFM_RAND_SPREAD+1))
+`ifndef BFM_RAND_SPREAD
+  `define BFM_RAND_SPREAD 24
+`endif
+`ifndef BFM_SEED
+  `define BFM_SEED 1
+`endif
+    logic [15:0] lfsr_ir, lfsr_dr, lfsr_dw;
+    function automatic [15:0] lfsr_nxt(input [15:0] s);
+        // x^16 + x^14 + x^13 + x^11 + 1 (maximal-length, never all-zero seed)
+        return {s[14:0], s[15]^s[13]^s[12]^s[10]};
+    endfunction
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            lfsr_ir <= 16'(`BFM_SEED) ^ 16'hBEEF;
+            lfsr_dr <= 16'(`BFM_SEED) ^ 16'h1234;
+            lfsr_dw <= 16'(`BFM_SEED) ^ 16'hA5A5;
+        end else begin
+            lfsr_ir <= lfsr_nxt(lfsr_ir);
+            lfsr_dr <= lfsr_nxt(lfsr_dr);
+            lfsr_dw <= lfsr_nxt(lfsr_dw);
+        end
+    end
+    function automatic [7:0] rand_lat(input [7:0] base, input [15:0] s);
+`ifdef BFM_RANDLAT
+        return base + 8'(s % 16'(`BFM_RAND_SPREAD + 1));
+`else
+        return base;
+`endif
+    endfunction
+
     initial begin
         for (int k = 0; k < DEPTH; k++) mem_b[k] = 8'h0;
         if (INIT_FILE != "")
@@ -121,8 +163,8 @@ module rv_axi_dualport_mem_bfm #(
             d_rstate<=R_IDLE; d_rcnt<='0; d_rlen_q<='0; d_rbeat<='0;
             d_raddr_q<='0; d_rid_q<='0; d_rdata<='0;
         end else case (d_rstate)
-            R_IDLE:   if (ser_grant_dr) begin d_raddr_q<=d_araddr; d_rid_q<=d_arid; d_rlen_q<=d_arlen; d_rcnt<=ar_delay; d_rstate<=R_ARWAIT; end
-            R_ARWAIT: if (d_rcnt==0) begin d_rcnt<=r_delay; d_rbeat<=0; d_rstate<=R_LAT; end else d_rcnt<=d_rcnt-8'd1;
+            R_IDLE:   if (ser_grant_dr) begin d_raddr_q<=d_araddr; d_rid_q<=d_arid; d_rlen_q<=d_arlen; d_rcnt<=rand_lat(ar_delay,lfsr_dr); d_rstate<=R_ARWAIT; end
+            R_ARWAIT: if (d_rcnt==0) begin d_rcnt<=rand_lat(r_delay,lfsr_dr); d_rbeat<=0; d_rstate<=R_LAT; end else d_rcnt<=d_rcnt-8'd1;
             R_LAT:    if (d_rcnt==0) begin d_rdata<=d_beat_rd(8'd0); d_rstate<=R_DATA; end else d_rcnt<=d_rcnt-8'd1;
             R_DATA:   if (d_rready) begin
                           if (d_rbeat==d_rlen_q) d_rstate<=R_IDLE;
@@ -156,12 +198,12 @@ module rv_axi_dualport_mem_bfm #(
         if (!rst_n) begin
             d_wstate<=W_IDLE; d_wcnt<='0; d_waddr_q<='0; d_wid_q<='0;
         end else case (d_wstate)
-            W_IDLE:   if (ser_grant_dw) begin d_waddr_q<=d_awaddr; d_wid_q<=d_awid; d_wcnt<=aw_delay; d_wstate<=W_AWWAIT; end
-            W_AWWAIT: if (d_wcnt==0) begin d_wcnt<=w_delay; d_wstate<=W_WWAIT; end else d_wcnt<=d_wcnt-8'd1;
+            W_IDLE:   if (ser_grant_dw) begin d_waddr_q<=d_awaddr; d_wid_q<=d_awid; d_wcnt<=rand_lat(aw_delay,lfsr_dw); d_wstate<=W_AWWAIT; end
+            W_AWWAIT: if (d_wcnt==0) begin d_wcnt<=rand_lat(w_delay,lfsr_dw); d_wstate<=W_WWAIT; end else d_wcnt<=d_wcnt-8'd1;
             W_WWAIT:  if (d_wcnt==0) begin
                           if (d_wvalid) begin
                               for (int i=0;i<DNB;i++) if (d_wstrb[i]) mem_b[base_off(d_waddr_q,1'b1,DNB)+i] <= d_wdata[i*8 +: 8];
-                              d_wcnt<=b_delay; d_wstate<=W_LAT;
+                              d_wcnt<=rand_lat(b_delay,lfsr_dw); d_wstate<=W_LAT;
 `ifdef BFM_STORE_HASH
                               // Differential store trace: cumulative hash over the
                               // (addr,strobe,data) write SEQUENCE, printed every N
@@ -252,8 +294,8 @@ module rv_axi_dualport_mem_bfm #(
             i_rstate<=R_IDLE; i_rcnt<='0; i_rlen_q<='0; i_rbeat<='0;
             i_raddr_q<='0; i_rid_q<='0; i_rdata<='0;
         end else case (i_rstate)
-            R_IDLE:   if (ser_grant_ir) begin i_raddr_q<=i_araddr; i_rid_q<=i_arid; i_rlen_q<=i_arlen; i_rcnt<=ar_delay; i_rstate<=R_ARWAIT; end
-            R_ARWAIT: if (i_rcnt==0) begin i_rcnt<=r_delay; i_rbeat<=0; i_rstate<=R_LAT; end else i_rcnt<=i_rcnt-8'd1;
+            R_IDLE:   if (ser_grant_ir) begin i_raddr_q<=i_araddr; i_rid_q<=i_arid; i_rlen_q<=i_arlen; i_rcnt<=rand_lat(ar_delay,lfsr_ir); i_rstate<=R_ARWAIT; end
+            R_ARWAIT: if (i_rcnt==0) begin i_rcnt<=rand_lat(r_delay,lfsr_ir); i_rbeat<=0; i_rstate<=R_LAT; end else i_rcnt<=i_rcnt-8'd1;
             R_LAT:    if (i_rcnt==0) begin i_rdata<=i_beat_rd(8'd0); i_rstate<=R_DATA; end else i_rcnt<=i_rcnt-8'd1;
             R_DATA:   if (i_rready) begin
                           if (i_rbeat==i_rlen_q) i_rstate<=R_IDLE;

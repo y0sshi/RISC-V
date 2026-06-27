@@ -666,6 +666,9 @@ endif
 ifneq ($(BOOT_DCWIN),)
 BOOT_TRACE_FLAG += -DBOOT_DCWIN=$(BOOT_DCWIN)
 endif
+ifneq ($(BOOT_FETCHWIN),)
+BOOT_TRACE_FLAG += -DBOOT_FETCHWIN=$(BOOT_FETCHWIN)
+endif
 ifneq ($(BOOT_CTRPROBE),)
 BOOT_TRACE_FLAG += -DBOOT_CTRPROBE
 endif
@@ -702,6 +705,44 @@ endif
 # real-HW difference the parallel-port BFM cannot show -- is exercised.
 ifneq ($(BOOT_SERIALIZE),)
 BOOT_DBG_FLAG += -DBFM_SERIALIZE
+endif
+# Per-transaction VARIABLE BFM latency: de-phase the IF / data / write ports with
+# independent LFSR streams so the I$-fill-vs-PTW interleavings real concurrent
+# masters produce (and the step-8 block fetch hits on hardware) are exercised.
+# BOOT_RANDLAT=1 enables; BOOT_SEED=<n> picks the stream; BOOT_RAND_SPREAD=<n> the
+# max extra cycles.  Deterministic per seed.  e.g.
+#   make vl_boot BOOT_HEX=... BOOT_RANDLAT=1 BOOT_SEED=3
+ifneq ($(BOOT_RANDLAT),)
+BOOT_DBG_FLAG += -DBFM_RANDLAT
+endif
+# Differential store-sequence hash, standalone (no full BOOT_TRACE).  Prints
+# [STHASH] every 20000 memory-changing kernel-VA-valued stores BY INDEX, which is
+# latency-INDEPENDENT -- so a baseline run and a randlat run agree until the first
+# corrupting/squashed store, localizing the bug.  BOOT_STLO=<n> dumps detailed
+# [ST] lines around index n.
+ifneq ($(BOOT_STOREHASH),)
+BOOT_DBG_FLAG += -DBFM_STORE_HASH
+endif
+# Divide-result golden check (muldiv retire vs software /,%): catches a divide that
+# retires with a wrong/stale result -- the #14 muldiv-timing class, UNCHECKED by the
+# load/store/forward detectors.  Standalone (was only under BOOT_TRACE before).
+ifneq ($(BOOT_DIVCHK),)
+BOOT_DBG_FLAG += -DBOOT_DIVCHK
+endif
+# ISS co-sim: independent integer shadow regfile, checks the core's forwarded
+# operands against the architecturally-correct value at each EX-commit (catches a
+# wrong-forward / wrong-register-value the other detectors miss).  [ISS] line = bug.
+ifneq ($(BOOT_ISS),)
+BOOT_DBG_FLAG += -DBOOT_ISS
+endif
+ifneq ($(BOOT_STLO),)
+BOOT_DBG_FLAG += -DSTLO=$(BOOT_STLO)
+endif
+ifneq ($(BOOT_SEED),)
+BOOT_DBG_FLAG += -DBFM_SEED=$(BOOT_SEED)
+endif
+ifneq ($(BOOT_RAND_SPREAD),)
+BOOT_DBG_FLAG += -DBFM_RAND_SPREAD=$(BOOT_RAND_SPREAD)
 endif
 ifneq ($(BOOT_ICACHE_SETS),)
 BOOT_DBG_FLAG += -DBOOT_ICACHE_SETS=$(BOOT_ICACHE_SETS)
