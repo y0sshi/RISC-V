@@ -515,6 +515,25 @@ module rv_core
     end
     assign imem_req = 1'b1;
 
+    // hb_dup: the served word repeats the last pushed word's byte-PC.  Two causes:
+    //   (1) redirect-reload SETTLE -- the redirect target is presented for an extra
+    //       cycle (redir_pend_q hold + the ftq[0] reload both drive imem_addr=target),
+    //       so the I$ serves it once MORE than it is pushed.  Here the FTQ head has
+    //       already advanced (imem_addr = head = target+4 != bfpc = target), so a pop
+    //       on this dup runs the head one word ahead of the served/pushed stream; that
+    //       stale lead later skips a served-but-unpushed word when a full-buffer hold
+    //       releases -> the next word inherits the skipped word's bfpc tag = 4-byte
+    //       fetch skid (the step-8 path_parentat crash; cache_soc uncached repro).
+    //   (2) IF-PTW hold -- imem_gnt=0 pins the head ON the committed word (imem_addr =
+    //       head = bfpc); when the walk finishes the head MUST advance even though the
+    //       I$ is still re-serving that same word.  Gating the pop with plain ~hb_dup
+    //       would stall the head forever here (livelock).
+    // So suppress the pop ONLY for case (1): a dup where the head has run ahead
+    // (imem_addr != bfpc).  Case (2) keeps imem_addr == bfpc and is unaffected.
+    logic [XLEN-1:0] hb_last_pc;
+    logic            hb_last_vld;
+    wire hb_dup    = hb_last_vld & (bfpc == hb_last_pc);
+    wire dup_ahead = hb_dup & (imem_addr != bfpc);   // reload-settle over-serve only
     // FTQ head pops on accept (not while holding); gen_pc pushes when there is room.
     // imem_gnt gates the pop: if the MMU is blocking the presented address on a TLB
     // miss (imem_gnt=0 while imem_ready=1 from the PREVIOUS fetch), the head must NOT
@@ -522,7 +541,7 @@ module rv_core
     // re-fetched) instead of being skipped while the next word is fetched and
     // mis-tagged.  This also keeps if_fault non-speculative (the head holds the
     // committed faulting address rather than running ahead into speculative faults).
-    wire ftq_pop  = imem_ready & imem_gnt & ~ftq_reload & ~redir_pend_q & ~fetch_hold & ~ftq_empty;
+    wire ftq_pop  = imem_ready & imem_gnt & ~ftq_reload & ~redir_pend_q & ~fetch_hold & ~ftq_empty & ~dup_ahead;
     wire ftq_push = ~ftq_full  & ~ftq_reload & ~redir_pend_q;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -601,9 +620,6 @@ module rv_core
     // (PC strictly advances), and a redirect flushes the buffer (hb_last_vld<=0), so
     // "skip a push whose bfpc equals the immediately preceding pushed PC" drops only
     // such duplicates -- a structural no-op on the I$ path (bfpc always advances).
-    logic [XLEN-1:0] hb_last_pc;
-    logic            hb_last_vld;
-    wire hb_dup   = hb_last_vld & (bfpc == hb_last_pc);
     wire hb_flush = redir_eff;
     wire hb_push  = imem_ready & ~redir_eff & ~redirect_stall & ~hb_full & ~hb_dup;
     wire hb_pop   = ~stall_id & align_valid;
