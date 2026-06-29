@@ -119,7 +119,62 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello boot boot_lo stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test ptw_amo_test
+.PHONY: hello sim_hello boot boot_lo stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test ptw_amo_test skid_redirect_test skid_ptw_test skid_ptwfault_test
+
+# ----- skid_ptwfault_test: redirect to a mod4==2 target that page-faults first
+# The faithful repro: an instruction page fault on a mid-word redirect target,
+# then a re-fetch after the handler maps the page, loses skip_low.  See memory
+# userspace-compiled-binary-bug.
+#   make skid_ptwfault_test  &&  (cd ../sim && rm -rf out/vl_boot && make vl_boot \
+#     BOOT_HEX=../software/boot/skid_ptwfault_test.hex BOOT_MAX=2000000)
+skid_ptwfault_test: boot/skid_ptwfault_test.hex
+
+boot/skid_ptwfault_test.elf: boot/skid_ptwfault_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr_zifencei -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/skid_ptwfault_test.S -o boot/skid_ptwfault_test.elf
+
+boot/skid_ptwfault_test.hex: boot/skid_ptwfault_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/skid_ptwfault_test.elf boot/skid_ptwfault_test.hex
+	@echo "  skid_ptwfault_test hex: $@"
+
+# ----- skid_redirect_test: trap-return (mret) to a mod4==2 target ------------
+# Reproducer for the userspace-compiled-binary bug: the step8 fetch skip_low
+# (drop the leading halfword of the first post-redirect word for a mid-word
+# target) is lost on a multi-cycle target fetch, so a redirect to a 2-byte-
+# aligned PC executes the halfword 2 bytes early.  c.ebreak sits at target-2;
+# a skid traps -> FAIL, correct skip_low -> DONE.  See memory
+# userspace-compiled-binary-bug.
+#   make skid_redirect_test  &&  (cd ../sim && rm -rf out/vl_boot && make vl_boot \
+#     BOOT_HEX=../software/boot/skid_redirect_test.hex BOOT_MAX=2000000)
+skid_redirect_test: boot/skid_redirect_test.hex
+
+boot/skid_redirect_test.elf: boot/skid_redirect_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr_zifencei -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/skid_redirect_test.S -o boot/skid_redirect_test.elf
+
+boot/skid_redirect_test.hex: boot/skid_redirect_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/skid_redirect_test.elf boot/skid_redirect_test.hex
+	@echo "  skid_redirect_test hex: $@"
+
+# ----- skid_ptw_test: redirect to a mod4==2 target whose fetch IF-PTWs --------
+# The MMU variant of skid_redirect_test (which PASSes): a cold-TLB IF-PTW on a
+# mid-word redirect target is the trigger that loses skip_low (a plain I$ miss is
+# not).  Mirrors Linux's first sret to a musl entry at mod4==2.  See memory
+# userspace-compiled-binary-bug.
+#   make skid_ptw_test  &&  (cd ../sim && rm -rf out/vl_boot && make vl_boot \
+#     BOOT_HEX=../software/boot/skid_ptw_test.hex BOOT_MAX=2000000)
+skid_ptw_test: boot/skid_ptw_test.hex
+
+boot/skid_ptw_test.elf: boot/skid_ptw_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr_zifencei -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/skid_ptw_test.S -o boot/skid_ptw_test.elf
+
+boot/skid_ptw_test.hex: boot/skid_ptw_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/skid_ptw_test.elf boot/skid_ptw_test.hex
+	@echo "  skid_ptw_test hex: $@"
 
 # ----- ptw_amo_test: AMO write-loss when an IF-PTW masks the D$ wait -----
 # Focused reproducer for the real-HW netlink atomic_dec loss (rv_soc.sv:364

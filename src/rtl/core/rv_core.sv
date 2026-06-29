@@ -707,7 +707,17 @@ module rv_core
                 ifpf_pend <= 1'b0;
             end else if (if_fault && ~redir_eff && ~ifpf_pend) begin
                 ifpf_pend    <= 1'b1;                   // capture (incl. PTW_FAULT transient)
-                ifpf_pc_pend <= imem_addr;              // = the committed faulting VA (held by imem_gnt)
+                // The faulting INSTRUCTION's VA, not just its word: a mid-word
+                // redirect target (skip_low_q=1, target[1]==1) faults on its
+                // word-aligned first fetch (imem_addr = target & ~3), but the
+                // architectural faulting PC is the target = imem_addr + 2.  Saving
+                // the bare imem_addr made the trap handler return 2 bytes early and
+                // execute the low halfword -- e.g. a userspace ELF entry at
+                // mod4==2 (musl 0x101be) demand-page-faulted, then re-entered at
+                // 0x101bc = c.ebreak -> SIGTRAP -> init killed.  skip_low_q is
+                // still pending here (the faulting word never pushed), so it marks
+                // exactly the mid-word-target-fault case.
+                ifpf_pc_pend <= imem_addr | (skip_low_q ? XLEN'(2) : XLEN'(0));
             end
         end
     end
