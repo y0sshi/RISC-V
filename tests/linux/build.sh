@@ -31,21 +31,44 @@ NPROC=$(nproc)
 FW_BASE=${FW_BASE:-0x80000000}
 OUT=${OUT:-fw_payload_linux}
 
+# ROOTFS selects what userspace the kernel embeds as its initramfs:
+#   minimal   - the freestanding static init.c (proves kernel->userspace; P0-5).
+#   buildroot - a real RV64GC glibc rootfs with bash, built separately by
+#               `make rootfs-buildroot` (build_rootfs.sh) into
+#               work/buildroot-rootfs.cpio.  Embedding only; no Buildroot build
+#               happens here (that runs in its own docker to avoid nesting).
+ROOTFS=${ROOTFS:-minimal}
+
 OPENSBI=$HERE/../opensbi/work/opensbi          # reuse the cloned v1.2 tree
 DTS=${DTS:-$HERE/rv_soc_linux.dts}
 
-echo "== [1/6] static init + initramfs listing =="
-# Freestanding (no target libc needed): raw write() via ecall, custom _start.
-${XK}gcc -static -nostdlib -ffreestanding -Os -o $W/init $HERE/init.c
-${XK}strip $W/init
-cat > $W/initramfs.list <<EOF
+echo "== [1/6] initramfs source (ROOTFS=$ROOTFS) =="
+if [ "$ROOTFS" = "buildroot" ]; then
+    INITRAMFS_SRC=$W/buildroot-rootfs.cpio
+    if [ ! -f "$INITRAMFS_SRC" ]; then
+        echo "ERROR: $INITRAMFS_SRC not found."
+        echo "       Build it first:  make image-buildroot && make rootfs-buildroot"
+        exit 1
+    fi
+    echo "   rootfs.cpio: $(stat -c %s $INITRAMFS_SRC) bytes (Buildroot glibc + bash)"
+else
+    # Freestanding (no target libc needed): raw write() via ecall, custom _start.
+    ${XK}gcc -static -nostdlib -ffreestanding -Os -o $W/init $HERE/init.c
+    ${XK}strip $W/init
+    cat > $W/initramfs.list <<EOF
 dir /dev 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
 nod /dev/null 0666 0 0 c 1 3
 dir /bin 0755 0 0
 file /init $W/init 0755 0 0
 EOF
-echo "   init: $(stat -c %s $W/init) bytes"
+    INITRAMFS_SRC=$W/initramfs.list
+    echo "   init: $(stat -c %s $W/init) bytes"
+fi
+# One-line fragment carrying the selected initramfs source, merged on top of the
+# static kernel_fragment.config so the path is not hard-coded there.  Reused by
+# the configure step (a change here forces reconfigure + Image rebuild below).
+echo "CONFIG_INITRAMFS_SOURCE=\"$INITRAMFS_SRC\"" > $W/gen_initramfs.config
 
 echo "== [2/6] Linux source v$KVER =="
 if [ "${FORCE_DL:-0}" = "1" ]; then rm -f $W/linux-$KVER.tar.xz; rm -rf $KDIR; fi
@@ -61,15 +84,23 @@ fi
 echo "   kernel src: $KDIR"
 
 echo "== [3/6] configure (defconfig + fragment) =="
-if [ "${FORCE_KERNEL:-0}" = "1" ] || [ ! -f $KDIR/.config ]; then
+# Reconfigure on FORCE_KERNEL, a missing .config, or an initramfs-source switch
+# (e.g. ROOTFS=minimal<->buildroot) so the embedded rootfs actually changes.
+WANT_SRC="CONFIG_INITRAMFS_SOURCE=\"$INITRAMFS_SRC\""
+HAVE_SRC=$(grep -h '^CONFIG_INITRAMFS_SOURCE=' $KDIR/.config 2>/dev/null || true)
+if [ "${FORCE_KERNEL:-0}" = "1" ] || [ ! -f $KDIR/.config ] || [ "$HAVE_SRC" != "$WANT_SRC" ]; then
     make -C $KDIR ARCH=riscv CROSS_COMPILE=$XK defconfig
     $KDIR/scripts/kconfig/merge_config.sh -m -O $KDIR \
-        $KDIR/.config $HERE/kernel_fragment.config
+        $KDIR/.config $HERE/kernel_fragment.config $W/gen_initramfs.config
     make -C $KDIR ARCH=riscv CROSS_COMPILE=$XK olddefconfig
+    NEED_IMAGE=1
 fi
 
 echo "== [4/6] build Image =="
-if [ "${FORCE_KERNEL:-0}" = "1" ] || [ ! -f $KDIR/arch/riscv/boot/Image ]; then
+# Rebuild when reconfigured, when forced, when missing, or when the initramfs
+# payload is newer than the last Image (the cpio is embedded INTO the Image).
+if [ "${FORCE_KERNEL:-0}" = "1" ] || [ "${NEED_IMAGE:-0}" = "1" ] || \
+   [ ! -f $KDIR/arch/riscv/boot/Image ] || [ "$INITRAMFS_SRC" -nt $KDIR/arch/riscv/boot/Image ]; then
     make -C $KDIR ARCH=riscv CROSS_COMPILE=$XK -j$NPROC Image
 fi
 cp $KDIR/arch/riscv/boot/Image $W/Image

@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.5
+########################################
+# Buildroot host-build image for the RV64GC rootfs (Linux roadmap (3): RootFS).
+#
+# Buildroot compiles its OWN cross toolchain (glibc) + target packages (bash,
+# busybox, ...), so the host side only needs a native C/C++ toolchain plus the
+# usual Buildroot host deps (rsync/file/unzip/bzip2/perl/python3/...).  This is a
+# SEPARATE image from linux-rv64 (the kernel/OpenSBI image) so the kernel build
+# environment stays minimal and is not polluted by Buildroot's host deps.
+#
+# Build:  docker build -t buildroot-rv64:latest -f Dockerfile.buildroot .
+# Used by: `make rootfs-buildroot` -> tests/linux/build_rootfs.sh
+#   (produces tests/linux/work/buildroot-rootfs.cpio, embedded by build.sh into
+#    the kernel Image via CONFIG_INITRAMFS_SOURCE).
+########################################
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Buildroot mandatory + recommended host packages (see Buildroot manual
+# "System requirements").  g++/perl/rsync/file/unzip/bzip2/cpio are the ones the
+# minimal linux-rv64 image lacks.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential g++ \
+    make gcc perl python3 \
+    rsync file unzip bzip2 cpio xz-utils gzip \
+    wget git ca-certificates \
+    bc sed gawk diffutils findutils which patch \
+    libncurses-dev locales && \
+    rm -rf /var/lib/apt/lists/*
+
+# Buildroot runs target-package ./configure scripts; autoconf refuses to run as
+# root unless FORCE_UNSAFE_CONFIGURE=1.  The build itself runs as root inside the
+# container (matching every other docker step in this repo); build_rootfs.sh
+# exports the escape hatch.
+ENV FORCE_UNSAFE_CONFIGURE=1
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

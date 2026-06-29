@@ -24,6 +24,8 @@ REPO         := $(patsubst %/,%,$(MAKEFILE_DIR))
 # gitignored work dirs cloned at a fixed ref -- see `make deps`).
 OPENSBI_REF   := v1.2
 OPENSBI_URL   := https://github.com/riscv-software-src/opensbi.git
+BUILDROOT_REF := 2025.02.15
+BUILDROOT_URL := https://github.com/buildroot/buildroot.git
 
 # Docker images.  `make images` (below) builds these in dependency order;
 # riscv_act is layered FROM iverilog (see tests/compliance/Dockerfile).
@@ -33,6 +35,7 @@ IMG_ACT       := riscv_act:latest
 IMG_GCC       := riscv_gcc:latest
 IMG_RISCOF    := riscof_run:latest
 IMG_LINUX     := linux-rv64:latest
+IMG_BUILDROOT := buildroot-rv64:latest
 
 # Re-linked real-HW firmware base (PS DDR, 2 MiB aligned) and device trees.
 HW_BASE       := 0x00200000
@@ -112,6 +115,10 @@ images:
 	cd tests/compliance && docker build -t $(IMG_ACT) .
 	cd src/software     && docker build -t $(IMG_GCC) .
 	cd tests/linux      && docker build -t $(IMG_LINUX) .
+
+.PHONY: image-buildroot
+image-buildroot:
+	cd tests/linux      && docker build -t $(IMG_BUILDROOT) -f Dockerfile.buildroot .
 	@echo "images built: $(IMG_IVERILOG) $(IMG_VERILATOR) $(IMG_ACT) $(IMG_GCC) $(IMG_LINUX)"
 
 # -----------------------------------------------------------------------------
@@ -133,18 +140,34 @@ fw-opensbi-hw:
 	   tests/opensbi/work/fw_payload_hw.elf
 	@echo "stashed tests/opensbi/work/fw_payload_hw.elf (entry 0x200000, for JTAG dow)"
 
+# Buildroot RV64GC glibc rootfs (bash) -> work/buildroot-rootfs.cpio, which
+# fw-linux* embed via ROOTFS=buildroot.  Runs in its own docker (buildroot-rv64);
+# first run compiles a glibc toolchain (~30-60 min), then it is idempotent.
+# FORCE_ROOTFS=1 re-runs the Buildroot build (after editing the defconfig/overlay).
+# The build tree lives in a NATIVE docker volume (rv_buildroot_cache:/br), NOT on
+# the Windows bind mount -- glibc's massive parallel build corrupts on 9p/virtiofs
+# (see build_rootfs.sh).  The volume also caches the toolchain across runs.
+.PHONY: rootfs-buildroot
+rootfs-buildroot:
+	docker run --rm -v $(REPO):/workspace -v rv_buildroot_cache:/br \
+	    -w /workspace/tests/linux $(IMG_BUILDROOT) bash -c \
+	    "tr -d '\015' < build_rootfs.sh | BR_BUILD_DIR=/br BUILDROOT_REF=$(BUILDROOT_REF) BUILDROOT_URL=$(BUILDROOT_URL) FORCE_ROOTFS=$(FORCE_ROOTFS) FORCE_DL=$(FORCE_DL) bash -s"
+
 # Linux build.sh is checked out CRLF -> strip CR before piping to bash.
+# ROOTFS=buildroot embeds work/buildroot-rootfs.cpio (run `make rootfs-buildroot`
+# first); default ROOTFS=minimal keeps the static-init P0-5 image.
 .PHONY: fw-linux fw-linux-lo fw-linux-hw
 fw-linux:
-	$(DRUN) -w /workspace/tests/linux $(IMG_LINUX) bash -c "tr -d '\015' < build.sh | bash -s"
+	$(DRUN) -w /workspace/tests/linux $(IMG_LINUX) bash -c \
+	    "tr -d '\015' < build.sh | ROOTFS=$(ROOTFS) FORCE_KERNEL=$(FORCE_KERNEL) bash -s"
 
 fw-linux-lo:
 	$(DRUN) -w /workspace/tests/linux $(IMG_LINUX) bash -c \
-	    "tr -d '\015' < build.sh | FW_BASE=$(HW_BASE) DTS=/workspace/tests/linux/rv_soc_linux_lo.dts OUT=fw_payload_linux_lo bash -s"
+	    "tr -d '\015' < build.sh | ROOTFS=$(ROOTFS) FW_BASE=$(HW_BASE) DTS=/workspace/tests/linux/rv_soc_linux_lo.dts OUT=fw_payload_linux_lo bash -s"
 
 fw-linux-hw:
 	$(DRUN) -w /workspace/tests/linux $(IMG_LINUX) bash -c \
-	    "tr -d '\015' < build.sh | FORCE_KERNEL=$(FORCE_KERNEL) FW_BASE=$(HW_BASE) DTS=$(DTS_LINUX_HW) OUT=fw_payload_linux_hw bash -s"
+	    "tr -d '\015' < build.sh | ROOTFS=$(ROOTFS) FORCE_KERNEL=$(FORCE_KERNEL) FW_BASE=$(HW_BASE) DTS=$(DTS_LINUX_HW) OUT=fw_payload_linux_hw bash -s"
 	cp tests/opensbi/work/opensbi/build/platform/generic/firmware/fw_payload.elf \
 	   tests/linux/work/fw_payload_linux_hw.elf
 	@echo "stashed tests/linux/work/fw_payload_linux_hw.elf (entry 0x200000, for JTAG dow)"

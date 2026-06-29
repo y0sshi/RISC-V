@@ -1,0 +1,58 @@
+# Buildroot defconfig for the RV64GC rv_soc rootfs (Linux roadmap (3)).
+#
+# Minimal glibc rootfs with bash, output as an initramfs cpio that build.sh
+# embeds into the kernel Image (CONFIG_INITRAMFS_SOURCE).  No kernel/bootloader
+# from Buildroot -- the Linux Image + OpenSBI fw_payload are built separately by
+# tests/linux/build.sh.
+#
+# Apply with:  make BR2_DEFCONFIG=/workspace/tests/linux/buildroot_rvsoc_defconfig defconfig
+# (see tests/linux/build_rootfs.sh).
+
+# --- Target: RISC-V 64-bit, G+C (IMAFDC), lp64d ABI (matches the core) ---
+BR2_riscv=y
+BR2_RISCV_64=y
+BR2_RISCV_ISA_RVM=y
+BR2_RISCV_ISA_RVA=y
+BR2_RISCV_ISA_RVF=y
+BR2_RISCV_ISA_RVD=y
+BR2_RISCV_ISA_RVC=y
+
+# --- Toolchain: Buildroot-internal musl, FULLY STATIC ---
+# Why musl + static (not glibc): the glibc dynamic-loader path (ld.so + libc.so.6)
+# was the FIRST dynamically-linked code ever run on this core (the static init.c
+# and the real-HW userspace milestone never exercised it) and it hangs in a tight
+# ld.so/glibc spin in the sv39 mmap region -- ld.so's LR/SC + AMO locks fit this
+# core's known variable-latency atomic/LR-SC livelock family (#15/#16/netlink).
+# Buildroot only allows fully-static (BR2_STATIC_LIBS) with a NON-glibc libc
+# (BR2_STATIC_LIBS depends on !BR2_TOOLCHAIN_USES_GLIBC).  musl is the standard,
+# robust, small choice for an embedded bring-up rootfs: static binaries map at
+# their fixed link address with no runtime loader, sidestepping the hang.  The
+# glibc dynamic-loader hang is tracked separately as an RTL atomic investigation.
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+BR2_STATIC_LIBS=y
+
+# --- Init: busybox (systemd is far too heavy for a 50 MHz single-hart core) ---
+BR2_INIT_BUSYBOX=y
+
+# --- Console / login on ttyS0 (our NS16550 UART) ---
+# getty -n -l /bin/bash skips login and drops straight into bash on the serial
+# console (ideal for bring-up; the empty root password below also allows login).
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
+BR2_TARGET_GENERIC_GETTY_BAUDRATE_57600=y
+BR2_TARGET_GENERIC_GETTY_OPTIONS="-n -l /bin/bash"
+BR2_TARGET_GENERIC_ROOT_PASSWD=""
+
+# --- The real bash (goal of this milestone) ---
+# busybox already provides a shell, so Buildroot hides full shells (bash/zsh/...)
+# behind BR2_PACKAGE_BUSYBOX_SHOW_OTHERS -- without it BR2_PACKAGE_BASH is
+# silently dropped by `make defconfig` and bash never gets built/installed.
+BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+BR2_PACKAGE_BASH=y
+
+# --- rootfs: initramfs cpio (RAM only; the core has no block storage) ---
+# Leave it uncompressed; the kernel re-compresses via CONFIG_RD_GZIP.
+BR2_TARGET_ROOTFS_CPIO=y
+
+# --- Overlay (sim sentinel init script) + post-build (root shell -> bash) ---
+BR2_ROOTFS_OVERLAY="/workspace/tests/linux/rootfs_overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="/workspace/tests/linux/rootfs_post_build.sh"
