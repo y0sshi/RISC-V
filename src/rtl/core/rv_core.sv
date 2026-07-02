@@ -2027,7 +2027,7 @@ module rv_core
             mem_wb_fpu_result_i   <= '0;
             mal_active_wb         <= 1'b0;
             mem_wb_fresh          <= 1'b0;
-        end else if (amo_stall || mal_stall || dmem_wait || mem_stall) begin
+        end else if (amo_stall || mal_stall || dmem_wait || mem_stall || mem_trap_enter) begin
             // AMO read phase / misaligned (incl. RV32 64-bit FLD/FSD) phase 0 /
             // data access in flight (dmem_wait) / data translation pending
             // (mem_stall: the access has not even been issued -- capturing here
@@ -2039,6 +2039,22 @@ module rv_core
             // stale live dmem_rdata, corrupting it — and double-count retire.  The
             // in-progress AMO/mal/data instruction is still held in EX/MEM and is
             // captured normally when the stall drops (phase 1 / write / data-ready).
+            // mem_trap_enter (4th-bug fix): the load/store currently in EX/MEM
+            // (about to advance) is ITSELF the faulting access (mem_trap_enter =
+            // ex_mem_valid && (mem_read|mem_write) && mem_fault).  Without this
+            // term, mem_wb_valid/mem_wb_ctrl below capture it unconditionally
+            // (flush_ex_mem only discards what NEXT enters ex_mem, it does not
+            // retroactively squash what mem_wb reads THIS edge), so a load with
+            // its destination register equal to its own base register (e.g. the
+            // extremely common `lw a4,0(a4)` / `lbu a1,0(a1)` pointer-chase
+            // idiom) retires ONE CYCLE LATER with whatever garbage dmem_rdata the
+            // faulting access produced, corrupting that register before the CPU
+            // ever reaches the trap handler (confirmed via BOOT_A4TRACE
+            // A4POSTWATCH: x14 written with garbage exactly 1 cycle after
+            // mem_trap_enter, at the faulting instruction's own PC).  No-op when
+            // vm is off (mem_fault stays 0) or the fault is on a NON-destination
+            // store (mem_wb_ctrl.reg_write is 0 already, so bubbling changes
+            // nothing observable).
             mem_wb_ctrl   <= '0;
             mem_wb_valid  <= 1'b0;
             mal_active_wb <= 1'b0;

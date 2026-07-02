@@ -634,6 +634,16 @@ ifneq ($(BOOT_MTIME_INSTR),)
 BOOT_MTIME_FLAG += -DMTIME_INSTR
 endif
 
+# 4th-bug (a4 save/restore corruption) detector.  STANDALONE (not under BOOT_TRACE)
+# so the model stays small enough to build on the Windows bind mount.  Prints
+# [A4SAVE]/[A4REST]/[A4REST-LD] and flags **A4CORRUPT-*** at the corrupting trap
+# round-trip.  make vl_boot ... BOOT_A4TRACE=1
+ifneq ($(BOOT_A4TRACE),)
+BOOT_A4TRACE_FLAG = -DBOOT_A4TRACE
+else
+BOOT_A4TRACE_FLAG =
+endif
+
 # Optional: -DBOOT_TRACE early divergence trace (make sim_boot BOOT_TRACE=1)
 ifneq ($(BOOT_TRACE),)
 BOOT_TRACE_FLAG = -DBOOT_TRACE
@@ -783,7 +793,7 @@ BOOT_DELAY_FLAG += -DBOOT_B_DELAY=$(BOOT_B_DELAY)
 endif
 
 sim_boot: dirs
-	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) $(BOOT_DELAY_FLAG) \
+	$(DOCKER_RUN) $(IVERILOG) $(IVFLAGS) -DRV_XLEN_64 $(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_A4TRACE_FLAG) $(BOOT_DBG_FLAG) $(BOOT_DELAY_FLAG) \
 		-o $(OUT_DIR)/tb_rv_boot_soc.vvp \
 		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
 	$(DOCKER_RUN) $(VVP) $(OUT_DIR)/tb_rv_boot_soc.vvp
@@ -817,7 +827,7 @@ image_verilator:
 
 vl_boot: dirs
 	$(VL_DOCKER_RUN) verilator $(VL_FLAGS) -DRV_XLEN_64 \
-		$(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_DBG_FLAG) $(BOOT_DELAY_FLAG) \
+		$(BOOT_HEX_FLAG) $(BOOT_MAX_FLAG) $(BOOT_MEMBASE_FLAG) $(BOOT_MTIME_FLAG) $(BOOT_TRACE_FLAG) $(BOOT_A4TRACE_FLAG) $(BOOT_DBG_FLAG) $(BOOT_DELAY_FLAG) \
 		-I$(INC_DIR) --top-module tb_rv_boot_soc --Mdir $(VL_BOOT_MDIR) -o tb_rv_boot_soc \
 		$(BOOT_SRC) $(TB_DIR)/tb_rv_boot_soc.sv
 	$(VL_DOCKER_RUN) ./$(VL_BOOT_MDIR)/tb_rv_boot_soc

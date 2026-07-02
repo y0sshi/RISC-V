@@ -363,6 +363,178 @@ module tb_rv_boot_soc;
         force u_soc.u_cpu.u_core.u_csr.mcycle_cnt = u_soc.u_cpu.u_core.u_csr.minstret_cnt;
 `endif
 
+`ifndef BOOT_DET_LO
+  `define BOOT_DET_LO 0
+`endif
+`ifdef BOOT_A4TRACE
+    // ---- BOOT_A4TRACE: user a4 (x14) save/restore round-trip corruption detector ----
+    // STANDALONE (deliberately outside `ifdef BOOT_TRACE, which is NOT defined by a
+    // plain BOOT_A4TRACE=1 build -- everything this detector needs, including its
+    // OWN cycle counter (a4_cyc; the BOOT_TRACE-only `tcyc` is not available here),
+    // must be self-contained) so it builds small enough for the bind mount.
+    // handle_exception saves user a4 with `sd a4,112(sp)` and restores it with
+    // `ld a4,112(sp)`.  Kernel-VA low32 PCs (Jul-2 vmlinux; re-derive with objdump
+    // if the kernel is rebuilt): save=0x8096418a  restore=0x80964258.  Two
+    // image-agnostic checks split the 4th bug's three hypotheses:
+    //   (A) save-store: at restore, DDR at the pt_regs slot == the value saved?
+    //       mismatch => the save store was lost / memory corrupted (save-side).
+    //   (B) restore-load: the restore ld delivers the DDR content to x14?
+    //       mismatch => the restore load returned stale data (restore-side).
+    //   both OK yet a4 still wrong architecturally => userspace add-write loss
+    //       (upstream of the handler; investigate the userspace regfile write).
+    integer          a4_cyc   = 0;       // own cycle counter (tcyc lives under BOOT_TRACE only)
+    integer          na4      = 0;      // cap for the (floored) normal A4SAVE/A4REST trace
+    integer          na4c     = 0;      // cap for the always-on A4CORRUPT hits
+    // Sanity tally: how many times handle_exception's entry / the sd-a4 site /
+    // the ld-a4 site actually commit, so a zero A4SAVE count can be told apart
+    // from "PC target wrong" vs "genuinely never reached".
+    integer          n_handle_entry = 0;
+    integer          n_a4_sd_site   = 0;
+    integer          n_a4_ld_site   = 0;
+    logic            a4_active = 1'b0;   // a save is outstanding, awaiting its restore
+    logic [63:0]     a4_pa    = '0;      // pt_regs slot PA captured at save
+    logic [63:0]     a4_saved = '0;      // value stored at save
+    logic            a4_rpend = 1'b0;    // a restore ld issued, awaiting its x14 WB
+    logic [63:0]     a4_rddr  = '0;      // DDR content the restore ld should deliver
+    // Inline DDR-word read (same as mem_win64(), duplicated here to avoid any
+    // forward-reference concern -- mem_win64 is defined later in this module).
+    function automatic logic [63:0] a4_mem_win64(input [63:0] pa);
+        logic [63:0] o; o = (pa - MEM_BASE) & ~64'h7;
+        return {u_bfm.mem_b[o+7], u_bfm.mem_b[o+6], u_bfm.mem_b[o+5], u_bfm.mem_b[o+4],
+                u_bfm.mem_b[o+3], u_bfm.mem_b[o+2], u_bfm.mem_b[o+1], u_bfm.mem_b[o+0]};
+    endfunction
+    always @(posedge clk) if (rst_n) begin
+        a4_cyc <= a4_cyc + 1;
+        if (!u_soc.u_cpu.u_core.flush_ex_mem && !u_soc.u_cpu.u_core.stall_ex
+            && u_soc.u_cpu.u_core.id_ex_valid
+            && (u_soc.u_cpu.u_core.id_ex_pc[31:0] == 32'h809640cc))
+            n_handle_entry <= n_handle_entry + 1;
+        if ((a4_cyc % 2000000) == 0)
+            $display("[A4TALLY @%0d] handle_entry=%0d sd_a4_site=%0d ld_a4_site=%0d",
+                      a4_cyc, n_handle_entry, n_a4_sd_site, n_a4_ld_site);
+        if (u_soc.mmu_dmem_req && !u_soc.periph_is_periph && !u_soc.core_dmem_wait) begin
+            // SAVE: `sd a4,112(sp)` -- capture slot PA + the value stored.  The
+            // state machine ALWAYS runs (never capped); only the trace print is
+            // floored+capped so a deep crash is still reachable (like BOOT_DET_LO).
+            if (u_soc.core_dmem_we
+                && (u_soc.u_cpu.u_core.ex_mem_pc[31:0] == 32'h8096418a)) begin
+                n_a4_sd_site <= n_a4_sd_site + 1;
+                a4_active <= 1'b1;
+                a4_pa     <= u_soc.mmu_dmem_pa;
+                a4_saved  <= u_soc.core_dmem_wdata;
+                if (a4_cyc >= `BOOT_DET_LO && na4 < 60) begin
+                    na4 <= na4 + 1;
+                    $display("[A4SAVE @%0d] pa=%h saved=%h", a4_cyc,
+                             u_soc.mmu_dmem_pa, u_soc.core_dmem_wdata);
+                end
+            end
+            // RESTORE: `ld a4,112(sp)`.
+            if (!u_soc.core_dmem_we
+                && (u_soc.u_cpu.u_core.ex_mem_pc[31:0] == 32'h80964258)) begin
+                n_a4_ld_site <= n_a4_ld_site + 1;
+                // (A) save-store integrity: DDR at the slot vs what was saved.
+                if (a4_active && (u_soc.mmu_dmem_pa == a4_pa)) begin
+                    a4_active <= 1'b0;
+                    if (a4_cyc >= `BOOT_DET_LO && na4 < 60) begin
+                        na4 <= na4 + 1;
+                        $display("[A4REST @%0d] pa=%h saved=%h ddr=%h", a4_cyc,
+                                 u_soc.mmu_dmem_pa, a4_saved, a4_mem_win64(u_soc.mmu_dmem_pa));
+                    end
+                    // A4CORRUPT-DDR: ALWAYS printed (content-triggered, rare).
+                    if ((a4_saved !== a4_mem_win64(u_soc.mmu_dmem_pa)) && na4c < 50) begin
+                        na4c <= na4c + 1;
+                        $display("[A4CORRUPT-DDR @%0d] pa=%h saved=%h ddr=%h  (save-store-loss)",
+                                 a4_cyc, u_soc.mmu_dmem_pa, a4_saved, a4_mem_win64(u_soc.mmu_dmem_pa));
+                    end
+                end
+                // (B) arm the restore-load integrity check: x14 must receive DDR.
+                a4_rpend <= 1'b1;
+                a4_rddr  <= a4_mem_win64(u_soc.mmu_dmem_pa);
+            end
+        end
+        // (B) cont: at the restore ld's x14 writeback, compare delivered vs DDR.
+        // A4CORRUPT-LOAD: ALWAYS printed (content-triggered, rare).
+        if (a4_rpend && u_soc.u_cpu.u_core.wb_reg_write
+            && (u_soc.u_cpu.u_core.wb_rd_addr == 14)) begin
+            a4_rpend <= 1'b0;
+            if ((u_soc.u_cpu.u_core.wb_data !== a4_rddr) && na4c < 50) begin
+                na4c <= na4c + 1;
+                $display("[A4CORRUPT-LOAD @%0d] x14<=%h ddr=%h  (restore-load-loss)",
+                         a4_cyc, u_soc.u_cpu.u_core.wb_data, a4_rddr);
+            end
+        end
+    end
+
+    // ---- x14 (a4) write-history ring + crash-triggered dump ----
+    // save/restore proved clean (A4CORRUPT-* never fires), so the corruption must
+    // be BEFORE any trap machinery touches a4: either the userspace ALU op that
+    // computes a4 never retires its WB write (an older-instruction write-loss,
+    // structurally like #16 but for the ordinary integer regfile path), or a plain
+    // interrupt's fast kernel path (which never touches a4 in software -- see
+    // handle_exception's bltz-taken branch) coincides with a hardware retire bug.
+    // This ring records every x14 WB commit (cycle, value, cumulative trap count at
+    // that moment) and DUMPS it the instant a U-mode load/store faults on a tiny
+    // (garbage-looking) VA -- exactly the observed crash signature (busybox/bash
+    // dereferencing a stale small a4).  mem_trap_val = ex_mem_alu_result = the
+    // faulting VA (offset 0 for `lw a4,0(a4)`, so it IS the corrupted a4 value).
+    localparam int A4_RING_N = 32;
+    integer      a4ring_cyc [A4_RING_N];
+    logic [63:0] a4ring_val [A4_RING_N];
+    integer      a4ring_ntrap [A4_RING_N];
+    integer      a4ring_wr    = 0;
+    integer      a4ring_count = 0;
+    integer      n_traps_total = 0;
+    integer      n_a4dump      = 0;   // cap: a few independent crash instances
+    // Post-crash watch: does x14 (a4) change BETWEEN the fault (mem_trap_enter,
+    // stval = the fault VA = a4's value at the instant of the fault) and
+    // handle_exception's OWN `sd a4,112(sp)` a few dozen cycles later?  The
+    // A4SAVE/A4REST/A4CORRUPT checks only prove save<->restore consistency, NOT
+    // that the saved value equals what a4 held at the actual fault instant -- if
+    // something rewrites the physical x14 register DURING the trap-entry window
+    // (before the save instruction reads it back out), that would explain why the
+    // kernel's OWN pt_regs dump (a4=0x3fd19d95-style) differs from the fault VA
+    // (e.g. 0x9) while save/restore still look internally consistent.
+    logic        a4_postwatch     = 1'b0;
+    logic [63:0] a4_postwatch_va  = '0;
+    integer      a4_postwatch_n   = 0;   // remaining x14 WB commits to log
+    always @(posedge clk) if (rst_n) begin
+        if (u_soc.u_cpu.u_core.csr_trap_enter && u_soc.u_cpu.u_core.csr_commit_ex)
+            n_traps_total <= n_traps_total + 1;
+        if (u_soc.u_cpu.u_core.wb_reg_write && (u_soc.u_cpu.u_core.wb_rd_addr == 14)) begin
+            a4ring_cyc[a4ring_wr]   <= a4_cyc;
+            a4ring_val[a4ring_wr]   <= u_soc.u_cpu.u_core.wb_data;
+            a4ring_ntrap[a4ring_wr] <= n_traps_total;
+            a4ring_wr    <= (a4ring_wr + 1) % A4_RING_N;
+            if (a4ring_count < A4_RING_N) a4ring_count <= a4ring_count + 1;
+            if (a4_postwatch && a4_postwatch_n > 0) begin
+                a4_postwatch_n <= a4_postwatch_n - 1;
+                $display("[A4POSTWATCH @%0d] (after crash VA=%h) x14<=%h pc4=%h  remaining=%0d",
+                         a4_cyc, a4_postwatch_va, u_soc.u_cpu.u_core.wb_data,
+                         u_soc.u_cpu.u_core.mem_wb_pc4, a4_postwatch_n - 1);
+                if (a4_postwatch_n - 1 == 0) a4_postwatch <= 1'b0;
+            end
+        end
+        if (u_soc.u_cpu.u_core.mem_trap_enter
+            && (u_soc.u_cpu.u_core.priv_level == 2'b00)
+            && ((u_soc.u_cpu.u_core.mem_trap_val < 64'h1000)
+                || (u_soc.u_cpu.u_core.mem_trap_val > 64'hFFFF_FFFF_FFFF_F000))
+            && n_a4dump < 10) begin
+            n_a4dump <= n_a4dump + 1;
+            a4_postwatch    <= 1'b1;
+            a4_postwatch_va <= u_soc.u_cpu.u_core.mem_trap_val;
+            a4_postwatch_n  <= 8;
+            $display("[A4CRASH @%0d] faulting VA=%h faulting-insn-pc=%h ntraps_total=%0d -- last %0d x14 writes:",
+                     a4_cyc, u_soc.u_cpu.u_core.mem_trap_val, u_soc.u_cpu.u_core.ex_mem_pc,
+                     n_traps_total, a4ring_count);
+            for (int k = 0; k < a4ring_count; k++) begin
+                automatic int idx = (a4ring_wr - a4ring_count + k + A4_RING_N) % A4_RING_N;
+                $display("   [%0d] cyc=%0d val=%h ntraps_at_write=%0d",
+                         k, a4ring_cyc[idx], a4ring_val[idx], a4ring_ntrap[idx]);
+            end
+        end
+    end
+`endif
+
 `ifdef BOOT_TRACE
     // --- divergence trace: ring buffer of distinct fetch_pc, dumped on first X ---
     integer tcyc = 0, rh = 0, rwh = 0, i;

@@ -60,12 +60,14 @@ rv_axi_burst_bridge 最終ビート `rdata_hold` / rv_timer 標準 SiFive CLINT 
 旧 FPU/CSR (2026-05-28〜30): FDIV/FSQRT が FP reg 未書込 (`fpu_start_stall`) / 特殊ケースハング (`special_pending`) /
 rv_fpu_div 2 倍余りドメイン化 / AMO 8byte ワード内オフセット / MHARTID X 伝播・mstatus64 UXL/SXL・CSR の EX/MEM フォワード。
 
-### ⚠️ 未解決 #18 (userspace レジスタがトラップ往復で破損; RootFS③ で発覚 2026-07-02)
-bug#17 修正で busybox が深部まで走った結果、**userspace プログラムが散発 SIGSEGV** (`cause=0x0d` load page fault, 微小/ゴミアドレス)。決定的観測 (BOOT_TRACE + ISS 検出器, `BOOT_DET_LO=<crash cy>` で早期偽陽性を除け crash 域に予算を回す):
-- 最初のクラッシュ = busybox jump-table `lw a4,0(a4)` @`0x46154`。EXEC トレースで、あるパスは `0x46140→0x46152` の完全な計算列を実行し a4=正しいテーブルアドレス (`0xc9e44`) を得るが、**トラップ往復後の sret 復帰では計算列を通らず 0x46154 に直接戻り a4=`0x9` (add 前の stale 値)** → `0x9` は unmapped → SIGSEGV。つまり **ユーザレジスタ a4 が add(`0x46152`)の書き戻し値 `0xc9e44` を失い、トラップ前の古い値 `0x9` のまま復帰** = 書き戻し喪失 or 保存/復元破損 (#15/#16 と同じ**可変レイテンシ × トラップ/割込 × retire 衝突**族)。
-- **bug#17 とは独立と確定**: 破損した load 実行時 `fetch_dead_q=0` (IF-fault drain 非アクティブ)、かつ drain 無効化版と有効化版が 714.5M までビット一致。data-fault/割込の往復であって IF-fault drain を通らない。**bug#1+#2/#17 で userspace が初めて走るようになり露呈した pre-existing バグ**。
-- 信頼検出器の状態: **FCHK (フェッチ語=実メモリ) / CFLOW (制御フロー) / DESYNC は crash 域で全沈黙** = フェッチ・制御フローは正しい。DLOAD/STLOSS の発火は全て M-mode トラップスタック (`0x8003dxxx`) + カーネル復元バースト (`0x8096427a`) の**偽陽性** (load 発行時とチェック時でメモリが変わる/バックツーバック load の fresh-vs-held) — drain 無効でも同一サイクル・同一値で出る。
-- **次アクション**: トラップ ENTRY 時の pt_regs 保存 `sd aN` と EXIT 時の復元 `ld aN` を対象レジスタで追い、スタックスロットの値が保存で誤ったか (store 側) 復元で誤ったか (load 側) を切り分け。#16 (mal FSM を `flush_ex_mem` で誤 reset) の類推で、**割込/トラップが若い命令に取られたとき古い命令の書き戻しが `flush_ex_mem`/stall 相互作用で失われる**経路を `rv_core.sv` の EX/MEM→MEM/WB 前進 + `flush_ex_mem` + `mem_wb` バブル条件で精査。bare repro 化 (割込×可変レイテンシで ALU 結果書き戻しを喪失させる `.S`) が最優先。デバッグ基盤: `BOOT_DET_LO` (crash 域に検出器予算を回すフロア, 既定 0), DESYNC の `exp_pa>=MEM_BASE` ガード, 検出器 cap 200 化 (`tb_rv_boot_soc.sv`)。
+### #18 (フォールトした load/store が MEM/WB のゲート漏れで garbage 書き戻しを retire; RootFS③ で発覚・解決 2026-07-02/03)
+bug#17 修正で busybox が深部まで走った結果、**userspace プログラムが散発 SIGSEGV** (`cause=0x0d` load page fault, 微小/ゴミアドレス) が観測された。当初は「トラップ往復でユーザレジスタの書き戻しが喪失/破損した」と推定したが、専用計装 (`BOOT_A4TRACE`, `src/sim/tb/tb_rv_boot_soc.sv` + `src/sim/Makefile`) による切り分けで**真因は別**と判明:
+
+- **save/restore 経路は健全と確定**: `handle_exception` の `sd a4,112(sp)` (save) と `ld a4,112(sp)` (restore) の値を 6800 回以上の trap round-trip にわたり突き合わせ、**不一致ゼロ**。#15/#16 型の「トラップ往復でのレジスタ喪失」ではなかった。
+- **真因**: `mem_wb` パイプラインレジスタ (`rv_core.sv`) が `mem_trap_enter` (EX/MEM 段の load/store 自身がページフォルトしたこと) で**ゲートされていなかった**。フォールトした load は `mem_trap_enter` と同時に `flush_ex_mem` で EX/MEM の**次の**内容は squash されるが、`mem_wb <= ex_mem_ctrl/ex_mem_valid` は同エッジで**フォールトした命令自身の (pre-edge) ex_mem 内容をそのまま捕捉**してしまう (flush_ex_mem は「これから ex_mem に入るもの」だけを止め、「今 ex_mem にあるものが mem_wb へ渡るのを止めない」——non-blocking assignment の意味論上、両レジスタは同一サイクルの pre-edge 値から独立に更新されるため)。結果、**フォールトした命令が 1 サイクル後に WB で retire し、フォールトで得られなかった無効なロードデータを destination レジスタへ書き込む**。`lw a4,0(a4)` / `lbu a1,0(a1)` / `lbu a5,0(a5)` のような「ベースレジスタ=デスティネーションレジスタ」のポインタチェイスパターンで未マップアドレスを踏むと、この単一のバグで**任意のレジスタが破損**しうる (busybox の複数プロセス・複数レジスタでの散発 SIGSEGV を統一的に説明)。
+- **発見手法**: x14 (a4) の WB 書き戻し履歴 32 件のリングバッファ + fault 検出直後の post-crash watch を実装。`[A4POSTWATCH]` が **fault 検出のわずか 1 サイクル後、fault 命令自身の PC から garbage 値が x14 に書き込まれている**ことを直接観測 (カーネル自身の `pt_regs` ダンプの a4 値と、fault アドレス自体の食い違いから逆算)。
+- **修正** (`rv_core.sv`): MEM/WB のバブル条件 `amo_stall || mal_stall || dmem_wait || mem_stall` に `mem_trap_enter` を追加。既存パターン (AMO read phase / misaligned phase0 / データアクセス中 / 変換待ち) と同型で、**vm off またはフォールト無しでは厳密 no-op**。
+- **回帰確認**: unit (pipeline 19/19, intr 10/10, soc 3/3, mmu64 11/11, sv64 46/46), cache (cache_soc 6/6×2, icache 50/50×2, dcache64 54/54), compliance RV64 117/117 + RV32 88/88, OpenSBI フルブート PASS, 非回帰 repro (callfault/skid_ptwfault/skid_ptw/skid_redirect/ptw_amo) 全 PASS、**full Linux boot (Buildroot rootfs) が `ROOTFS-BASH-OK: GNU bash, version 5.2.37` に到達、segfault 0 件・panic 0 件** (旧 RTL は同一 run で ~9 件の SIGSEGV)。Linux ロードマップ③ (RootFS) の最終ブロッカーを解消。
 
 ### C-2a 多サイクル除算で見つけた #14 + Linux 回帰の最終判定 (2026-06-11/12)
 - **#14 (restart livelock; 修正済)**: 除算完了サイクルに無関係 stall (`~imem_ready` I$ フィル等) が掛かると retire できず
