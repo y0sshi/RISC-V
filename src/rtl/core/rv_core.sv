@@ -123,6 +123,27 @@ module rv_core
     // never fires and SATP is only written in M-mode (which cannot fault on fetch).
     logic            ifpf_take;          // 1 = take an instruction page fault trap this cycle
     logic [XLEN-1:0] ifpf_pc;            // faulting instruction VA (-> mepc / mtval)
+    // fetch_dead_q (bug #17): the COMMITTED instruction fetch has PAGE-FAULTED, so
+    // imem_ready will NEVER rise for it -- the ~imem_ready full-pipeline freeze must
+    // be released so the OLDER in-flight instructions (notably the very JAL/branch
+    // whose redirect targeted the faulting page) can drain and RETIRE, after which
+    // the latched fault is taken precisely.  Without this the freeze and the fault
+    // deadlock each other: a demand-paged call target (Linux userspace) faults ->
+    // imem_ready stays 0 -> stall_ex holds the JAL in EX -> branch_taken_ex keeps
+    // redir_eff high -> the fault can neither latch nor be taken -> the MMU re-walks
+    // the dead VA forever (observed: musl memset() call spinning in an IF-PTW
+    // walk/fault loop at ~3 reads/17 cycles with zero retires).  Set on if_fault
+    // (the walked VA is the committed imem_addr -- imem_gnt pins the FTQ head);
+    // cleared when the fetch is alive again (imem_ready: a redirect moved fetch to
+    // a mapped page) or the fault trap is taken (ifpf_take).  STRUCTURAL NO-OP
+    // whenever instruction fetch never page-faults (bare mode / M-mode / all
+    // compliance and unit suites): fetch_dead_q is then constant 0 and every
+    // masked term reduces to the original expression.
+    logic            fetch_dead_q;
+    // Forward declarations (read by the ifpf take gate below their normal home):
+    logic            if_id_valid;    // IF/ID pipeline register valid
+    logic            id_ex_valid;    // ID/EX pipeline register valid
+    logic            ex_mem_valid;   // EX/MEM pipeline register valid
     logic            satp_write_redir;   // SATP write committed -> refetch next insn under new satp
     logic [XLEN-1:0] satp_redir_tgt;     // = PC of the instruction after the SATP write
     logic        trap_or_mret;    // Combined: causes PC redirect + pipeline flush
@@ -267,8 +288,12 @@ module rv_core
 
     // redirect_stall holds IF/ID only (not EX) so the redirecting branch/trap can
     // still complete; it must NOT be added to stall_ex.
-    assign stall_if = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | muldiv_busy_int | muldiv_start_stall | mal_stall | redirect_stall | dmem_wait;
-    assign stall_id = load_use_hazard | ~imem_ready | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | muldiv_busy_int | muldiv_start_stall | mal_stall | redirect_stall | dmem_wait;
+    // (~imem_ready & ~fetch_dead_q): the IF freeze is released while the committed
+    // fetch is DEAD (page-faulted, bug #17) so older instructions drain and retire;
+    // the aligner then starves and feeds bubbles.  ~fetch_dead_q is 1 (no-op)
+    // whenever instruction fetch cannot page-fault.
+    assign stall_if = load_use_hazard | (~imem_ready & ~fetch_dead_q) | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | muldiv_busy_int | muldiv_start_stall | mal_stall | redirect_stall | dmem_wait;
+    assign stall_id = load_use_hazard | (~imem_ready & ~fetch_dead_q) | amo_stall | mmu_stall | fpu_busy_int | fpu_start_stall | muldiv_busy_int | muldiv_start_stall | mal_stall | redirect_stall | dmem_wait;
     // mem_stall freezes EX/MEM: a load/store in MEM whose data translation is
     // still pending must remain in MEM (re-issuing its access) until the TLB is
     // filled.  Without this the access leaves MEM unwritten.  Note: IF-port PTW
@@ -282,7 +307,7 @@ module rv_core
     // completes.  Unlike mmu_stall, the IF fetch uses its OWN AXI master, so
     // freezing EX/MEM does not conflict with the data port.  NO-OP for a 1-cycle
     // IF (imem_ready=1 every cycle): ~imem_ready=0.
-    assign stall_ex = amo_stall | fpu_busy_int | muldiv_busy_int | mal_stall | mem_stall | dmem_wait | ~imem_ready;
+    assign stall_ex = amo_stall | fpu_busy_int | muldiv_busy_int | mal_stall | mem_stall | dmem_wait | (~imem_ready & ~fetch_dead_q);
     // Traps/MRET flush the same stages as branch (instructions after the trap insn).
     // With the variable-length fetch (see IF stage), the redirect target address is
     // presented to IMEM combinationally on the cycle the redirect resolves, so the
@@ -317,7 +342,19 @@ module rv_core
     // flush_ex), and the wrong path stays bubbled in IF/ID by flush_id.  ~stall_ex
     // implies imem_ready, so this is a strict refinement / no-op whenever the only
     // stall source is ~imem_ready or there is no stall (the common BRAM case).
-    assign flush_ex    = (load_use_hazard | redir_eff) & ~stall_ex;
+    // (fetch_dead_q & stall_id & ...): bug #17 drain-duplication guard.  Releasing
+    // the ~imem_ready freeze creates the NEW combination "EX advances (stall_ex=0)
+    // while ID cannot refill (stall_id=1, e.g. mmu_stall from the looping walk of
+    // the dead page)": ID/EX would HOLD the instruction EX/MEM just captured and
+    // EX/MEM would capture it AGAIN next cycle (double execution / CSR re-fire).
+    // Bubble ID/EX on such an advance -- the instruction has executed.  The
+    // *_start_stall exclusions keep a multi-cycle FPU/divide op held in ID/EX on
+    // its start cycle (EX/MEM captured a deliberate bubble for it, not the op).
+    // Today mmu_stall implies ~imem_ready (the I$ starves during a walk), so this
+    // term can only fire under fetch_dead_q -> structural no-op without a fault.
+    assign flush_ex    = (load_use_hazard | redir_eff
+                          | (fetch_dead_q & stall_id
+                             & ~fpu_start_stall & ~muldiv_start_stall)) & ~stall_ex;
     // EX/MEM must NOT be flushed for branch or load-use:
     //   - branch in EX: EX/MEM holds the instruction before the branch (already
     //     committed to EX; it must reach MEM/WB).  JAL's rd writeback also lives
@@ -700,12 +737,35 @@ module rv_core
             ifpf_take <= 1'b0;                          // default: single-cycle pulse
             if (fetch_redir_ext) begin
                 ifpf_pend <= 1'b0;                      // older redirect squashed the speculative fetch
-            end else if (ifpf_pend && ~align_valid && ~redir_eff) begin
-                // faulting word is the next instruction to retire -> take now
+            end else if (ifpf_pend && ~align_valid && ~if_id_valid && ~id_ex_valid
+                         && ~ex_mem_valid
+                         && (~redir_eff | (redir_pend_q & ~redir_req))) begin
+                // faulting word is the next instruction to retire -> take now.
+                // ~if_id_valid && ~id_ex_valid && ~ex_mem_valid (bug #17): with
+                // the fetch_dead_q drain, older in-flight instructions retire
+                // while the fault is pending; the take must wait until IF/ID,
+                // ID/EX AND EX/MEM are bubbles.  ID/EX: the take's redirect
+                // asserts flush_ex on a released (~stall_ex) cycle and would
+                // otherwise KILL a live older instruction in EX.  EX/MEM: an
+                // older MEM-stage access can raise ITS OWN page fault
+                // (mem_trap_enter) on the very take cycle; the CSR trap mux
+                // prefers ifpf_take, and flush_ex_mem would squash the older
+                // access with its fault LOST (sret then returns to the ifpf PC,
+                // never re-executing the load/store = silent data corruption).
+                // All three are already bubbles in the pre-existing paths
+                // (redirect-target fault: flushed; the freeze never let them
+                // change) -> no-op there.
+                // (redir_pend_q & ~redir_req) (bug #17): the fault of the CURRENT
+                // redirect TARGET is takeable while the registered redirect is
+                // still presenting that very target (redir_pend_q can never clear
+                // for a dead fetch -- clearing needs imem_ready).  ~redir_req
+                // keeps the original behavior for a LIVE redirect resolving this
+                // cycle (its fault, if any, is wrong-path / stale).
                 ifpf_take <= 1'b1;
                 ifpf_pc   <= (hb_count != '0) ? h0pc : ifpf_pc_pend;
                 ifpf_pend <= 1'b0;
-            end else if (if_fault && ~redir_eff && ~ifpf_pend) begin
+            end else if (if_fault && ~ifpf_pend
+                         && (~redir_eff | (redir_pend_q & ~redir_req))) begin
                 ifpf_pend    <= 1'b1;                   // capture (incl. PTW_FAULT transient)
                 // The faulting INSTRUCTION's VA, not just its word: a mid-word
                 // redirect target (skip_low_q=1, target[1]==1) faults on its
@@ -722,13 +782,26 @@ module rv_core
         end
     end
 
+    // fetch_dead_q driver (bug #17; see declaration above).  Set UNGATED on any
+    // committed-fetch page fault (even while redir_eff blocks the ifpf latch --
+    // releasing the freeze is what lets the redirect source retire so the latch
+    // gate can open on the NEXT walk-fault iteration).  Cleared the moment the
+    // fetch is alive again (imem_ready: a redirect moved fetch onto a mapped
+    // page) or the fault trap is taken (ifpf_take redirects to the handler).
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                      fetch_dead_q <= 1'b0;
+        else if (imem_ready | ifpf_take) fetch_dead_q <= 1'b0;
+        else if (if_fault)               fetch_dead_q <= 1'b1;
+    end
+
 
     // =========================================================================
     // IF/ID Pipeline Register  (between IF and ID) -- fed by the aligner
     // =========================================================================
     logic [31:0]     if_id_inst;
     logic [XLEN-1:0] if_id_pc;
-    logic            if_id_valid;
+    // (if_id_valid / id_ex_valid are declared with the fetch_dead_q forward
+    // declarations above: the ifpf take gate reads them before this point.)
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush_id) begin
@@ -845,7 +918,6 @@ module rv_core
     logic [2:0]      id_ex_funct3;
     logic [11:0]     id_ex_csr_addr;   // inst[31:20] — CSR address for Zicsr
     logic [31:0]     id_ex_inst;       // raw fetched word (for illegal-instruction mtval)
-    logic            id_ex_valid;
     // FP operands registered from fregfile (64-bit for F+D extensions)
     logic [63:0]     id_ex_frs1_data, id_ex_frs2_data, id_ex_frs3_data;
 
@@ -928,7 +1000,7 @@ module rv_core
     logic [XLEN-1:0] ex_mem_pc;    // PC of instruction in MEM stage (for fault mepc)
     logic [XLEN-1:0] ex_mem_pc4;
     logic [2:0]      ex_mem_funct3;
-    logic            ex_mem_valid;
+    // (ex_mem_valid is declared with the fetch_dead_q forward declarations above.)
     logic [XLEN-1:0] ex_mem_csr_fwd;     // forward-decl: used in ex_mem_fwd_data mux before definition
     logic [XLEN-1:0] ex_mem_fpu_result_i_fwd;  // forward-decl: FPU int result for EX/MEM forwarding
 
@@ -1315,7 +1387,10 @@ module rv_core
                 // paired SC then fails and the constrained loop retries.
                 reservation_valid <= 1'b0;
             end else if (!amo_stall && !mal_stall && !dmem_wait && !mem_stall
-                         && imem_ready) begin
+                         && (imem_ready | fetch_dead_q)) begin
+                // (| fetch_dead_q, bug #17): same advance condition as the MEM/WB
+                // capture -- an LR/SC draining past a dead fetch must update the
+                // reservation exactly once on its advance cycle.
                 // !mem_stall: same translation-pending hole as amo_state above
                 // (the LR/SC has not actually accessed memory yet).
                 if (ex_mem_ctrl.is_lr && ex_mem_valid) begin
@@ -1643,7 +1718,12 @@ module rv_core
     // itself is handled separately (latched, see IF stage), and fflags writes
     // are left ungated (multi-cycle FP's result_valid pulse need not coincide
     // with imem_ready, and fflags accumulation is idempotent).
-    wire csr_commit = imem_ready;
+    // | fetch_dead_q (bug #17): while the committed fetch is dead the pipeline
+    // drains (advance semantics identical to imem_ready=1 with a starved aligner),
+    // so WB-stage events (retire count) must fire for the draining instructions.
+    // Each instruction spends exactly one cycle in WB during the drain (MEM/WB
+    // advances every cycle), so nothing double-counts.  No-op when fetch_dead_q=0.
+    wire csr_commit = imem_ready | fetch_dead_q;
     // EX-stage commit gate for state changes attributed to the instruction in EX
     // (CSR write, trap entry, MRET/SRET).  These must fire EXACTLY ONCE -- on the
     // cycle the EX instruction actually advances out of EX (~stall_ex) -- NOT merely
@@ -1963,8 +2043,12 @@ module rv_core
             mem_wb_valid  <= 1'b0;
             mal_active_wb <= 1'b0;
             mem_wb_fresh  <= 1'b0;
-        end else if (imem_ready) begin
+        end else if (imem_ready | fetch_dead_q) begin
             // Normal advance.  This instruction is FRESH in WB next cycle.
+            // fetch_dead_q (bug #17): the committed fetch has page-faulted and will
+            // never raise imem_ready; the pipeline drains instead of freezing, so
+            // MEM/WB must advance (capturing the draining instructions, then
+            // bubbles) exactly as in the imem_ready=1 flow.
             mem_wb_fresh          <= 1'b1;
             mem_wb_ctrl           <= ex_mem_ctrl;
             mem_wb_alu_result     <= ex_mem_ctrl.is_sc ? sc_result : ex_mem_alu_result;

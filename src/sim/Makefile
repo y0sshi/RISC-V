@@ -663,6 +663,11 @@ endif
 ifneq ($(BOOT_PTWLO),)
 BOOT_TRACE_FLAG += -DBOOT_PTWLO=$(BOOT_PTWLO)
 endif
+# Cycle floor for the trustworthy fetch/load/store detectors (skip early-boot
+# false positives that exhaust the caps; see tb_rv_boot_soc.sv BOOT_DET_LO).
+ifneq ($(BOOT_DET_LO),)
+BOOT_TRACE_FLAG += -DBOOT_DET_LO=$(BOOT_DET_LO)
+endif
 ifneq ($(BOOT_DCWIN),)
 BOOT_TRACE_FLAG += -DBOOT_DCWIN=$(BOOT_DCWIN)
 endif

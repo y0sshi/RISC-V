@@ -306,6 +306,17 @@ module rv_mmu
 
     ptw_state_t      ptw_state;
     logic            ptw_wait;            // 1 = just entered new state, skip 1 cycle
+    // Dead-fetch walk memo (bug #17): the VPN of the last FAULTED instruction
+    // walk.  While the core holds a page-faulted fetch (drain in progress), the
+    // FTQ keeps re-presenting the dead VA and its walk re-faults forever; with
+    // strict IF-over-MEM priority in PTW_IDLE that starves a pending DATA
+    // translation (mem_stall then deadlocks the drain).  When the presented IF
+    // VPN is known dead AND a data walk is pending, let the data walk go first.
+    // Cleared on tlb_flush (SFENCE.VMA: the mapping may have changed, the retry
+    // is legitimate).  Never set unless an instruction fetch page-faults ->
+    // structural no-op for bare mode / M-mode suites.
+    logic             if_dead_vld;
+    logic [VPN_W-1:0] if_dead_vpn;
     // ptw_for_if is now an output port (see port list); driven by the PTW FSM.
     logic [VPN_W-1:0] ptw_vpn;           // VPN of the VA being walked
     logic [PPN_INT_W-1:0] ptw_ppn_cur;   // PPN of the current page table
@@ -375,17 +386,26 @@ module rv_mmu
             ptw_res_r   <= 1'b0; ptw_res_w <= 1'b0; ptw_res_x <= 1'b0;
             ptw_res_u   <= 1'b0; ptw_res_d <= 1'b0;
             ptw_fault_r <= 1'b0;
+            if_dead_vld <= 1'b0;
+            if_dead_vpn <= '0;
         end else begin
+            if (tlb_flush) if_dead_vld <= 1'b0;   // SFENCE.VMA: retry is legitimate
             case (ptw_state)
 
                 PTW_IDLE: begin
                     ptw_fault_r <= 1'b0;
                     ptw_wait    <= 1'b0;
-                    // IF miss has priority over MEM miss
+                    // IF miss has priority over MEM miss -- EXCEPT when the
+                    // presented IF VPN is known dead (its walk just faulted and
+                    // no SFENCE has intervened) and a data walk is pending: the
+                    // dead-IF re-walk would starve the data translation forever
+                    // (bug #17 drain deadlock).
                     // Note: no ptw_wait needed on IDLE→L* transition because
                     // ptw_req=0 in IDLE so the memory model returns ptw_ready=0
                     // on the first cycle after transition (natural 1-cycle gap).
-                    if (vm_enabled && if_req && !if_tlb_hit) begin
+                    if (vm_enabled && if_req && !if_tlb_hit
+                        && !(if_dead_vld && (if_vpn == if_dead_vpn)
+                             && vm_data && mem_req && !mem_tlb_hit && !mem_reg_ready)) begin
                         ptw_for_if <= 1'b1;
                         ptw_vpn    <= if_vpn;
                         ptw_state  <= (XLEN == 64) ? PTW_L2 : PTW_L1;
@@ -495,7 +515,13 @@ module rv_mmu
                 end
 
                 PTW_DONE:  ptw_state <= PTW_IDLE;
-                PTW_FAULT: ptw_state <= PTW_IDLE;
+                PTW_FAULT: begin
+                    ptw_state <= PTW_IDLE;
+                    if (ptw_for_if && !tlb_flush) begin
+                        if_dead_vld <= 1'b1;      // remember the dead IF VPN
+                        if_dead_vpn <= ptw_vpn;
+                    end
+                end
                 default:   ptw_state <= PTW_IDLE;
 
             endcase
@@ -575,10 +601,20 @@ module rv_mmu
             if_req_out = if_perm_ok;
             if_fault   = !if_perm_ok;
         end else begin
-            // TLB miss: block request, signal fault if PTW faulted
+            // TLB miss: block request, signal fault if PTW faulted.
+            // (ptw_vpn == if_vpn): report the fault ONLY to the VA that was
+            // actually walked.  A walk launched for an earlier presented VA can
+            // complete (fault) after a redirect has switched if_va to a new
+            // address (e.g. an instruction-page-fault trap redirecting to the
+            // -- mapped -- handler while the dead target's relaunched walk is
+            // still in flight); without the compare that zombie fault would be
+            // attributed to the new fetch address (a spurious page fault on a
+            // mapped page).  Strict no-op whenever the presented VA is the
+            // walked VA -- every case that correctly faulted before (bug #17).
             if_pa      = '0;
             if_req_out = 1'b0;
-            if_fault   = ptw_fault_r && ptw_for_if && (ptw_state == PTW_FAULT);
+            if_fault   = ptw_fault_r && ptw_for_if && (ptw_state == PTW_FAULT)
+                         && (ptw_vpn == if_vpn);
         end
     end
 

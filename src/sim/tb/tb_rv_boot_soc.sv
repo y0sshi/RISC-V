@@ -433,6 +433,14 @@ module tb_rv_boot_soc;
 `ifndef BOOT_PTWLO
   `define BOOT_PTWLO 0
 `endif
+// BOOT_DET_LO: cycle floor for the trustworthy fetch/load/store detectors
+// (FCHK/CFLOW/DLOAD/STLOSS/DESYNC).  Early boot (~9.9M) produces false-positive
+// fires that exhaust the small per-detector caps, blinding them at a later
+// (userspace) crash.  Set BOOT_DET_LO to a cycle just before the crash so the
+// caps are spent where it matters.  Default 0 = original behaviour.
+`ifndef BOOT_DET_LO
+  `define BOOT_DET_LO 0
+`endif
 `ifndef BOOT_WATCH_PA
   `define BOOT_WATCH_PA 64'h0
 `endif
@@ -1334,7 +1342,9 @@ module tb_rv_boot_soc;
         if (u_soc.u_cpu.u_core.hb_push
             && (^u_soc.gen_icache.u_ic.addr_q !== 1'bx) && (^exp_pa !== 1'bx)
             && (u_soc.gen_icache.u_ic.addr_q >= MEM_BASE)
-            && (u_soc.gen_icache.u_ic.addr_q != exp_pa) && ndesync < 30) begin
+            && (exp_pa >= MEM_BASE)   // exp_pa==0 (bubble/redirect) is not a real desync
+            && (u_soc.gen_icache.u_ic.addr_q != exp_pa) && ndesync < 200
+            && tcyc >= `BOOT_DET_LO) begin
             ndesync <= ndesync + 1;
             $display("[DESYNC @%0d] addr_q=%h exp_pa=%h bfpc=%h imem_rdata=%h mem@addr_q=%h",
                      tcyc, u_soc.gen_icache.u_ic.addr_q, exp_pa,
@@ -1351,7 +1361,7 @@ module tb_rv_boot_soc;
         if (u_soc.u_cpu.u_core.if_id_valid
             && (^u_soc.u_cpu.u_core.if_id_pc !== 1'bx)
             && (u_soc.u_cpu.u_core.if_id_pc !== prev_ifid_pc)
-            && nfchk < 40) begin : fchk_blk
+            && nfchk < 200 && tcyc >= `BOOT_DET_LO) begin : fchk_blk
             logic [63:0] pa0, pa2; logic [15:0] got_lo, got_hi, exp_lo, exp_hi;
             logic mism;
             pa0 = va2pa(u_soc.u_cpu.u_core.if_id_pc);
@@ -1413,7 +1423,7 @@ module tb_rv_boot_soc;
                 exp_next_pc <= u_soc.u_cpu.u_core.trap_vector; cf_synced <= 1'b1;
             end else if (cf_proc) begin
                 if (cf_synced && (^cf_pc !== 1'bx) && (^exp_next_pc !== 1'bx)
-                    && (cf_pc !== exp_next_pc) && ncflow < 40) begin
+                    && (cf_pc !== exp_next_pc) && ncflow < 200 && tcyc >= `BOOT_DET_LO) begin
                     ncflow <= ncflow + 1;
                     $display("[CFLOW @%0d] got=%h exp=%h inst=%08h | irq=%b extrap=%b mret=%b sret=%b brtk=%b | mepc=%h mtvec=%h",
                              tcyc, cf_pc, exp_next_pc, u_soc.u_cpu.u_core.id_ex_inst,
@@ -1709,7 +1719,7 @@ module tb_rv_boot_soc;
                 3'b110:  exp = {32'd0, ew[31:0]};            // LWU
                 default: exp = ew;
             endcase
-            if (u_soc.u_cpu.u_core.wb_data !== exp && ndld < 30) begin
+            if (u_soc.u_cpu.u_core.wb_data !== exp && ndld < 200 && tcyc >= `BOOT_DET_LO) begin
                 ndld <= ndld + 1;
                 $display("[DLOAD BUG @%0d] pc=%h addr=%h f3=%b fresh=%b wb_data=%h exp=%h (ddr_word=%h)",
                     tcyc, ld_pc, ld_addr, f3, u_soc.u_cpu.u_core.mem_wb_fresh,
@@ -1782,7 +1792,7 @@ module tb_rv_boot_soc;
             got  = mem_va_bytes(svq_va[svq_rd % SVQ], nbb);
             want = svq_data[svq_rd % SVQ] & ((nbb >= 8) ? 64'hFFFF_FFFF_FFFF_FFFF
                                                         : ((64'h1 << (nbb*8)) - 64'h1));
-            if ((got !== want) && nstl < 30) begin
+            if ((got !== want) && nstl < 200 && tcyc >= `BOOT_DET_LO) begin
                 nstl <= nstl + 1;
                 $display("[STLOSS @%0d] pc=%h va=%h sz=%0d mem=%h intended=%h",
                     tcyc, svq_pc[svq_rd % SVQ], svq_va[svq_rd % SVQ], nbb, got, want);

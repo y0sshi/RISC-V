@@ -119,7 +119,26 @@ C_STARTUP_SRC = $(C_STARTUP)/crt0.S $(C_STARTUP)/syscalls.c $(C_STARTUP)/uart.c
 
 SIM_DIR = ../sim
 
-.PHONY: hello sim_hello boot boot_lo stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test ptw_amo_test skid_redirect_test skid_ptw_test skid_ptwfault_test
+.PHONY: hello sim_hello boot boot_lo stack_test atomic_test lrsc_irq_test div_irq_test div_mem_irq_test div_cachemiss_test mal_cachemiss_test mal_load_irq_test ptw_amo_test skid_redirect_test skid_ptw_test skid_ptwfault_test callfault_test
+
+# ----- callfault_test: JAL / sequential fetch into a demand-paged page --------
+# Reproducer for RTL bug #17: an instruction page fault on a JAL's redirect
+# target livelocked (the held JAL kept redir_eff high so the fault could never
+# latch; the dead fetch kept stall_ex high so the JAL could never retire).
+# Also covers the sequential page-crossing drain.  See memory
+# userspace-compiled-binary-bug (second bug).
+#   make callfault_test  &&  (cd ../sim && rm -rf out/vl_boot && make vl_boot \
+#     BOOT_HEX=../software/boot/callfault_test.hex BOOT_MAX=2000000)
+callfault_test: boot/callfault_test.hex
+
+boot/callfault_test.elf: boot/callfault_test.S boot/boot.ld
+	$(DOCKER_RUN) riscv64-unknown-elf-gcc -march=rv64imac_zicsr_zifencei -mabi=lp64 \
+	    -nostdlib -nostartfiles -ffreestanding -T boot/boot.ld boot/callfault_test.S -o boot/callfault_test.elf
+
+boot/callfault_test.hex: boot/callfault_test.elf
+	$(DOCKER_RUN) riscv64-unknown-elf-objcopy -O verilog \
+	    --adjust-vma=-0x80000000 boot/callfault_test.elf boot/callfault_test.hex
+	@echo "  callfault_test hex: $@"
 
 # ----- skid_ptwfault_test: redirect to a mod4==2 target that page-faults first
 # The faithful repro: an instruction page fault on a mid-word redirect target,
