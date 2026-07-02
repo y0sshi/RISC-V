@@ -66,11 +66,23 @@ help:
 	@echo "Firmware (docker; *-lo = 0x200000 sim base, *-hw = 0x200000 real-HW DTS):"
 	@echo "  make fw-opensbi[-lo|-hw]   OpenSBI hello fw_payload"
 	@echo "  make fw-linux[-lo|-hw]     Linux fw_payload (kernel cached after first build)"
+	@echo "                             ROOTFS=buildroot embeds the bash rootfs (default: minimal)"
 	@echo ""
 	@echo "Boot in simulation (verilator):"
 	@echo "  make boot                  mini-SBI stand-in (fast sanity)"
 	@echo "  make boot-opensbi          real OpenSBI hello (needs fw-opensbi-lo)"
-	@echo "  make boot-linux            real Linux to userspace (needs fw-linux-lo; ~8 min)"
+	@echo "  make boot-linux            minimal Linux to userspace (needs fw-linux-lo; ~8 min)"
+	@echo ""
+	@echo "Linux + rootfs (bash), end-to-end -- sim path:"
+	@echo "  1) make images image-buildroot deps    (once; buildroot ~40-60 min first run)"
+	@echo "  2) make fw-linux-rootfs                 rootfs (bash) -> fw_payload_linux.hex"
+	@echo "  3) make boot-linux-rootfs               boot in sim; PASS = 'ROOTFS-BASH-OK:' (~20 min)"
+	@echo "Linux + rootfs (bash), end-to-end -- real HW (Zybo) path:"
+	@echo "  1) make fw-linux-rootfs-hw              rootfs fw @0x200000 + stash ELF for JTAG"
+	@echo "  2) PowerShell: python boards/zybo_z720/build_all.py  (see FPGA section below)"
+	@echo "  3) PowerShell: boards/zybo_z720/vitis/bringup_jtag.tcl (Pmod JC UART 57600 8N1)"
+	@echo "  NOTE: the Buildroot tree lives in a NATIVE docker volume (rv_buildroot_cache);"
+	@echo "        run make from the repo root.  See docs/linux_sim.md for the full flow."
 	@echo ""
 	@echo "Tests:"
 	@echo "  make compliance            riscv-tests RV64 (compliance32 for RV32)"
@@ -172,11 +184,25 @@ fw-linux-hw:
 	   tests/linux/work/fw_payload_linux_hw.elf
 	@echo "stashed tests/linux/work/fw_payload_linux_hw.elf (entry 0x200000, for JTAG dow)"
 
+# One-shot "rootfs-in" firmware: build the Buildroot rootfs (bash) THEN wrap it
+# into the Linux fw_payload.  Thin wrappers: the ROOTFS=buildroot target-specific
+# variable is inherited by the prerequisites, so `fw-linux`/`fw-linux-hw` embed
+# work/buildroot-rootfs.cpio.  Requires `make image-buildroot` (+ `make deps`)
+# once beforehand.  The -sim variant produces the 0x80000000-base
+# fw_payload_linux.hex (boot with `make boot-linux-rootfs`); the -hw variant
+# re-links to 0x200000 (PS DDR) and stashes the ELF for JTAG dow.
+.PHONY: fw-linux-rootfs fw-linux-rootfs-hw
+fw-linux-rootfs: ROOTFS=buildroot
+fw-linux-rootfs: rootfs-buildroot fw-linux
+
+fw-linux-rootfs-hw: ROOTFS=buildroot
+fw-linux-rootfs-hw: rootfs-buildroot fw-linux-hw
+
 # -----------------------------------------------------------------------------
 # Simulation boot (verilator).  Delegate to src/sim; clean the model dir first
 # (BOOT_HEX is a compile-time define, so each image needs a fresh build).
 # -----------------------------------------------------------------------------
-.PHONY: boot boot-opensbi boot-linux
+.PHONY: boot boot-opensbi boot-linux boot-linux-rootfs
 boot:
 	rm -rf src/sim/out/vl_boot
 	"$(MAKE)" -C src/sim vl_boot
@@ -191,6 +217,16 @@ boot-linux:
 	"$(MAKE)" -C src/sim vl_boot \
 	    BOOT_HEX=../../tests/linux/work/fw_payload_linux_lo.hex BOOT_MEM_BASE=2097152 \
 	    BOOT_MAX=480000000 BOOT_MTIME_DIV=64
+
+# rootfs-in Linux (base 0x80000000 = MEM_BASE default, so NO BOOT_MEM_BASE).
+# Bigger cap: userspace (busybox init -> bash) is reached far later than the
+# static-init P0-5 marker; PASS = console shows "ROOTFS-BASH-OK:" (emitted by the
+# S99sentinel init script via /bin/bash).  Needs `make fw-linux-rootfs` first.
+boot-linux-rootfs:
+	rm -rf src/sim/out/vl_boot
+	"$(MAKE)" -C src/sim vl_boot \
+	    BOOT_HEX=../../tests/linux/work/fw_payload_linux.hex \
+	    BOOT_MAX=1500000000 BOOT_MTIME_DIV=64
 
 # -----------------------------------------------------------------------------
 # Tests
