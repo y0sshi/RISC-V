@@ -13,6 +13,42 @@
 //
 //   make sim_boot                       (default firmware: src/software/boot)
 //   make sim_boot BOOT_HEX=path/to.hex  (e.g. a real OpenSBI fw_payload hex)
+//
+// ---- Instrumentation knob map (2026-07-03 review) ---------------------------
+// All BOOT_* `ifdef blocks below are debug instrumentation accumulated during
+// the RTL bug hunts (#4..#18).  They fall into two classes:
+//
+// PERMANENT, generic (keep; reusable on any future hunt):
+//   BOOT_HEX/BOOT_MAX/BOOT_MTIME_DIV/BOOT_MEM_BASE/BOOT_NO_ICACHE/BOOT_NO_DCACHE
+//     -- harness configuration, not debug.
+//   BOOT_RANDLAT/BOOT_SEED/BOOT_RAND_SPREAD -- randomized AXI latency in the BFM;
+//     the ONLY sim knob that reproduces the variable-latency bug class (#15..#18).
+//   BOOT_TRACE       -- [trap] trace + the RANDLAT-immune detector suite
+//     (FCHK/DESYNC fetch checkers, [STDROP]/[STCORRUPT] store matcher,
+//     [IRQPEND]/[IRQCAUSE] interrupt cross-check).  NOTE: the detectors and
+//     BOOT_ISS only compile under BOOT_TRACE -- always pass BOOT_TRACE=1 with
+//     BOOT_ISS=1 (running BOOT_ISS alone silently runs NO checkers).
+//   BOOT_EXEC[_LO]/BOOT_PTWLO/BOOT_WIN/BOOT_DCWIN/BOOT_HANG_PC/BOOT_DUMP_AT/
+//   BOOT_CYCTRACE/BOOT_VCD -- generic windows/dump/trace helpers.
+//   BOOT_WATCH_PA    -- BFM write-watch on one physical word ([WATCHV]).
+//   BOOT_MTIME_INSTR -- retire-driven mtime/mcycle (HW-bug vs RNG-roulette A/B).
+//   BOOT_STHASH/BOOT_STLO/BOOT_DIVCHK/BOOT_DET_LO -- store-hash / divide-golden /
+//     detector windowing.
+//
+// BUG-SPECIFIC, throwaway (kept as worked examples; REVIEW BEFORE REUSE -- they
+// hardcode vmlinux addresses or bug-specific hierarchy paths that go stale the
+// moment the kernel or the RTL around them is rebuilt):
+//   BOOT_A4TRACE  -- #18 hunt: x14(a4) WB ring buffer + post-fault watch.
+//   BOOT_CTRPROBE -- netlink/atomic hunt: D$/AMO probe on the BOOT_WATCH_PA line.
+//   BOOT_FETCHWIN -- step8 skid hunt: FTQ/halfword-buffer/aligner window trace.
+//   BOOT_IPROBE   -- #17 hunt: IF-PTW/fault pipeline window.
+//   [PRB]/[PRB2]/[PRBP]/[MSCR]/[MSREG] prints (inside BOOT_TRACE/BOOT_DCWIN) --
+//     vmlinux-symbol-specific probes; refresh the addresses with `nm` after any
+//     kernel rebuild (see docs/linux_sim.md).
+//
+// None of the bare-repro regressions (src/software/boot/*_test.S) depend on any
+// throwaway knob: they self-check via UART/tohost.  Deleting a throwaway block
+// is safe for them, but re-run the full gates (CLAUDE.md) before doing so.
 // =============================================================================
 
 `timescale 1ns / 1ps

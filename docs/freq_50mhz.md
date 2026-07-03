@@ -3,6 +3,28 @@
 > 第8セッション着手。目標 = Zybo Z7-20 のコアを 25 MHz -> 50 MHz (20 ns 周期) へ。
 > 完了条件 = 実機 OpenSBI + RV64GC Linux (NET=y) が複数回連続 userspace 到達 + timing met (WNS>=0)。
 
+---
+
+## ✅ 完了サマリ (2026-07-03) — 本文はキャンペーンの詳細ログ (アーカイブ)
+
+**50 MHz 達成済み。実機 Zybo Z7-20 @50MHz で timing met (WNS=+0.313ns, Failing EP 0/74618) +
+OpenSBI + Linux 6.12 + Buildroot RootFS が `ROOTFS-BASH-OK` 到達 (sim/実機)。**
+
+到達手順の要約 (すべて develop にコミット済み):
+- **step1+2** decoupled fetch FIFO + redirect select 登録化 (2e2aecc) — §11
+- **step5** FPU misc 経路 2 段化 / **step6** 整数 MUL 段化 → 30.303MHz (70a6a7d) — §12-13
+- **step7** FP 加算器オペランドのレジスタ化 (1de4dd7) — §19。40MHz 実機達成 (08ff181) — §18.1
+- **step8** FTQ block fetch = IF 段全書換 (fetch skid バグ根治 6335611 / I$ fill-serve abe9bb7 含む) — §20-21, §25
+- **step9** FPU misc-D 2 段化 (e275b75) — §22 / **step10** load→branch interlock (01d1457) — §23 /
+  **step11** FMA-D 加算器 3 段化 (d59705f) — §24 → **default flow 50MHz MET**
+- 方法論の教訓 = **緩い制約はアーティファクトを生む** (33ns 制約の「fetch ループが binding」は誤り。
+  タイト 20ns probe で実測すべし; `build_physopt.tcl`) — §18。
+
+以降の本文 (§1〜§25) は試行錯誤の生ログ。**§番号は RTL コメント (`rv_core.sv`/`rv_dcache.sv` 等) や
+CLAUDE.md から参照されているため、節の削除・再番号付けをしないこと。**
+
+---
+
 ## 1. critical path (確定)
 
 OOC 見積り (`boards/report_area_timing.tcl`, xc7z020-1, RV64) の `timing_worst_paths.rpt`:
