@@ -22,9 +22,18 @@ RUN_IMG   := riscof_run:latest
 SPIKE_IMG := spike:latest
 SAIL_IMG  := sail:latest
 
+# Linux host: run as the invoking user so bind-mount outputs (riscof_work,
+# arch-test-suite clone) are not root-owned.  Windows Docker Desktop maps
+# ownership already -> empty.
+ifeq ($(OS),Windows_NT)
+DOCKER_USER :=
+else
+DOCKER_USER := --user $(shell id -u):$(shell id -g) -e HOME=/tmp
+endif
+
 # MSYS_NO_PATHCONV=1 stops Git-bash/MSYS from rewriting container paths like
 # /workspace and /tmp into Windows paths (harmless if the var is unset elsewhere).
-DOCKER_RUN := MSYS_NO_PATHCONV=1 docker run --rm -v $(PROJECT_ROOT):/workspace \
+DOCKER_RUN := MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_USER) -v $(PROJECT_ROOT):/workspace \
                 -w /workspace/tests/riscof $(RUN_IMG)
 
 # --- Test selection -------------------------------------------------------

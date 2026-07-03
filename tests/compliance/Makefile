@@ -17,7 +17,14 @@ DOCKER_TTY := $(shell powershell -Command "if (-not [Console]::IsInputRedirected
 else
 DOCKER_TTY := $(shell test -t 0 && echo -t)
 endif
-DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) \
+# Linux host: run as the invoking user so bind-mount outputs (tests/results)
+# are not root-owned.  Windows Docker Desktop maps ownership already -> empty.
+ifeq ($(OS),Windows_NT)
+DOCKER_USER :=
+else
+DOCKER_USER := --user $(shell id -u):$(shell id -g) -e HOME=/tmp
+endif
+DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) $(DOCKER_USER) \
                 -v $(PROJECT_ROOT):/workspace \
                 -w /workspace/tests/compliance \
                 $(DOCKER_IMAGE)
@@ -72,7 +79,7 @@ help:
 
 # Open container shell for manual debugging
 shell:
-	docker run --rm -it \
+	docker run --rm -it $(DOCKER_USER) \
 		-v $(PROJECT_ROOT):/workspace \
 		-w /workspace/tests/compliance \
 		$(DOCKER_IMAGE) bash

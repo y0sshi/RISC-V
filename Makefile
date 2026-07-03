@@ -42,7 +42,18 @@ HW_BASE       := 0x00200000
 DTS_OPENSBI_HW := /workspace/docs/opensbi/rv_soc_hw.dts
 DTS_LINUX_HW   := /workspace/tests/linux/rv_soc_linux_hw.dts
 
-DRUN          := docker run --rm -v $(REPO):/workspace
+# On a native Linux host, containers must run as the invoking user, or every
+# file they create on the bind mount is root-owned (the host user then cannot
+# delete/overwrite it).  Docker Desktop on Windows/macOS already maps ownership,
+# so this is Windows-empty.  HOME=/tmp gives the anonymous uid a writable HOME
+# (git/ccache/buildroot all want one).
+ifeq ($(OS),Windows_NT)
+DOCKER_USER :=
+else
+DOCKER_USER := --user $(shell id -u):$(shell id -g) -e HOME=/tmp
+endif
+
+DRUN          := docker run --rm $(DOCKER_USER) -v $(REPO):/workspace
 
 # MSYS/Git-Bash rewrites POSIX-looking args (e.g. `docker -w /workspace/...` ->
 # `C:/msys64/workspace/...`), which breaks the docker working-dir and volume
@@ -159,9 +170,13 @@ fw-opensbi-hw:
 # The build tree lives in a NATIVE docker volume (rv_buildroot_cache:/br), NOT on
 # the Windows bind mount -- glibc's massive parallel build corrupts on 9p/virtiofs
 # (see build_rootfs.sh).  The volume also caches the toolchain across runs.
+# Linux host: the fresh named volume is root-owned, so chown its top dir to the
+# invoking user first (non-recursive: everything below is then user-created; a
+# volume previously populated as root needs a one-time manual `chown -R`).
 .PHONY: rootfs-buildroot
 rootfs-buildroot:
-	docker run --rm -v $(REPO):/workspace -v rv_buildroot_cache:/br \
+	$(if $(DOCKER_USER),docker run --rm -v rv_buildroot_cache:/br $(IMG_BUILDROOT) chown $(shell id -u):$(shell id -g) /br)
+	docker run --rm $(DOCKER_USER) -v $(REPO):/workspace -v rv_buildroot_cache:/br \
 	    -w /workspace/tests/linux $(IMG_BUILDROOT) bash -c \
 	    "tr -d '\015' < build_rootfs.sh | BR_BUILD_DIR=/br BUILDROOT_REF=$(BUILDROOT_REF) BUILDROOT_URL=$(BUILDROOT_URL) FORCE_ROOTFS=$(FORCE_ROOTFS) FORCE_DL=$(FORCE_DL) bash -s"
 

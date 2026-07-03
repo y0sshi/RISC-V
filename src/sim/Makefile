@@ -58,7 +58,15 @@ DOCKER_TTY := $(shell powershell -Command "if (-not [Console]::IsInputRedirected
 else
 DOCKER_TTY := $(shell test -t 0 && echo -t)
 endif
-DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) \
+# Linux host: run as the invoking user so bind-mount outputs (out/, wave/) are
+# not root-owned.  Windows Docker Desktop maps ownership already -> empty.
+# HOME=/tmp gives the anonymous uid a writable HOME (ccache etc.).
+ifeq ($(OS),Windows_NT)
+DOCKER_USER :=
+else
+DOCKER_USER := --user $(shell id -u):$(shell id -g) -e HOME=/tmp
+endif
+DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) $(DOCKER_USER) \
                 -v $(PROJECT_ROOT):/workspace \
                 -w /workspace/src/sim \
                 $(DOCKER_IMAGE)
@@ -813,7 +821,7 @@ wave_boot:
 #   make vl_boot BOOT_HEX=... BOOT_TRACE=1 BOOT_EXEC=1 BOOT_EXEC_LO=8000000
 # See docs/verilator_sim.md.
 VL_IMAGE := verilator:5.020
-VL_DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) \
+VL_DOCKER_RUN := docker run --rm -i $(DOCKER_TTY) $(DOCKER_USER) \
                 -v $(PROJECT_ROOT):/workspace \
                 -w /workspace/src/sim \
                 $(VL_IMAGE)
