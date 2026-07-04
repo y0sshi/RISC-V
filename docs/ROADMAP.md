@@ -64,6 +64,22 @@ bash シェル到達 (`ROOTFS-BASH-OK`) を達成** (2026-07-03、sim/実機と�
     想定 (再計測不要)。**残作業 = 実機での bitstream 合成 (`build_all.py`) + JTAG bring-up
     (`vitis/bringup_jtag.tcl`) + `ROOTFS-BASH-OK` 到達確認** (実機所有者が実施)。
 - **KV260 = Zynq UltraScale+ (PS8/A53/DDR4)**。PS 初期化・FSBL・SmartConnect が別物で中工数。
+  - **✅ スクリプト整備完了 (2026-07-04)**: `boards/kv260/` に `build_all.py`/`set_pl_freq.py`/
+    `vivado/build_kv260.tcl`(207行の旧プレースホルダから本番品質へ全面書換)/`vivado/export_xsa.tcl`/
+    `vitis/{fsbl.py,bringup_jtag.tcl}` を新設。board_part (`xilinx.com:kv260_som:part0:1.4`) は
+    Vivado 2024.2 に同梱済みのため vendoring 不要。`apply_bd_automation ... apply_board_preset` を
+    board_part のみ (carrier の board_connections 無し) で実行し **DDR4 64bit 構成が CRITICAL
+    WARNING 無しで通ることを実測確認済み** (Vivado `project` ステージ実行、exit code 0、無害な
+    PS8 特有 WARNING 2件 [AWUSER/ARUSER_WIDTH mismatch] のみ)。UART は J2 Pmod 互換ヘッダの
+    `som240_1_b21`(E12)/`som240_1_b22`(D11) に配線 (Xilinx 公式 part0_pins.xml とコミュニティ
+    gist の2系統で座標一致を確認済みだが、実配線前にユーザー側でのスキーマティック再確認を推奨)。
+    **⚠️ 3点の未検証/簡略化**: ①UART ピンの物理配線は上記の通りクロスチェック止まり
+    (実配線前確認推奨)、②JTAG bring-up は Zynq-7000 と異なり FSBL+PMUFW の実行が必須
+    (`ps7_init` 相当のレジスタ叩きのみでは完結しない) でドキュメントベースの組立につき
+    実機未検証、③PL クロック実現値は PS7 と異なり複数 PLL 構成のため `set_pl_freq.py` は
+    実現値の自動計算をせず PL_FREQMHZ 書換のみに留めた (詳細は各 README/スクリプト冒頭コメント)。
+    **残作業 = 実機での bitstream 合成 + Vitis FSBL/PMUFW ビルド + JTAG bring-up (要デバッグの
+    可能性あり) + `ROOTFS-BASH-OK` 到達確認** (実機所有者が実施)。
 
 ### ⑤ Vector (RVV) 拡張 (新機能)
 
