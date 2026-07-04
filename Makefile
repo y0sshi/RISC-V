@@ -101,9 +101,9 @@ help:
 	@echo "  make sim-<name>            any src/sim target, e.g. make sim-pipeline"
 	@echo ""
 	@echo "FPGA / board (run from PowerShell - NOT make):"
-	@echo "  python boards/zybo_z720/build_all.py     bitstream -> XSA -> FSBL -> BOOT.bin"
-	@echo "  python boards/zybo_z720/set_pl_freq.py <MHz>   retarget PL clock (e.g. 50) first"
-	@echo "  boards/zybo_z720/vitis/bringup_jtag.tcl   on-board JTAG bring-up (xsct)"
+	@echo "  python boards/zybo_z720/build_all.py                               bitstream -> XSA -> FSBL -> BOOT.bin"
+	@echo "  python boards/zybo_z720/set_pl_freq.py <MHz>                       retarget PL clock (e.g. 50) first"
+	@echo "  \$${XILINX_VITIS}/bin/xsct boards/zybo_z720/vitis/bringup_jtag.tcl   on-board JTAG bring-up (xsct)"
 
 # -----------------------------------------------------------------------------
 # Dependencies: clone pinned external trees into their gitignored work dirs.

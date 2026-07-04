@@ -35,11 +35,15 @@ BR2_STATIC_LIBS=y
 BR2_INIT_BUSYBOX=y
 
 # --- Console / login on ttyS0 (our NS16550 UART) ---
-# getty -n -l /bin/bash skips login and drops straight into bash on the serial
-# console (ideal for bring-up; the empty root password below also allows login).
+# getty -n -l <prog> skips login and execs <prog> straight into a shell on the
+# serial console (ideal for bring-up; the empty root password below also
+# allows login).  busybox getty execs <prog> with argv[0] left as the plain
+# path (no leading '-'), so a bare "/bin/bash" never sees itself as a login
+# shell and skips /etc/profile.  /sbin/login_bash wraps it with --login so
+# /etc/profile (winsize workaround, etc.) actually runs.
 BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
 BR2_TARGET_GENERIC_GETTY_BAUDRATE_57600=y
-BR2_TARGET_GENERIC_GETTY_OPTIONS="-n -l /bin/bash"
+BR2_TARGET_GENERIC_GETTY_OPTIONS="-n -l /sbin/login_bash"
 BR2_TARGET_GENERIC_ROOT_PASSWD=""
 
 # --- The real bash (goal of this milestone) ---

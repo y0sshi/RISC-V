@@ -1,0 +1,6 @@
+#!/bin/sh
+# busybox getty's -l option execs the given program with argv[0] left as the
+# plain path (no leading '-') and no --login flag, so bash never recognizes
+# itself as a login shell and skips /etc/profile entirely.  Force it via
+# --login instead of relying on argv[0] convention.
+exec /bin/bash --login

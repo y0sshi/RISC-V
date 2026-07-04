@@ -1,0 +1,9 @@
+# A serial console (Pmod JC UART, no pty) never receives a TIOCSWINSZ from
+# the terminal client, so the kernel's winsize stays 0x0 and screen-oriented
+# programs (vi/top/less) silently no-op (clear the screen, then exit) instead
+# of drawing.  Only fall back to a fixed default when the size is still 0x0 --
+# an ssh/pty session already got its real size from the client and must not
+# be overwritten.
+case "$(stty size 2>/dev/null)" in
+    ""|"0 0"|"0"|" ") stty rows 24 cols 80 2>/dev/null ;;
+esac
