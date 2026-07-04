@@ -51,6 +51,18 @@ bash シェル到達 (`ROOTFS-BASH-OK`) を達成** (2026-07-03、sim/実機と�
 
 - **PYNQ-Z1 / PYNQ-Z2 = Zynq-7000 で Zybo Z7-20 とほぼ同系**。RTL 不変、XDC ピン + ボードプリセット +
   DDR/クロックのみ。小工数の確実な勝ち。
+  - **✅ スクリプト整備完了 (2026-07-04)**: `boards/pynq_z1/` `boards/pynq_z2/` に Zybo と同型の
+    ビルド一式 (`build_all.py`/`set_pl_freq.py`/`vivado/build_pynq_z{1,2}.tcl`/`vitis/*`) を新設。
+    board_files は `pynq-z1/1.0` (vendor `www.digilentinc.com`, 大文字混在の旧規約) /
+    `pynq-z2/A.0` (vendor `tul.com.tw`) をコミュニティ配布元から vendoring (詳細は各
+    `board_files/README.md`)。board_part VLNV はハードコードせず `get_board_parts -filter` で
+    実行時解決 (旧規約の casing に非依存)。UART は Pmod JC が無いため **Pmod JB (JB1=W14
+    uart_tx, JB2=Y14 uart_rx, 両ボード共通)** に配線。`vivado.bat -tclargs project` (BD 生成のみ、
+    非synth) を両ボードで実行し board_part 解決 + BD 生成が無エラーで通ることを確認済み
+    (`www.digilentinc.com:pynq-z1:part0:1.0` / `tul.com.tw:pynq-z2:part0:1.0` に解決)。
+    同一チップ (`xc7z020clg400-1`) のため 50MHz timing closure は Zybo の結果がそのまま適用できる
+    想定 (再計測不要)。**残作業 = 実機での bitstream 合成 (`build_all.py`) + JTAG bring-up
+    (`vitis/bringup_jtag.tcl`) + `ROOTFS-BASH-OK` 到達確認** (実機所有者が実施)。
 - **KV260 = Zynq UltraScale+ (PS8/A53/DDR4)**。PS 初期化・FSBL・SmartConnect が別物で中工数。
 
 ### ⑤ Vector (RVV) 拡張 (新機能)

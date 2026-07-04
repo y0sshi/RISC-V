@@ -8,7 +8,7 @@
 #   Two command families (by hard constraint):
 #     - bash / docker  -> THIS Makefile  (firmware builds, verilator boot, tests)
 #     - FPGA (Vivado/Vitis MUST run from PowerShell; Bash/MSYS crashes synth)
-#                      -> python boards/zybo_z720/build_all.py  (+ bringup_jtag.tcl)
+#                      -> python boards/<board>/build_all.py  (+ bringup_jtag.tcl)
 #
 # Docker mounts the repo at /workspace using the same $(abspath)/dirname idiom as
 # src/sim/Makefile (proven to produce a Docker-acceptable host path on this setup).
@@ -90,8 +90,8 @@ help:
 	@echo "  3) make boot-linux-rootfs               boot in sim; PASS = 'ROOTFS-BASH-OK:' (~20 min)"
 	@echo "Linux + rootfs (bash), end-to-end -- real HW (Zybo) path:"
 	@echo "  1) make fw-linux-rootfs-hw              rootfs fw @0x200000 + stash ELF for JTAG"
-	@echo "  2) PowerShell: python boards/zybo_z720/build_all.py  (see FPGA section below)"
-	@echo "  3) PowerShell: boards/zybo_z720/vitis/bringup_jtag.tcl (Pmod JC UART 57600 8N1)"
+	@echo "  2) PowerShell: python boards/<board>/build_all.py  (see FPGA section below)"
+	@echo "  3) PowerShell: boards/<board>/vitis/bringup_jtag.tcl (Pmod JC UART 57600 8N1)"
 	@echo "  NOTE: the Buildroot tree lives in a NATIVE docker volume (rv_buildroot_cache);"
 	@echo "        run make from the repo root.  See docs/linux_sim.md for the full flow."
 	@echo ""
@@ -101,9 +101,9 @@ help:
 	@echo "  make sim-<name>            any src/sim target, e.g. make sim-pipeline"
 	@echo ""
 	@echo "FPGA / board (run from PowerShell - NOT make):"
-	@echo "  python boards/zybo_z720/build_all.py                               bitstream -> XSA -> FSBL -> BOOT.bin"
-	@echo "  python boards/zybo_z720/set_pl_freq.py <MHz>                       retarget PL clock (e.g. 50) first"
-	@echo "  \$${XILINX_VITIS}/bin/xsct boards/zybo_z720/vitis/bringup_jtag.tcl   on-board JTAG bring-up (xsct)"
+	@echo "  python boards/<board>/build_all.py                               bitstream -> XSA -> FSBL -> BOOT.bin"
+	@echo "  python boards/<board>/set_pl_freq.py <MHz>                       retarget PL clock (e.g. 50) first"
+	@echo "  \$${XILINX_VITIS}/bin/xsct boards/<board>/vitis/bringup_jtag.tcl   on-board JTAG bring-up (xsct)"
 
 # -----------------------------------------------------------------------------
 # Dependencies: clone pinned external trees into their gitignored work dirs.
