@@ -15,13 +15,13 @@
 # Zynq UltraScale+ (KV260) is different: JTAG bring-up needs BOTH an FSBL
 # (running on the APU, Cortex-A53) AND a PMU firmware image (PMUFW, running on
 # the separate MicroBlaze-based Platform Management Unit) -- see
-# ../README.md for why. Creating a standalone platform for psu_cortexa53_0 is
-# EXPECTED to auto-generate both fsbl.elf and pmufw.elf as platform boot
-# components (mirroring how the Zynq-7000 flow auto-generates just fsbl.elf),
-# but this has NOT been run against real Vitis 2024.2 output by this script's
-# author -- if pmufw.elf does not appear after platform.build(), check the
-# Vitis platform creation GUI/docs for a separate PMU domain
-# (cpu="psu_pmu_0", os="standalone") that may need to be added explicitly.
+# ../README.md for why. Creating a standalone platform for psu_cortexa53_0
+# DOES auto-generate both as platform boot components -- CONFIRMED against a
+# real Vitis 2024.2 run (2026-07-04). The one surprise: pmufw.elf does NOT
+# land under sw/boot/ alongside fsbl.elf as originally expected -- it lands
+# under sw/qemu/ instead (not a QEMU-only artifact despite the directory
+# name; it is the real PMUFW for this platform). bringup_jtag.tcl already
+# points at sw/qemu/pmufw.elf accordingly.
 #
 # Run in BATCH from PowerShell, NOT Bash/MSYS (its path translation breaks the
 # Xilinx tools). From the repo root (tool via $env:XILINX_VITIS or PATH):
@@ -29,9 +29,9 @@
 #       $PWD\boards\kv260\vitis\fsbl.py `
 #       *> $PWD\boards\kv260\vitis\fsbl.log 2>&1
 #
-# Expected output ELFs (workspace is gitignored):
+# Output ELFs (workspace is gitignored):
 #   boards/kv260/vitis/ws/kv260_plat/export/kv260_plat/sw/boot/fsbl.elf
-#   boards/kv260/vitis/ws/kv260_plat/export/kv260_plat/sw/boot/pmufw.elf
+#   boards/kv260/vitis/ws/kv260_plat/export/kv260_plat/sw/qemu/pmufw.elf
 # =============================================================================
 import os
 import shutil
@@ -82,3 +82,9 @@ for root, _dirs, files in os.walk(WS):
             print("  %s: %s" % (f, os.path.join(root, f)))
 
 vitis.dispose()
+
+# CONFIRMED (2026-07-04, real Vitis 2024.2 run): platform.build() DOES
+# auto-generate both. fsbl.elf lands under sw/boot/ as expected, but
+# pmufw.elf lands under sw/qemu/ instead of sw/boot/ (not the QEMU-only
+# artifact the directory name suggests -- it is the real PMUFW for this
+# platform). bringup_jtag.tcl points at sw/qemu/pmufw.elf accordingly.

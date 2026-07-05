@@ -1,0 +1,46 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * rv_riscv_kv260_overlay.dts - minimal PL bitstream-load overlay for the
+ * RISC-V SoC on KV260, used with Linux's fpga_manager framework (fpgautil)
+ * instead of raw JTAG `fpga -file`.
+ *
+ * Background (see boards/kv260/vitis/README.md "xmutil / fpgautil path"):
+ * on real KV260 hardware, `pl_resetn0` (the PS-to-PL reset that releases our
+ * RISC-V core) is controlled via a PS EMIO GPIO line, not a simple register
+ * bit -- it is normally released by Linux's zynqmp-fpga driver as part of
+ * its standard bitstream-load sequence. A bare JTAG `fpga -file` bypasses
+ * that driver entirely and leaves pl_resetn0 asserted, so the RISC-V core
+ * never starts even though the bitstream loads and DDR4/PMUFW/FSBL all work
+ * fine (confirmed on real hardware, 2026-07-04).
+ *
+ * This overlay is DELIBERATELY minimal: it only points the standard
+ * "fpga_full" FPGA region at our bitstream (firmware-name) -- there are NO
+ * extra device nodes for our custom AXI peripherals (UART/GPIO/CLINT/PLIC),
+ * because the RISC-V core accesses them directly over its own AXI masters;
+ * Linux itself doesn't need a driver for any of them.
+ *
+ * Compile (any host with a device-tree-compiler; the project's linux-rv64
+ * docker image already has one -- see tests/linux/Dockerfile):
+ *   dtc -@ -I dts -O dtb -o rv_riscv_kv260_overlay.dtbo rv_riscv_kv260_overlay.dts
+ *
+ * On the board (already running its stock Ubuntu/PetaLinux via SD, since
+ * KV260 has no boot-mode switch -- see the confidence note in
+ * bringup_jtag.tcl):
+ *   sudo fpgautil -b rv_riscv_kv260.bit.bin -o rv_riscv_kv260_overlay.dtbo
+ *
+ * NOT independently verified on real hardware yet as of authoring -- this
+ * is the next thing to try.
+ */
+
+/ {
+    fragment@0 {
+        target = <&fpga_full>;
+        __overlay__ {
+            #address-cells = <2>;
+            #size-cells = <2>;
+            firmware-name = "rv_riscv_kv260.bit.bin";
+        };
+    };
+};
