@@ -22,6 +22,15 @@ module tb_rv_mmu;
     logic [XLEN-1:0]  mem_pa;
     logic             mem_req_out, mem_we_out, mem_fault;
     logic             mmu_stall;
+
+    // Per-access strobe to the MMU MEM port: auto-generated as the rising edge of
+    // mem_req (one new access per req assertion), mirroring rv_core's dmem_acc_new.
+    // The MMU now does a REGISTERED MEM-port lookup gated by this strobe (the data
+    // TLB is taken off the stall_if critical path); the translated PA is therefore
+    // presented one cycle after the strobe (see rv_mmu.sv / docs/freq_50mhz.md).
+    logic             mem_acc_new, mem_acc_new_out, mem_req_q;
+    always_ff @(posedge clk) mem_req_q <= mem_req;
+    assign mem_acc_new = mem_req & ~mem_req_q;
     logic [XLEN-1:0]  ptw_paddr;
     logic             ptw_req;
     logic [XLEN-1:0]  ptw_rdata;
@@ -35,8 +44,10 @@ module tb_rv_mmu;
         .if_va(if_va), .if_req(if_req),
         .if_pa(if_pa), .if_req_out(if_req_out), .if_fault(if_fault),
         .mem_va(mem_va), .mem_req(mem_req), .mem_we(mem_we),
+        .mem_acc_new(mem_acc_new),
         .mem_pa(mem_pa), .mem_req_out(mem_req_out),
         .mem_we_out(mem_we_out), .mem_fault(mem_fault),
+        .mem_acc_new_out(mem_acc_new_out),
         .mmu_stall(mmu_stall),
         .ptw_paddr(ptw_paddr), .ptw_req(ptw_req),
         .ptw_rdata(ptw_rdata), .ptw_ready(ptw_ready)
@@ -307,11 +318,20 @@ module tb_rv_mmu;
             // [8] R+W+X page: load and store OK
             // --------------------------------------------------------
             $display("\n[8] R+W+X page: load/store OK");
-            // VA=0x0001_2345 mapped PPN=3, RWXU, D=1
-            mem_va = XLEN'(32'h0001_2345); mem_req = 1'b1; mem_we = 1'b0; #1;
+            // VA=0x0001_2345 mapped PPN=3, RWXU, D=1 (already in TLB -> hit).
+            // The MEM port now PRESENTS the registered translation one cycle after
+            // the per-access strobe (the capture bubble), so advance until the
+            // registered result is presented (mmu_stall drops) before sampling.
+            // Load and store are SEPARATE accesses (each re-edges mem_req to strobe).
+            mem_va = XLEN'(32'h0001_2345); mem_req = 1'b1; mem_we = 1'b0;
+            @(posedge clk); #1;                          // strobe: capture (hit)
+            while (mmu_stall) begin @(posedge clk); #1; end  // present
             check_x("load fault=0",  mem_fault,   1'b0);
             check_x("load req=1",    mem_req_out, 1'b1);
-            mem_we = 1'b1; #1;
+            idle_inputs(); @(posedge clk); #1;           // drop req for a fresh strobe
+            mem_va = XLEN'(32'h0001_2345); mem_req = 1'b1; mem_we = 1'b1;
+            @(posedge clk); #1;                          // strobe: capture (hit)
+            while (mmu_stall) begin @(posedge clk); #1; end  // present
             check_x("store fault=0", mem_fault,   1'b0);
             check_x("store req=1",   mem_req_out, 1'b1);
             idle_inputs(); @(posedge clk); #1;

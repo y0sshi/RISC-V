@@ -1,0 +1,33 @@
+# =============================================================================
+# RISCOF runner image: riscv64 toolchain + iverilog + Spike + RISCOF, all-in-one.
+# Avoids host PATH issues (host riscv64-unknown-elf-gcc resolves to a rv32 Xilinx
+# GCC) by running the whole flow inside one container.
+#
+# Build (after `docker build -t spike:latest spike/`):
+#   docker build -t riscof_run:latest -f Dockerfile.run .
+# Run (from repo root):
+#   docker run --rm -v "<repo>:/workspace" -w /workspace/tests/riscof riscof_run:latest \
+#     riscof run --config=config.ini \
+#       --suite=arch-test-suite/riscv-test-suite \
+#       --env=arch-test-suite/riscv-test-suite/env --no-browser
+# =============================================================================
+FROM riscv_act:latest
+
+# iverilog/vvp + python + git (toolchain riscv64-unknown-elf-* already in base image)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iverilog python3 python3-pip git ca-certificates \
+        device-tree-compiler && \
+    rm -rf /var/lib/apt/lists/*
+
+# Spike binary from the dedicated image
+COPY --from=spike:latest /usr/local/bin/spike /usr/local/bin/spike
+
+# RISCOF: riscof 1.25.3 pins the yanked gitpython==3.1.17.  Use uv with an
+# override (same as the host uv setup) to install a maintained gitpython.
+RUN pip3 install --break-system-packages --no-cache-dir uv && \
+    printf 'gitpython>=3.1.30\n' > /tmp/ov.txt && \
+    uv pip install --system --break-system-packages --no-cache-dir \
+        --override /tmp/ov.txt "riscof==1.25.3"
+
+WORKDIR /workspace
+CMD ["riscof", "--version"]

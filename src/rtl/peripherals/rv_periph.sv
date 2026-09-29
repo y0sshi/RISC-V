@@ -1,0 +1,177 @@
+// =============================================================================
+/// @file rv_periph.sv
+/// @brief Memory-mapped peripheral subsystem (CLINT timer, UART, PLIC, GPIO).
+///
+/// Shared by every SoC wrapper that carries peripherals (rv_soc = AXI/DDR,
+/// rv_soc_bram = Harvard).  Presents a simple synchronous slave on the core's
+/// physical data bus.  Address decode (peripheral region 0xC0xx) and the
+/// 1-cycle registered read path live here so the wrappers only have to:
+///   - route a data access here when @c is_periph, and to memory otherwise,
+///   - select @c rdata when @c rdata_valid (a peripheral read result this cycle).
+///
+/// Memory map (matches the SoC docs):
+///   CLINT 0xC000_xxxx, UART 0xC001_xxxx, GPIO 0xC002_xxxx, PLIC 0xC010_xxxx.
+///
+/// @param XLEN      Data path width.
+/// @param CLK_FREQ  Core clock (for UART baud divisor).
+/// @param BAUD_RATE UART baud rate.
+// =============================================================================
+
+`default_nettype none
+
+module rv_periph
+    import rv_pkg::*;
+#(
+    parameter int XLEN      = rv_pkg::XLEN,
+    parameter int CLK_FREQ  = 125_000_000,
+    parameter int BAUD_RATE = 115_200,
+    parameter int MTIME_DIV = 1          // CLINT mtime prescaler (see rv_timer)
+) (
+    input  wire              clk,
+    input  wire              rst_n,
+
+    // ---- Simple-bus slave (physical data address from the MMU) --------------
+    input  wire  [XLEN-1:0]   addr,    // = mmu_dmem_pa
+    input  wire  [XLEN-1:0]   wdata,   // = core_dmem_wdata (byte-lane aligned)
+    input  wire  [XLEN/8-1:0] wstrb,   // = core_dmem_wstrb (byte-lane aligned)
+    input  wire               req,     // = mmu_dmem_req
+    input  wire               we,      // = mmu_dmem_we
+    output logic             is_periph,   // combinational: addr targets a peripheral
+    output logic [XLEN-1:0]  rdata,       // registered read data (valid when rdata_valid)
+    output logic             rdata_valid, // a peripheral READ result is on rdata this cycle
+
+    // ---- Interrupts ----------------------------------------------------------
+    output logic             timer_irq,
+    output logic             sw_irq,      // CLINT msip software interrupt
+    output logic [1:0]       ext_irq,     // PLIC contexts
+    output logic [63:0]      mtime,       // CLINT mtime (for the core's 'time' CSR)
+
+    // ---- I/O -----------------------------------------------------------------
+    input  wire  [3:0]       gpio_in,
+    output logic [3:0]       gpio_out,
+    input  wire              uart_rx,
+    output logic             uart_tx
+);
+
+    // ---- Address decode ------------------------------------------------------
+    // The PLIC uses the standard SiFive map (base 0xC010_0000) whose registers
+    // span up to base+0x201004 (S-context claim) -- i.e. 0xC010_0000..0xC031_xxxx.
+    // It therefore owns addr[23:20] in {1,2,3} (0xC01x/0xC02x/0xC03x_xxxx), which
+    // is disjoint from CLINT/UART/GPIO (all at 0xC00x_xxxx, addr[23:20]=0).
+    logic is_timer_access, is_uart_access, is_gpio_access, is_plic_access;
+    always_comb begin
+        is_timer_access = (addr[31:16] == 16'hC000);
+        is_uart_access  = (addr[31:16] == 16'hC001);
+        is_gpio_access  = (addr[31:16] == 16'hC002);
+        is_plic_access  = (addr[31:24] == 8'hC0)
+                        && (addr[23:20] >= 4'h1) && (addr[23:20] <= 4'h3);
+        is_periph       = is_timer_access | is_uart_access
+                        | is_gpio_access  | is_plic_access;
+    end
+
+    // PLIC byte offset from its base (0xC010_0000): low 22 bits minus 0x100000.
+    // In-region addresses keep addr[21:0] in [0x100000, 0x3FFFFF] (no wrap), so
+    // the offset lands in [0, 0x2FFFFF] covering the whole standard map.
+    wire [21:0] plic_off = addr[21:0] - 22'h100000;
+
+    logic [XLEN-1:0] timer_rdata;
+    logic [31:0]     uart_rdata, plic_rdata, gpio_rdata;
+    logic            uart_tx_irq, uart_rx_irq, gpio_irq;
+
+    // 32-bit peripheral WRITE lane select: the core pre-shifts sub-XLEN store
+    // data onto the byte lanes selected by the address, so on RV64 a 32-bit
+    // store to a register at addr[2]=1 (UART IER/LCR @ +4/+0xC, PLIC
+    // claim/complete, CLINT mtimecmp_hi, ...) carries its data on
+    // wdata[63:32] -- wdata[31:0] is zero.  Select the active lane so 32-bit
+    // peripherals always see the written value on their 32-bit port.
+    // (The CLINT takes the full wdata/wstrb instead: it has genuine 64-bit
+    // registers and supports 64-bit accesses.)
+    wire [31:0] wdata32 = (XLEN == 64 && addr[2]) ? wdata[XLEN-1 -: 32]
+                                                  : wdata[31:0];
+
+    // ---- 1-cycle registered read path (BRAM-like latency) -------------------
+    logic [XLEN-1:0] periph_rdata_reg;
+    logic            prev_periph_read;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            periph_rdata_reg <= '0;
+            prev_periph_read <= 1'b0;
+        end else begin
+            // Replicate the 32-bit peripheral register across every 32-bit lane.
+            // On RV64 the core right-shifts a sub-XLEN load by (addr[2:0]*8) to
+            // select the byte lane within a 64-bit word; a 32-bit MMIO register at
+            // a word offset with addr[2]=1 (e.g. UART STAT @ +4) would otherwise be
+            // shifted out (>>32) and read as 0.  Peripherals return data on the low
+            // 32 bits regardless of addr[2], so replicating makes either lane valid.
+            // The CLINT is the exception: it returns the naturally-aligned XLEN-wide
+            // value (64-bit mtime/mtimecmp readq on RV64 needs distinct halves), so
+            // its rdata passes through unreplicated -- each lane already holds the
+            // correct half.
+            if (is_timer_access)      periph_rdata_reg <= timer_rdata;
+            else if (is_uart_access)  periph_rdata_reg <= {(XLEN/32){uart_rdata}};
+            else if (is_gpio_access)  periph_rdata_reg <= {(XLEN/32){gpio_rdata}};
+            else if (is_plic_access)  periph_rdata_reg <= {(XLEN/32){plic_rdata}};
+            prev_periph_read <= req & ~we & is_periph;
+        end
+    end
+    assign rdata       = periph_rdata_reg;
+    assign rdata_valid = prev_periph_read;
+
+    // ---- Peripherals ---------------------------------------------------------
+    rv_timer #(.XLEN (XLEN), .MTIME_DIV (MTIME_DIV)) u_timer (
+        .clk (clk), .rst_n (rst_n),
+        .addr (addr[15:0]),
+        .req  (req & is_timer_access),
+        .we   (we  & is_timer_access),
+        .wdata (wdata),
+        .wstrb (wstrb),
+        .rdata (timer_rdata),
+        .timer_irq (timer_irq),
+        .sw_irq (sw_irq),
+        .mtime_o (mtime)
+    );
+
+    rv_uart #(
+        .CLK_FREQ (CLK_FREQ),
+        .BAUD_RATE (BAUD_RATE)
+    ) u_uart (
+        .clk (clk), .rst_n (rst_n),
+        .addr (addr[4:0]),
+        .req  (req & is_uart_access),
+        .we   (we  & is_uart_access),
+        .wdata (wdata32),
+        .rdata (uart_rdata),
+        .uart_tx (uart_tx),
+        .uart_rx (uart_rx),
+        .tx_irq (uart_tx_irq),
+        .rx_irq (uart_rx_irq)
+    );
+
+    rv_plic #(
+        .NSRC (8), .NCTX (2), .PRIO_BITS (3)
+    ) u_plic (
+        .clk (clk), .rst_n (rst_n),
+        .addr (plic_off),
+        .req  (req & is_plic_access),
+        .we   (we  & is_plic_access),
+        .wdata (wdata32),
+        .rdata (plic_rdata),
+        .src_irq ({5'b0, gpio_irq, uart_tx_irq, uart_rx_irq}),
+        .ext_irq (ext_irq)
+    );
+
+    rv_gpio #(.WIDTH(4)) u_gpio (
+        .clk (clk), .rst_n (rst_n),
+        .addr (addr[3:0]),
+        .req  (req & is_gpio_access),
+        .we   (we  & is_gpio_access),
+        .wdata (wdata32),
+        .rdata (gpio_rdata),
+        .gpio_in (gpio_in),
+        .gpio_out (gpio_out),
+        .irq (gpio_irq)
+    );
+
+endmodule
+
+`default_nettype wire

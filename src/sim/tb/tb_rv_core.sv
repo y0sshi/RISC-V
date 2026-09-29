@@ -39,7 +39,7 @@ module tb_rv_core;
     // =========================================================================
     // DUT instantiation
     // =========================================================================
-    rv_soc #(
+    rv_soc_bram #(
         .IMEM_DEPTH (4096),
         .DMEM_DEPTH (4096),
         .IMEM_FILE  (IMEM_FILE),
@@ -79,24 +79,24 @@ module tb_rv_core;
             @(posedge clk);
 
             // Monitor PC and instruction (useful for debugging)
-            if (dut.u_core.if_id_valid) begin
+            if (dut.u_cpu.u_core.if_id_valid) begin
                 $display("[%0t] PC=0x%08h INST=0x%08h",
                     $time,
-                    dut.u_core.if_id_pc,
-                    dut.u_core.if_id_inst);
+                    dut.u_cpu.u_core.if_id_pc,
+                    dut.u_cpu.u_core.if_id_inst);
             end
 
             // Detect ECALL (0x00000073) as test termination
-            if (dut.u_core.if_id_inst == 32'h00000073 &&
-                dut.u_core.if_id_valid) begin
+            if (dut.u_cpu.u_core.if_id_inst == 32'h00000073 &&
+                dut.u_cpu.u_core.if_id_valid) begin
                 $display("=== ECALL detected - Test Complete ===");
                 // x10 (a0) holds return value: 0 = pass, non-zero = fail
-                $display("a0 (x10) = %0d", dut.u_core.u_regfile.regs[10]);
-                if (dut.u_core.u_regfile.regs[10] == 0) begin
+                $display("a0 (x10) = %0d", dut.u_cpu.u_core.u_regfile.regs[10]);
+                if (dut.u_cpu.u_core.u_regfile.regs[10] == 0) begin
                     $display("RESULT: PASS");
                 end else begin
                     $display("RESULT: FAIL (code=%0d)",
-                        dut.u_core.u_regfile.regs[10]);
+                        dut.u_cpu.u_core.u_regfile.regs[10]);
                 end
                 $finish;
             end

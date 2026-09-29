@@ -77,7 +77,7 @@ module zybo_z7_top (
     // =========================================================================
     logic [3:0] gpio_out;
 
-    rv_soc #(
+    rv_soc_bram #(
         .IMEM_DEPTH (8192),        // 8K x 32-bit = 32 KB instruction memory
         .DMEM_DEPTH (4096),        // 4K x 32-bit = 16 KB data memory
         .IMEM_FILE  (""),          // Load via Vivado memory initialisation

@@ -1,0 +1,85 @@
+/dts-v1/;
+
+/* Base-relocated copy of rv_soc_linux.dts for the real-HW PS-DDR base
+ * (FW_BASE=0x0020_0000).  Identical to rv_soc_linux.dts except /memory is moved
+ * to the re-linked firmware base.  Linux is relocatable and takes its RAM base
+ * from this /memory node, so re-linking the OpenSBI wrapper + this DTB is all
+ * that changes (the kernel Image is base-independent).
+ *
+ * Keep /memory <= the rv_axi_dualport_mem_bfm DEPTH (64 MiB) in
+ * tb_rv_boot_soc.sv: OpenSBI relocates the FDT inside declared RAM, and
+ * overshooting the BFM reads X and runs away (see docs/opensbi_sim.md).  The
+ * 1 GB real-HW /memory is a later (P2) step; bring-up uses 64 MiB.
+ */
+
+/ {
+    #address-cells = <2>;
+    #size-cells = <2>;
+    compatible = "rvcore,rv_soc";
+    model = "rv_soc (RV64GC educational core)";
+
+    chosen {
+        bootargs = "earlycon=sbi console=ttyS0,115200";
+        stdout-path = "/soc/serial@c0010000";
+    };
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        timebase-frequency = <1000000>;   /* CLINT mtime ticks once per cycle */
+
+        cpu0: cpu@0 {
+            device_type = "cpu";
+            reg = <0>;
+            compatible = "riscv";
+            riscv,isa = "rv64imafdc";
+            mmu-type = "riscv,sv39";
+            status = "okay";
+
+            cpu0_intc: interrupt-controller {
+                #interrupt-cells = <1>;
+                interrupt-controller;
+                compatible = "riscv,cpu-intc";
+            };
+        };
+    };
+
+    /* 64 MiB at the re-linked base (0x0020_0000) == the BFM DEPTH (1<<26). */
+    memory@200000 {
+        device_type = "memory";
+        reg = <0x0 0x00200000  0x0 0x04000000>;
+    };
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        compatible = "simple-bus";
+        ranges;
+
+        clint@c0000000 {
+            compatible = "riscv,clint0";
+            reg = <0x0 0xc0000000  0x0 0x10000>;
+            interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;  /* MSIP, MTIP */
+        };
+
+        plic0: interrupt-controller@c0100000 {
+            compatible = "riscv,plic0";
+            reg = <0x0 0xc0100000  0x0 0x4000000>;
+            #interrupt-cells = <1>;
+            interrupt-controller;
+            interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>; /* MEIP, SEIP */
+            riscv,ndev = <8>;
+        };
+
+        serial@c0010000 {
+            compatible = "ns16550a";
+            reg = <0x0 0xc0010000  0x0 0x1000>;
+            reg-shift = <2>;
+            reg-io-width = <4>;
+            interrupt-parent = <&plic0>;
+            interrupts = <1>;
+            clock-frequency = <1843200>;
+            current-speed = <115200>;
+        };
+    };
+};

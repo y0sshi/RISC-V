@@ -1,0 +1,39 @@
+# =============================================================================
+# export_xsa.tcl - Export a fixed hardware platform (.xsa) from the ALREADY-BUILT
+#                  KV260 project, reusing impl_1 (no re-implementation).
+# =============================================================================
+# The .xsa bundles the PS8 init (psu_init.tcl/.c -- DDR4/clock bring-up) and
+# the implemented bitstream, and is the hand-off Vitis consumes to generate the
+# FSBL + PMUFW and BOOT.bin (prep-C) and the JTAG bring-up scripts (prep-D).
+#
+# Run from PowerShell (NOT Bash/MSYS -- its path translation crashes Vivado). The
+# -source path must be ABSOLUTE (a relative path makes Vivado's cwd != repo root
+# and "couldn't read file"); from the repo root, $PWD\... is absolute:
+#   & "$env:XILINX_VIVADO\bin\vivado.bat" -mode batch `
+#       -source $PWD\boards\kv260\vivado\export_xsa.tcl `
+#       *> $PWD\boards\kv260\vivado\export_xsa.log 2>&1
+#
+# Requires a completed impl_1 with a written bitstream (build_kv260.tcl -tclargs bit).
+# Output: boards/kv260/vivado/rv_riscv_kv260/rv_riscv_kv260.xsa (gitignored).
+# =============================================================================
+
+set script_dir [file normalize [file dirname [info script]]]
+set proj_name  "rv_riscv_kv260"
+set proj_dir   "$script_dir/$proj_name"
+set xpr        "$proj_dir/$proj_name.xpr"
+set xsa        "$proj_dir/$proj_name.xsa"
+
+if {![file exists $xpr]} {
+    error "project not found: $xpr  (build it first: build_kv260.tcl -tclargs bit)"
+}
+
+open_project $xpr
+
+# Pull the routed design + bitstream from impl_1 into memory so write_hw_platform
+# can emit the fixed platform with psu_init and the embedded .bit.
+open_run impl_1
+
+write_hw_platform -fixed -include_bit -force $xsa
+puts "INFO: wrote hardware platform: $xsa"
+validate_hw_platform $xsa
+puts "INFO: export_xsa DONE"

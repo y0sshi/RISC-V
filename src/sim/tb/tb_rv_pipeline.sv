@@ -45,6 +45,7 @@ module tb_rv_pipeline;
         .imem_req        (imem_req),
         .imem_rdata      (imem_rdata),
         .imem_ready      (imem_ready),
+        .imem_gnt        (1'b1),
         .dmem_addr       (dmem_addr),
         .dmem_wdata      (dmem_wdata),
         .dmem_wstrb      (dmem_wstrb),
@@ -58,9 +59,14 @@ module tb_rv_pipeline;
         .mstatus_mxr_out (mstatus_mxr_out),
         .tlb_flush_out   (tlb_flush_out),
         .mmu_stall       (1'b0),
+        .mem_stall       (1'b0),
+        .dmem_wait       (1'b0),
+        .if_fault        (1'b0),
+        .mem_fault       (1'b0),
         .timer_irq       (timer_irq),
         .sw_irq          (sw_irq),
-        .ext_irq         (ext_irq)
+        .ext_irq         (ext_irq),
+        .time_val        (64'b0)
     );
 
     // Clock and memory models

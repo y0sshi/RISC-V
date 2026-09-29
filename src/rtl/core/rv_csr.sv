@@ -55,6 +55,7 @@ module rv_csr
     input  wire  [2:0]       csr_op,     // funct3
     input  wire              csr_we,     // CSR write enable
     output logic [XLEN-1:0]  csr_rdata,  // Old CSR value (combinational)
+    output logic             csr_access_ok, // csr_addr implemented + privilege OK (combinational)
 
     // ---- Exception trap entry ------------------------------------------------
     input  wire              trap_enter,
@@ -88,7 +89,14 @@ module rv_csr
     // ---- MMU state outputs ---------------------------------------------------
     output logic [XLEN-1:0]  satp_val,
     output logic              mstatus_sum,
-    output logic              mstatus_mxr
+    output logic              mstatus_mxr,
+    output logic              mstatus_mprv,  // mstatus.MPRV (bit 17)
+    output logic [1:0]        mstatus_mpp_out, // mstatus.MPP (bits 12:11)
+
+    // ---- F-extension fcsr ----------------------------------------------------
+    input  wire  [4:0]       fpu_fflags,    // FPU exception flags to OR into fflags
+    input  wire              fpu_fflags_we, // 1 = FPU produced result this cycle
+    output logic [2:0]       frm_out        // fcsr.frm -> FPU rounding mode (DYN)
 );
 
     // =========================================================================
@@ -99,6 +107,7 @@ module rv_csr
     logic           mstatus_mie;    // [3]  Machine Interrupt Enable
     logic           mstatus_mpie;   // [7]  Machine Previous IE
     logic [1:0]     mstatus_mpp;    // [12:11] Machine Previous Privilege
+    logic           mstatus_mprv_r; // [17] Modify PRiVilege (data accesses use MPP)
     logic           mstatus_sum_r;  // [18] Supervisor User Memory access
     logic           mstatus_mxr_r;  // [19] Make eXecutable Readable
 
@@ -130,6 +139,43 @@ module rv_csr
     logic [63:0]    mcycle_cnt;
     logic [63:0]    minstret_cnt;
 
+    // Counter-enable registers (bit0=CY, bit1=TM, bit2=IR).  mcounteren gates
+    // S-mode access to cycle/time/instret; scounteren gates U-mode access.
+    // Stored as WARL (only the low 3 bits are meaningful here).  Enforcement
+    // (illegal-instruction on a disabled counter) is not done yet -- the shadows
+    // are always readable (permissive, sufficient for boot); the registers exist
+    // so firmware/Linux can program them.
+    logic [31:0]    mcounteren_reg;
+    logic [31:0]    scounteren_reg;
+
+    // F-extension CSRs
+    logic [4:0]     fflags_reg;  // fcsr[4:0] : NV|DZ|OF|UF|NX (accumulated)
+    logic [2:0]     frm_reg;     // fcsr[7:5] : rounding mode
+
+    assign frm_out = frm_reg;
+
+    // =========================================================================
+    // PMP (Physical Memory Protection) CSRs — 16 entries
+    // pmpcfg byte = {L[7], 2'b00, A[4:3], X[2], W[1], R[0]} (bits 6:5 are WARL 0).
+    // A: 0=OFF, 1=TOR, 2=NA4, 3=NAPOT.  Locked entries (L=1) ignore cfg/addr writes.
+    // pmpaddr holds PA[55:2] (RV64 -> bits[53:0]) / PA[33:2] (RV32 -> all 32 bits).
+    // NOTE: only the architectural CSR state + WARL is implemented here; address
+    // matching / access enforcement is deferred (see CLAUDE.md PMP notes).
+    // =========================================================================
+    localparam int PMP_ENTRIES = 16;
+    logic [7:0]  pmpcfg  [0:PMP_ENTRIES-1];
+    xlen_t       pmpaddr [0:PMP_ENTRIES-1];
+
+    // pmpaddr implemented-width mask: RV64 = PA 56-bit -> addr bits [53:0]; RV32 = 32 bits.
+    localparam xlen_t PMP_ADDR_MASK = (XLEN == 64) ? xlen_t'(64'h003F_FFFF_FFFF_FFFF)
+                                                   : xlen_t'(64'hFFFF_FFFF);
+
+    // Packed views for CSR reads (8 cfg bytes per 64-bit word)
+    wire [63:0] pmpcfg_lo = {pmpcfg[7], pmpcfg[6], pmpcfg[5], pmpcfg[4],
+                             pmpcfg[3], pmpcfg[2], pmpcfg[1], pmpcfg[0]};
+    wire [63:0] pmpcfg_hi = {pmpcfg[15], pmpcfg[14], pmpcfg[13], pmpcfg[12],
+                             pmpcfg[11], pmpcfg[10], pmpcfg[9],  pmpcfg[8]};
+
     priv_level_t    cur_priv;
     assign priv_level = cur_priv;
 
@@ -149,12 +195,21 @@ module rv_csr
     // Use 64-bit intermediates and wire assigns to avoid constant-select
     // warnings in always_* with parametric-width signals.
     // =========================================================================
+    // The SoC ORs both PLIC contexts (M ctx0, S ctx1) onto a single ext_irq line
+    // (only one context owns any given source, so the OR is unambiguous).  Route
+    // that shared line by delegation: when external interrupts are delegated to
+    // S (mideleg[9]=1, as Linux sets) it drives SEIP only; otherwise (M-mode-only
+    // firmware owning the PLIC) it drives MEIP.  Without the ~mideleg[9] gate on
+    // MEIP, a delegated external IRQ would ALSO raise MEIP, which a lower-privilege
+    // (kernel in S) takes unconditionally -- stealing the interrupt into M-mode
+    // where OpenSBI has no PLIC handler.  Bare/compliance keep mideleg[9]=0, so
+    // MEIP=ext_irq exactly as before (no-op).
     wire [63:0] mip64 = ({63'b0, sw_irq   & mideleg_reg[1]} << 1)   // SSIP
                       | ({63'b0, sw_irq}                     << 3)   // MSIP
                       | ({63'b0, timer_irq & mideleg_reg[5]} << 5)   // STIP
                       | ({63'b0, timer_irq}                  << 7)   // MTIP
-                      | ({63'b0, ext_irq  & mideleg_reg[9]}  << 9)   // SEIP
-                      | ({63'b0, ext_irq}                    << 11); // MEIP
+                      | ({63'b0, ext_irq  &  mideleg_reg[9]} << 9)   // SEIP
+                      | ({63'b0, ext_irq  & ~mideleg_reg[9]} << 11); // MEIP
     wire [XLEN-1:0] mip_val = mip64[XLEN-1:0];
 
     // Masked views for S-mode
@@ -173,8 +228,14 @@ module rv_csr
     assign s_irq_bits = sip_val & sie_val;
 
     // irq_pending: use assign so wire signals (m_irq_bits, s_irq_bits) are in sensitivity.
-    // M-mode interrupts only taken in M-mode when mstatus.MIE=1
-    wire m_irq_en = (cur_priv == PRIV_M) && mstatus_mie;
+    // M-mode interrupts: taken in M-mode when mstatus.MIE=1, and ALWAYS taken
+    // while executing at a lower privilege (spec: interrupts for a higher
+    // privilege level are globally enabled regardless of that level's xIE when
+    // running at a lower level).  Without the priv<M term, a non-delegated
+    // MTIP never trapped to M-mode while the kernel ran in S-mode -- OpenSBI's
+    // timer (SBI set_timer -> mtimecmp -> MTIP -> M handler -> STIP) never
+    // delivered, so Linux received no timer ticks (idle forever, P0-4).
+    wire m_irq_en = (cur_priv == PRIV_M) ? mstatus_mie : 1'b1;
     // S-mode interrupts: taken in U/S-mode when mstatus.SIE=1
     wire s_irq_en = (cur_priv == PRIV_U) || (cur_priv == PRIV_S && mstatus_sie);
     assign irq_pending = (m_irq_en && |m_irq_bits) || (s_irq_en && |s_irq_bits);
@@ -187,6 +248,7 @@ module rv_csr
         misa_val = '0;
         if (XLEN == 64) misa_val[XLEN-1:XLEN-2] = 2'd2;
         else            misa_val[XLEN-1:XLEN-2] = 2'd1;
+        misa_val[2]  = 1'b1;   // 'C' compressed
         misa_val[8]  = 1'b1;   // 'I'
         misa_val[18] = 1'b1;   // 'S' supervisor mode
         misa_val[20] = 1'b1;   // 'U' user mode
@@ -195,26 +257,36 @@ module rv_csr
     // =========================================================================
     // MMU state outputs
     // =========================================================================
-    assign satp_val    = satp_reg;
-    assign mstatus_sum = mstatus_sum_r;
-    assign mstatus_mxr = mstatus_mxr_r;
+    assign satp_val      = satp_reg;
+    assign mstatus_sum   = mstatus_sum_r;
+    assign mstatus_mxr   = mstatus_mxr_r;
+    assign mstatus_mprv  = mstatus_mprv_r;
+    assign mstatus_mpp_out = mstatus_mpp;
 
     // =========================================================================
     // mstatus reconstruction (full M-mode view)
     // Wire-based to avoid constant-select warnings in always_*.
+    // UXL[33:32]=2 and SXL[35:34]=2 are hardwired for RV64 (read-only constants).
     // =========================================================================
-    wire [63:0] mstatus64 = ({63'b0, mstatus_sie}   << 1)
-                          | ({63'b0, mstatus_mie}   << 3)
-                          | ({63'b0, mstatus_spie}  << 5)
-                          | ({63'b0, mstatus_mpie}  << 7)
-                          | ({63'b0, mstatus_spp}   << 8)
-                          | ({62'b0, mstatus_mpp}   << 11)
-                          | ({63'b0, mstatus_sum_r} << 18)
-                          | ({63'b0, mstatus_mxr_r} << 19);
+    localparam [63:0] MSTATUS_UXL = (XLEN == 64) ? 64'h0000_0002_0000_0000 : 64'h0;
+    localparam [63:0] MSTATUS_SXL = (XLEN == 64) ? 64'h0000_0008_0000_0000 : 64'h0;
+    wire [63:0] mstatus64 = ({63'b0, mstatus_sie}    << 1)
+                          | ({63'b0, mstatus_mie}    << 3)
+                          | ({63'b0, mstatus_spie}   << 5)
+                          | ({63'b0, mstatus_mpie}   << 7)
+                          | ({63'b0, mstatus_spp}    << 8)
+                          | ({62'b0, mstatus_mpp}    << 11)
+                          | ({63'b0, mstatus_mprv_r} << 17)
+                          | ({63'b0, mstatus_sum_r}  << 18)
+                          | ({63'b0, mstatus_mxr_r}  << 19)
+                          | MSTATUS_UXL
+                          | MSTATUS_SXL;
     wire [XLEN-1:0] mstatus_rval = mstatus64[XLEN-1:0];
 
-    // sstatus: restricted view of mstatus (S-mode accessible bits only)
-    wire [XLEN-1:0] sstatus_rval = mstatus_rval & SSTATUS_WMASK;
+    // sstatus: restricted view of mstatus (S-mode accessible bits + UXL read-only)
+    // UXL[33:32] is read-only in sstatus but must be visible to S-mode software.
+    localparam [XLEN-1:0] SSTATUS_RMASK = SSTATUS_WMASK | XLEN'(MSTATUS_UXL);
+    wire [XLEN-1:0] sstatus_rval = mstatus_rval & SSTATUS_RMASK;
 
     // =========================================================================
     // Trap delegation check (combinational)
@@ -293,11 +365,64 @@ module rv_csr
     assign sepc_out = {sepc_reg[XLEN-1:1], 1'b0};
 
     // =========================================================================
+    // CSR existence + privilege decode (combinational on csr_addr)
+    // =========================================================================
+    // csr_access_ok = the addressed CSR is implemented AND accessible from the
+    // current privilege level (csr_addr[9:8] encodes the minimum privilege).
+    // The core raises an illegal-instruction exception for a CSR instruction
+    // when this is low.  This is REQUIRED for OpenSBI: its hart-feature
+    // detection probes optional CSRs (stimecmp/menvcfg/mhpmcounters/...) with
+    // trap-and-detect; silently reading 0 made it believe Sstc exists, so it
+    // programmed timers into the nonexistent stimecmp CSR and the Linux tick
+    // never fired (banner falsely listed sscofpmf,smaia,smstateen,sstc).
+    logic csr_implemented;
+    always_comb begin
+        csr_implemented = 1'b0;
+        case (csr_addr)
+            // F/D extension
+            CSR_FFLAGS, CSR_FRM, CSR_FCSR,
+            // Supervisor
+            CSR_SSTATUS, CSR_SIE, CSR_STVEC, CSR_SCOUNTEREN,
+            CSR_SSCRATCH, CSR_SEPC, CSR_SCAUSE, CSR_STVAL, CSR_SIP, CSR_SATP,
+            // Machine
+            CSR_MSTATUS, CSR_MISA, CSR_MEDELEG, CSR_MIDELEG, CSR_MIE, CSR_MTVEC,
+            CSR_MCOUNTEREN, CSR_MSCRATCH, CSR_MEPC, CSR_MCAUSE, CSR_MTVAL, CSR_MIP,
+            CSR_MCYCLE, CSR_MINSTRET, CSR_MHARTID,
+            // Machine information (mandatory; read-as-zero where unimplemented)
+            12'hF11, 12'hF12, 12'hF13, 12'hF15,   // mvendorid/marchid/mimpid/mconfigptr
+            // User counter shadows
+            CSR_CYCLE, CSR_TIME, CSR_INSTRET:
+                csr_implemented = 1'b1;
+            default: ;
+        endcase
+        if (XLEN == 32) begin
+            case (csr_addr)
+                CSR_CYCLEH, CSR_TIMEH, CSR_INSTRETH,
+                12'hB80, 12'hB82:                  // mcycleh / minstreth
+                    csr_implemented = 1'b1;
+                default: ;
+            endcase
+        end
+        // PMP: pmpaddr0..15 + pmpcfg0/2 (RV64) or pmpcfg0..3 (RV32)
+        if (csr_addr[11:4] == 8'h3B)
+            csr_implemented = 1'b1;
+        if (csr_addr == 12'h3A0 || csr_addr == 12'h3A2)
+            csr_implemented = 1'b1;
+        if (XLEN == 32 && (csr_addr == 12'h3A1 || csr_addr == 12'h3A3))
+            csr_implemented = 1'b1;
+    end
+    assign csr_access_ok = csr_implemented && (2'(cur_priv) >= csr_addr[9:8]);
+
+    // =========================================================================
     // CSR Read (combinational — returns old value before write)
     // =========================================================================
     always_comb begin
         csr_rdata = '0;
         case (csr_addr)
+            // F-extension
+            CSR_FFLAGS:   csr_rdata = {{(XLEN-5){1'b0}}, fflags_reg};
+            CSR_FRM:      csr_rdata = {{(XLEN-3){1'b0}}, frm_reg};
+            CSR_FCSR:     csr_rdata = {{(XLEN-8){1'b0}}, frm_reg, fflags_reg};
             // Supervisor-level
             CSR_SSTATUS:  csr_rdata = sstatus_rval;
             CSR_SIE:      csr_rdata = sie_val;
@@ -322,12 +447,40 @@ module rv_csr
             CSR_MIP:      csr_rdata = mip_val;
             CSR_MCYCLE:   csr_rdata = xlen_t'(mcycle_cnt[XLEN-1:0]);
             CSR_MINSTRET: csr_rdata = xlen_t'(minstret_cnt[XLEN-1:0]);
-            CSR_MHARTID:  csr_rdata = xlen_t'(HARTID[XLEN-1:0]);
+            CSR_MHARTID:  csr_rdata = xlen_t'(HARTID);
+            CSR_MCOUNTEREN: csr_rdata = xlen_t'(mcounteren_reg);
+            CSR_SCOUNTEREN: csr_rdata = xlen_t'(scounteren_reg);
+            // User-mode read-only counter shadows (cycle / time / instret).
+            CSR_CYCLE:    csr_rdata = xlen_t'(mcycle_cnt[XLEN-1:0]);
+            CSR_TIME:     csr_rdata = xlen_t'(timer_val[XLEN-1:0]);     // CLINT mtime
+            CSR_INSTRET:  csr_rdata = xlen_t'(minstret_cnt[XLEN-1:0]);
+            CSR_CYCLEH:   csr_rdata = (XLEN == 32) ? xlen_t'(mcycle_cnt[63:32])   : '0;
+            CSR_TIMEH:    csr_rdata = (XLEN == 32) ? xlen_t'(timer_val[63:32])    : '0;
+            CSR_INSTRETH: csr_rdata = (XLEN == 32) ? xlen_t'(minstret_cnt[63:32]) : '0;
             // RV32 upper-half counters
             12'hB80:      csr_rdata = (XLEN == 32) ? xlen_t'(mcycle_cnt[63:32])   : '0;
             12'hB82:      csr_rdata = (XLEN == 32) ? xlen_t'(minstret_cnt[63:32]) : '0;
             default:      csr_rdata = '0;
         endcase
+
+        // PMP CSR reads (override default for 0x3A0-0x3A3 / 0x3B0-0x3BF)
+        if (csr_addr[11:4] == 8'h3B) begin            // pmpaddr0..15
+            csr_rdata = pmpaddr[csr_addr[3:0]];
+        end else if (XLEN == 32) begin
+            unique case (csr_addr)
+                12'h3A0: csr_rdata = xlen_t'(pmpcfg_lo[31:0]);
+                12'h3A1: csr_rdata = xlen_t'(pmpcfg_lo[63:32]);
+                12'h3A2: csr_rdata = xlen_t'(pmpcfg_hi[31:0]);
+                12'h3A3: csr_rdata = xlen_t'(pmpcfg_hi[63:32]);
+                default: ;
+            endcase
+        end else begin                                 // XLEN == 64 (even pmpcfg only)
+            unique case (csr_addr)
+                12'h3A0: csr_rdata = xlen_t'(pmpcfg_lo);
+                12'h3A2: csr_rdata = xlen_t'(pmpcfg_hi);
+                default: ;
+            endcase
+        end
     end
 
     // =========================================================================
@@ -343,6 +496,19 @@ module rv_csr
         endcase
     end
 
+    // satp.MODE is WARL: the hardware implements only Bare and one paged mode
+    // (Sv39 on RV64, Sv32 on RV32).  A write that selects an UNSUPPORTED MODE
+    // (e.g. Sv48/Sv57 on RV64) is ignored entirely (satp retains its old value),
+    // matching QEMU/real hardware.  Linux probes the MMU mode by writing a
+    // candidate MODE and reading it back (set_satp_mode); without this WARL
+    // restriction the read-back would falsely confirm Sv48/Sv57, Linux would
+    // install Sv57 page tables, and the Sv39-only MMU would treat satp as Bare
+    // and fetch untranslated garbage.  RV32: both Bare and Sv32 are valid.
+    wire satp_mode_legal =
+        (XLEN == 32) ? 1'b1
+                     : (csr_new_val[XLEN-1 -: 4] == 4'd0 ||
+                        csr_new_val[XLEN-1 -: 4] == 4'd8);
+
     // =========================================================================
     // Sequential CSR updates
     // Priority: trap_enter > sret_en > mret_en > csr_we
@@ -353,9 +519,10 @@ module rv_csr
             // M-mode mstatus fields
             mstatus_mie   <= 1'b0;
             mstatus_mpie  <= 1'b1;
-            mstatus_mpp   <= 2'b11;  // MPP reset: M-mode
-            mstatus_sum_r <= 1'b0;
-            mstatus_mxr_r <= 1'b0;
+            mstatus_mpp    <= 2'b11; // MPP reset: M-mode
+            mstatus_mprv_r <= 1'b0;
+            mstatus_sum_r  <= 1'b0;
+            mstatus_mxr_r  <= 1'b0;
             // S-mode mstatus fields
             mstatus_sie   <= 1'b0;
             mstatus_spie  <= 1'b1;
@@ -380,6 +547,16 @@ module rv_csr
             // Counters
             mcycle_cnt    <= '0;
             minstret_cnt  <= '0;
+            mcounteren_reg <= '0;
+            scounteren_reg <= '0;
+            // F-extension CSRs
+            fflags_reg    <= 5'h0;
+            frm_reg       <= 3'h0;
+            // PMP CSRs
+            for (int pi = 0; pi < PMP_ENTRIES; pi++) begin
+                pmpcfg[pi]  <= 8'h0;
+                pmpaddr[pi] <= '0;
+            end
 
         end else begin
             // Free-running cycle counter
@@ -388,6 +565,12 @@ module rv_csr
             // Instruction retire counter
             if (retire_en)
                 minstret_cnt <= minstret_cnt + 1;
+
+            // FPU fflags accumulation (OR on every FPU result).
+            // CSR write takes priority if both happen on the same cycle.
+            if (fpu_fflags_we && !(csr_we && (csr_addr == CSR_FFLAGS ||
+                                               csr_addr == CSR_FCSR)))
+                fflags_reg <= fflags_reg | fpu_fflags;
 
             if (trap_enter) begin
                 // ---- Trap entry (delegation-aware) ---------------------------
@@ -415,7 +598,7 @@ module rv_csr
                 // ---- Supervisor trap return ----------------------------------
                 mstatus_sie  <= mstatus_spie;
                 mstatus_spie <= 1'b1;
-                cur_priv     <= mstatus_spp ? PRIV_S : PRIV_U;
+                cur_priv     <= priv_level_t'(mstatus_spp ? PRIV_S : PRIV_U);
                 mstatus_spp  <= 1'b0;  // SPP ← U after SRET
 
             end else if (mret_en) begin
@@ -424,10 +607,20 @@ module rv_csr
                 mstatus_mpie <= 1'b1;
                 cur_priv     <= priv_level_t'(mstatus_mpp);
                 mstatus_mpp  <= 2'b00;  // MPP ← U after MRET
+                // Spec: clear MPRV when returning to non-M privilege
+                if (mstatus_mpp != 2'b11)
+                    mstatus_mprv_r <= 1'b0;
 
             end else if (csr_we) begin
                 // ---- Normal CSR write ----------------------------------------
                 case (csr_addr)
+                    // F-extension CSRs
+                    CSR_FFLAGS: fflags_reg <= csr_new_val[4:0];
+                    CSR_FRM:    frm_reg    <= csr_new_val[2:0];
+                    CSR_FCSR: begin
+                        fflags_reg <= csr_new_val[4:0];
+                        frm_reg    <= csr_new_val[7:5];
+                    end
                     // Supervisor CSRs
                     CSR_SSTATUS: begin
                         // Only update S-mode bits of mstatus
@@ -447,17 +640,19 @@ module rv_csr
                     CSR_SCAUSE:   scause_reg   <= csr_new_val;
                     CSR_STVAL:    stval_reg    <= csr_new_val;
                     // SATP: also accessible from S/U mode (handled by privilege check elsewhere)
-                    CSR_SATP:     satp_reg     <= csr_new_val;
+                    // MODE is WARL: ignore writes selecting an unsupported mode.
+                    CSR_SATP:     if (satp_mode_legal) satp_reg <= csr_new_val;
                     // Machine CSRs
                     CSR_MSTATUS: begin
-                        mstatus_sie   <= csr_new_val[1];
-                        mstatus_mie   <= csr_new_val[3];
-                        mstatus_spie  <= csr_new_val[5];
-                        mstatus_mpie  <= csr_new_val[7];
-                        mstatus_spp   <= csr_new_val[8];
-                        mstatus_mpp   <= csr_new_val[12:11];
-                        mstatus_sum_r <= csr_new_val[18];
-                        mstatus_mxr_r <= csr_new_val[19];
+                        mstatus_sie    <= csr_new_val[1];
+                        mstatus_mie    <= csr_new_val[3];
+                        mstatus_spie   <= csr_new_val[5];
+                        mstatus_mpie   <= csr_new_val[7];
+                        mstatus_spp    <= csr_new_val[8];
+                        mstatus_mpp    <= csr_new_val[12:11];
+                        mstatus_mprv_r <= csr_new_val[17];
+                        mstatus_sum_r  <= csr_new_val[18];
+                        mstatus_mxr_r  <= csr_new_val[19];
                     end
                     CSR_MEDELEG:  medeleg_reg  <= csr_new_val;
                     CSR_MIDELEG:  mideleg_reg  <= csr_new_val;
@@ -467,9 +662,35 @@ module rv_csr
                     CSR_MEPC:     mepc_reg     <= {csr_new_val[XLEN-1:1], 1'b0};
                     CSR_MCAUSE:   mcause_reg   <= csr_new_val;
                     CSR_MTVAL:    mtval_reg    <= csr_new_val;
-                    // misa, mip, mcycle, minstret, mhartid: read-only
+                    // Counter-enable (WARL: keep CY/TM/IR bits [2:0])
+                    CSR_MCOUNTEREN: mcounteren_reg <= {29'b0, csr_new_val[2:0]};
+                    CSR_SCOUNTEREN: scounteren_reg <= {29'b0, csr_new_val[2:0]};
+                    // misa, mip, mcycle, minstret, mhartid, cycle/time/instret: read-only
                     default: ;
                 endcase
+
+                // ---- PMP CSR writes (WARL; locked entries L=1 ignore writes) -
+                if (csr_addr[11:4] == 8'h3B) begin
+                    // pmpaddr0..15 (0x3B0..0x3BF)
+                    if (!pmpcfg[csr_addr[3:0]][7])
+                        pmpaddr[csr_addr[3:0]] <= csr_new_val & PMP_ADDR_MASK;
+                end else if (XLEN == 64) begin
+                    // RV64: pmpcfg0 (0..7) at 0x3A0, pmpcfg2 (8..15) at 0x3A2
+                    if (csr_addr == 12'h3A0 || csr_addr == 12'h3A2) begin
+                        for (int j = 0; j < 8; j++)
+                            if (!pmpcfg[(csr_addr == 12'h3A2 ? 8 : 0) + j][7])
+                                pmpcfg[(csr_addr == 12'h3A2 ? 8 : 0) + j]
+                                    <= {csr_new_val[j*8+7], 2'b00, csr_new_val[j*8+4 -: 5]};
+                    end
+                end else begin
+                    // RV32: pmpcfg0..3 at 0x3A0..0x3A3, 4 entries each
+                    if (csr_addr >= 12'h3A0 && csr_addr <= 12'h3A3) begin
+                        for (int j = 0; j < 4; j++)
+                            if (!pmpcfg[{csr_addr[1:0], 2'b00} + j[3:0]][7])
+                                pmpcfg[{csr_addr[1:0], 2'b00} + j[3:0]]
+                                    <= {csr_new_val[j*8+7], 2'b00, csr_new_val[j*8+4 -: 5]};
+                    end
+                end
             end
         end
     end

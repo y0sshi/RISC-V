@@ -13,6 +13,7 @@ build/
 *.str
 *.xpr
 *.runs/
+*.gen/
 *.cache/
 *.hw/
 *.ip_user_files/
@@ -22,6 +23,24 @@ vivado_*.backup*
 *.bit
 *.ltx
 *.dcp
+*.rpt
+clockInfo.txt
+tight_setup_hold_pins.txt
+# Scripted Vivado project output dirs (boards/<board>/vivado/rv_riscv_*)
+boards/**/vivado/rv_riscv_*/
+
+# =============================================================================
+# Vitis (FSBL / BOOT.bin build outputs; scripts under boards/<board>/vitis/ are tracked)
+# =============================================================================
+boards/**/vitis/ws/
+boards/**/vitis/boot.gen.bif
+boards/**/vitis/ps7_init.tcl
+boards/**/vitis/convert_bin.bif
+boards/**/vitis/*.bit.bin
+boards/**/vitis/*.dtbo
+*.xsa
+BOOT.bin
+*.elf
 
 # =============================================================================
 # Simulation
@@ -37,6 +56,11 @@ src/software/build/
 *.hex
 *.dump
 *.o
+
+# =============================================================================
+# Tests
+# =============================================================================
+tests/results/
 
 # =============================================================================
 # Old project (legacy)
@@ -56,3 +80,13 @@ src/software/build/
 Thumbs.db
 .nvim
 
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+
+# OpenSBI build area (cloned + build artifacts)
+tests/opensbi/work/
+
+# Linux kernel build area (downloaded source + Image + fw_payload)
+tests/linux/work/

@@ -1,0 +1,24 @@
+//============================================================================
+// boot.bif - bootgen image descriptor for the Zybo Z7-20 RISC-V SoC (REFERENCE).
+//============================================================================
+// Builds an SD/QSPI BOOT.bin that:
+//   1. runs the PS Cortex-A9 FSBL  -> ps7_init brings up DDR/MIO/clocks,
+//   2. copies the RISC-V firmware into PS DDR at 0x0020_0000 (= RST_ADDR), THEN
+//   3. configures the PL with the bitstream -> the RISC-V core comes out of reset
+//      and fetches its first instruction from 0x0020_0000 (firmware already there).
+//
+// ORDER MATTERS: the firmware data partition is listed BEFORE the bitstream so it
+// is resident in DDR before PL config releases the RISC-V core.  The firmware is a
+// raw .bin loaded with [load=...] (NOT an .elf) so the FSBL treats it as data and
+// does NOT try to hand the A9 off to RISC-V code.
+//
+// This file uses placeholder relative names; make_bootbin.ps1 generates a concrete
+// .bif with resolved absolute paths.  Adjust the firmware to the real-HW image
+// (rebuilt with DTS=docs/opensbi/rv_soc_hw.dts, see prep-E) before a real boot.
+//============================================================================
+the_ROM_image:
+{
+    [bootloader] fsbl.elf
+    [load=0x00200000] fw_payload_hw.bin
+    bd_riscv_wrapper.bit
+}

@@ -30,16 +30,36 @@ module tb_rv_mext;
     // =========================================================================
     // DUT
     // =========================================================================
+    logic            clk, rst_n;
     logic [XLEN-1:0] rs1, rs2;
     muldiv_op_t       op;
+    logic            valid_in;
     logic [XLEN-1:0] result;
+    logic            div_busy;
 
     rv_muldiv #(.XLEN(XLEN)) dut (
+        .clk      (clk),
+        .rst_n    (rst_n),
         .rs1_data (rs1),
         .rs2_data (rs2),
         .op       (op),
-        .result   (result)
+        .valid_in (valid_in),
+        .result   (result),
+        .div_busy (div_busy)
     );
+
+    // Clock
+    initial clk = 1'b0;
+    always #5 clk = ~clk;
+
+    // True for divide ops (which take the multi-cycle sequential path)
+    function automatic logic is_divide(input muldiv_op_t o);
+        case (o)
+            MDU_DIV, MDU_DIVU, MDU_REM, MDU_REMU,
+            MDU_DIVW, MDU_DIVUW, MDU_REMW, MDU_REMUW: is_divide = 1'b1;
+            default:                                  is_divide = 1'b0;
+        endcase
+    endfunction
 
     // =========================================================================
     // Helpers
@@ -59,7 +79,10 @@ module tb_rv_mext;
 
     // Drive with 64-bit literals; auto-truncated to XLEN for XLEN=32.
     // Expected values chosen so xlen_t'(exp64) is correct for both widths.
-    task test(
+    // Both multiply and divide ops now use the valid_in/div_busy handshake (50MHz
+    // step 6: MUL is pipelined behind input+output registers, so it asserts busy
+    // like the divider).  Wait for busy to rise then fall, then sample the result.
+    task automatic test(
         input string   name,
         input muldiv_op_t top,
         input [63:0]   a, b, exp
@@ -67,8 +90,14 @@ module tb_rv_mext;
         rs1 = xlen_t'(a);
         rs2 = xlen_t'(b);
         op  = top;
-        #1;
-        check(name, result, xlen_t'(exp));
+        // Hold valid_in until the unit accepts (busy rises); this is robust to
+        // starting from any state (e.g. the prior op's done cycle).
+        @(negedge clk);
+        valid_in = 1'b1;
+        do @(negedge clk); while (!div_busy);   // op started
+        valid_in = 1'b0;
+        do @(negedge clk); while (div_busy);    // finished, result registered
+        check(name, result, xlen_t'(exp));      // sampled at negedge (stable)
     endtask
 
     // =========================================================================
@@ -79,6 +108,13 @@ module tb_rv_mext;
         $dumpvars(0, tb_rv_mext);
         pass_cnt = 0;
         fail_cnt = 0;
+        valid_in = 1'b0;
+
+        // Reset the sequential divider FSM
+        rst_n = 1'b0;
+        repeat (3) @(negedge clk);
+        rst_n = 1'b1;
+        @(negedge clk);
 
         $display("=== M-Extension Unit Test (XLEN=%0d) ===", XLEN);
 

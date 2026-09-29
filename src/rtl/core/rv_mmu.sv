@@ -51,9 +51,11 @@ module rv_mmu
 
     // ---- Translation control (from rv_core / rv_csr) ------------------------
     input  wire  [XLEN-1:0]  satp,           // SATP CSR
-    input  priv_level_t      priv_level,     // current privilege level
+    input  wire priv_level_t priv_level,     // current privilege level (IF)
     input  wire              mstatus_sum,    // mstatus.SUM
     input  wire              mstatus_mxr,    // mstatus.MXR
+    input  wire              mstatus_mprv,   // mstatus.MPRV
+    input  wire  [1:0]       mstatus_mpp,    // mstatus.MPP (used with MPRV)
     input  wire              tlb_flush,      // SFENCE.VMA → invalidate all TLB
 
     // ---- IF port (instruction fetch) ----------------------------------------
@@ -67,17 +69,21 @@ module rv_mmu
     input  wire  [XLEN-1:0]  mem_va,
     input  wire              mem_req,
     input  wire              mem_we,
+    input  wire              mem_acc_new,    // 1-cycle STROBE from rv_core: first cycle of a NEW data access
     output logic [XLEN-1:0]  mem_pa,         // physical address → dmem
     output logic             mem_req_out,    // forwarded req → dmem
     output logic             mem_we_out,     // forwarded we → dmem
     output logic             mem_fault,      // load/store page fault
+    output logic             mem_acc_new_out,// D$-facing strobe (delayed 1 cycle vs mem_acc_new under VM)
 
-    // ---- Stall output -------------------------------------------------------
-    output logic             mmu_stall,      // 1 = PTW in progress or fault
+    // ---- Stall outputs ------------------------------------------------------
+    output logic             mmu_stall,      // 1 = IF or MEM translation pending (stalls IF/ID)
+    output logic             mem_stall,      // 1 = MEM-port translation pending (also stalls EX/MEM)
 
     // ---- PTW physical-memory port (rv_soc muxes with dmem) -----------------
     output logic [XLEN-1:0]  ptw_paddr,
     output logic             ptw_req,
+    output logic             ptw_for_if,     // 1 = the active PTW is an instruction-fetch walk
     input  wire  [XLEN-1:0]  ptw_rdata,
     input  wire              ptw_ready
 );
@@ -99,11 +105,16 @@ module rv_mmu
     // Translation-mode detection
     // =========================================================================
     // Sv32: SATP[31]=MODE, Sv39: SATP[63:60]=4'h8
-    // M-mode always uses physical addresses (no vm).
+    // M-mode always uses physical addresses for IF.
+    // For data accesses: MPRV=1 uses MPP as effective privilege instead.
     wire [63:0] satp64      = {{(64-XLEN){1'b0}}, satp};
-    wire        vm_enabled  = (XLEN == 32)
-                              ? (satp64[31] && (priv_level != PRIV_M))
-                              : ((satp64[63:60] == 4'h8) && (priv_level != PRIV_M));
+    wire        vm_active   = (XLEN == 32) ? satp64[31]
+                                           : (satp64[63:60] == 4'h8);
+    wire        vm_enabled  = vm_active && (priv_level != PRIV_M);
+    // Effective privilege for data accesses (MPRV: use MPP when in M-mode)
+    wire [1:0]  priv_data   = (mstatus_mprv && (priv_level == PRIV_M))
+                              ? mstatus_mpp : priv_level;
+    wire        vm_data     = vm_active && (priv_data != PRIV_M);
 
     // Root-page-table PPN from SATP (44-bit internal)
     wire [PPN_INT_W-1:0] satp_ppn44 = (XLEN == 32)
@@ -190,8 +201,9 @@ module rv_mmu
             // Load: need R, or (MXR && X)
             mem_perm_ok = mem_tlb_r || (mstatus_mxr && mem_tlb_x);
 
-        if      (priv_level == PRIV_U) mem_perm_ok = mem_perm_ok &&  mem_tlb_u;
-        else if (priv_level == PRIV_S) mem_perm_ok = mem_perm_ok && (!mem_tlb_u || mstatus_sum);
+        // Use priv_data (MPRV-adjusted) for U/S privilege check on data accesses
+        if      (priv_data == PRIV_U) mem_perm_ok = mem_perm_ok &&  mem_tlb_u;
+        else if (priv_data == PRIV_S) mem_perm_ok = mem_perm_ok && (!mem_tlb_u || mstatus_sum);
     end
 
     // =========================================================================
@@ -199,7 +211,86 @@ module rv_mmu
     // =========================================================================
     // PA = {ppn, page_offset}  — via 64-bit intermediate, then truncated to XLEN
     wire [63:0] if_pa64  = ({20'b0, if_tlb_ppn}  << 12) | {52'b0, if_va [11:0]};
-    wire [63:0] mem_pa64 = ({20'b0, mem_tlb_ppn} << 12) | {52'b0, mem_va[11:0]};
+    // (mem_pa is now driven from the REGISTERED translation, mt_pa_xlat below; the
+    // live combinational mem_pa64 is no longer needed.)
+
+    // =========================================================================
+    // MEM-port REGISTERED lookup (50 MHz: take the data TLB off the stall_if path)
+    // =========================================================================
+    // The combinational data TLB compare (mem_va -> mem_tlb_hit -> mem_pa /
+    // mem_stall / mem_fault) is the dominant critical-path source: ex_mem_alu_result
+    // -> data TLB -> ... -> c_wait -> stall_if -> trap -> fetch_pc -> IF TLB -> I$.
+    // Under vm_data, CAPTURE the translation result into registers on the per-access
+    // STROBE (mem_acc_new, generated by rv_core exactly once per new data access)
+    // and drive mem_pa / mem_req_out / mem_fault / mem_stall from the REGISTERED
+    // values, so the slow TLB compare only feeds a register (mt_*), never stall_if
+    // in one cycle.  This costs one guaranteed bubble cycle per data access (the
+    // capture cycle); the registered PA then drives the D$, which does its own
+    // registered 2-phase lookup the NEXT cycle (serial: MMU translate, then D$ tag --
+    // see docs/freq_50mhz.md).  vm off (bare / M-mode) is a strict passthrough no-op.
+    //
+    // Oscillation-free by construction: capture is gated by the core STROBE (or a
+    // pending latch across a PTW), never by the level mem_req, so a held completed
+    // access does not re-capture (mirrors the D$ strobe design that fixed the
+    // earlier level-req oscillation, docs/freq_50mhz.md section 4/5).
+    logic                 mt_valid;       // registered translation valid (presenting)
+    logic                 mem_pend;       // strobe seen, capture not yet done (PTW gap)
+    logic [PPN_INT_W-1:0] mt_ppn;
+    logic                 mt_perm;
+    logic                 mt_we;
+    logic [11:0]          mt_voff;        // page offset of the captured VA
+    logic                 mem_acc_new_q;  // delayed (registered) D$ strobe
+
+    wire mem_new_strobe  = vm_data & mem_req & mem_acc_new;
+    // Capture when the translation is available (TLB hit) for the new/pending access.
+    wire mem_can_capture = vm_data & mem_req & mem_tlb_hit & (mem_new_strobe | mem_pend);
+    // The registered result drives the port from the cycle AFTER capture; a fresh
+    // strobe forces the capture-cycle bubble (mem_reg_ready=0 that cycle).
+    wire mem_reg_ready   = vm_data & mt_valid & ~mem_new_strobe;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            mt_valid      <= 1'b0;
+            mem_pend      <= 1'b0;
+            mt_ppn        <= '0;
+            mt_perm       <= 1'b0;
+            mt_we         <= 1'b0;
+            mt_voff       <= '0;
+            mem_acc_new_q <= 1'b0;
+        end else begin
+            mem_acc_new_q <= mem_can_capture;   // D$ strobe fires the cycle PA goes valid
+            if (!vm_data || !mem_req) begin
+                // No data access in MEM (or vm off): drop any registered/pending
+                // translation so stale state never leaks to the NEXT access.  A held
+                // access keeps mem_req=1 (frozen pipeline), so this only clears in the
+                // idle gap between accesses (the captured translation is already
+                // consumed once the access retires and mem_req drops).
+                mt_valid <= 1'b0;
+                mem_pend <= 1'b0;
+            end else if (mem_can_capture) begin
+                mt_ppn   <= mem_tlb_ppn;
+                mt_perm  <= mem_perm_ok;
+                mt_we    <= mem_we;
+                mt_voff  <= mem_va[11:0];
+                mt_valid <= 1'b1;
+                mem_pend <= 1'b0;
+            end else if (mem_new_strobe) begin
+                // fresh access whose translation is not yet available (TLB miss or
+                // the capture-cycle bubble): hold it pending and present a bubble.
+                mt_valid <= 1'b0;
+                mem_pend <= 1'b1;
+            end
+            // else: hold mt_valid / mem_pend (access stays presented while held)
+        end
+    end
+
+    // D$-facing per-access strobe: delayed registered pulse under VM, raw strobe
+    // (combinational passthrough) when vm is off (non-destructive for bram/act/M).
+    assign mem_acc_new_out = vm_data ? mem_acc_new_q : mem_acc_new;
+
+    // Registered physical address (from the captured PPN + page offset)
+    wire [63:0]     mt_pa64    = ({20'b0, mt_ppn} << 12) | {52'b0, mt_voff};
+    wire [XLEN-1:0] mt_pa_xlat = mt_pa64[XLEN-1:0];
 
     // =========================================================================
     // PTW state machine
@@ -215,7 +306,18 @@ module rv_mmu
 
     ptw_state_t      ptw_state;
     logic            ptw_wait;            // 1 = just entered new state, skip 1 cycle
-    logic            ptw_for_if;          // 1 = walking for IF port
+    // Dead-fetch walk memo (bug #17): the VPN of the last FAULTED instruction
+    // walk.  While the core holds a page-faulted fetch (drain in progress), the
+    // FTQ keeps re-presenting the dead VA and its walk re-faults forever; with
+    // strict IF-over-MEM priority in PTW_IDLE that starves a pending DATA
+    // translation (mem_stall then deadlocks the drain).  When the presented IF
+    // VPN is known dead AND a data walk is pending, let the data walk go first.
+    // Cleared on tlb_flush (SFENCE.VMA: the mapping may have changed, the retry
+    // is legitimate).  Never set unless an instruction fetch page-faults ->
+    // structural no-op for bare mode / M-mode suites.
+    logic             if_dead_vld;
+    logic [VPN_W-1:0] if_dead_vpn;
+    // ptw_for_if is now an output port (see port list); driven by the PTW FSM.
     logic [VPN_W-1:0] ptw_vpn;           // VPN of the VA being walked
     logic [PPN_INT_W-1:0] ptw_ppn_cur;   // PPN of the current page table
 
@@ -284,21 +386,43 @@ module rv_mmu
             ptw_res_r   <= 1'b0; ptw_res_w <= 1'b0; ptw_res_x <= 1'b0;
             ptw_res_u   <= 1'b0; ptw_res_d <= 1'b0;
             ptw_fault_r <= 1'b0;
+            if_dead_vld <= 1'b0;
+            if_dead_vpn <= '0;
         end else begin
+            if (tlb_flush) if_dead_vld <= 1'b0;   // SFENCE.VMA: retry is legitimate
             case (ptw_state)
 
                 PTW_IDLE: begin
                     ptw_fault_r <= 1'b0;
                     ptw_wait    <= 1'b0;
-                    // IF miss has priority over MEM miss
+                    // IF miss has priority over MEM miss -- EXCEPT when the
+                    // presented IF VPN is known dead (its walk just faulted and
+                    // no SFENCE has intervened) and a data walk is pending: the
+                    // dead-IF re-walk would starve the data translation forever
+                    // (bug #17 drain deadlock).
                     // Note: no ptw_wait needed on IDLE→L* transition because
                     // ptw_req=0 in IDLE so the memory model returns ptw_ready=0
                     // on the first cycle after transition (natural 1-cycle gap).
-                    if (vm_enabled && if_req && !if_tlb_hit) begin
+                    if (vm_enabled && if_req && !if_tlb_hit
+                        && !(if_dead_vld && (if_vpn == if_dead_vpn)
+                             && vm_data && mem_req && !mem_tlb_hit && !mem_reg_ready)) begin
                         ptw_for_if <= 1'b1;
                         ptw_vpn    <= if_vpn;
                         ptw_state  <= (XLEN == 64) ? PTW_L2 : PTW_L1;
-                    end else if (vm_enabled && mem_req && !mem_tlb_hit) begin
+                    end else if (vm_data && mem_req && !mem_tlb_hit && !mem_reg_ready) begin
+                        // Launch a data PTW only for an access whose translation is
+                        // NOT already captured/presented (mem_reg_ready=0).  Once the
+                        // MEM-port registered lookup has presented an access (mt_valid,
+                        // the D$ is servicing it with the captured PA), a concurrent
+                        // IF-PTW round-robin fill can EVICT that access's data TLB
+                        // entry, dropping the live mem_tlb_hit to 0.  Without this gate
+                        // PTW_IDLE would launch a SPURIOUS data re-translation for the
+                        // in-flight access; that data PTW masks core_dmem_wait
+                        // (rv_soc.sv) to 0 while the registered mem_stall (driven by
+                        // mt_valid, not the live TLB) no longer re-holds the pipeline,
+                        // so the held store retires before its D$ S_WRITE completes =
+                        // lost store (HARM).  The captured PA is fixed once presented,
+                        // so an eviction is irrelevant -- skip the re-PTW.
                         ptw_for_if <= 1'b0;
                         ptw_vpn    <= mem_vpn;
                         ptw_state  <= (XLEN == 64) ? PTW_L2 : PTW_L1;
@@ -306,20 +430,30 @@ module rv_mmu
                 end
 
                 PTW_L2: begin   // Sv39 only
-                    // ptw_wait skips 1 cycle when entering from L2→L1 would
-                    // also be needed, but IDLE→L2 is safe (ptw_req=0 in IDLE).
                     if (ptw_wait) begin
                         ptw_wait <= 1'b0;
                     end else if (ptw_ready) begin
-                        if (!pte_v || (!pte_r && pte_w) || pte_leaf) begin
-                            // Invalid PTE or unexpected leaf (gigapage not supported)
+                        if (!pte_v || (!pte_r && pte_w)) begin
                             ptw_fault_r <= 1'b1;
                             ptw_state   <= PTW_FAULT;
+                        end else if (pte_leaf) begin
+                            // Sv39 gigapage (1 GB): PPN[17:0] must be 0
+                            if (pte_ppn44[17:0] != 18'b0 || !pte_a) begin
+                                ptw_fault_r <= 1'b1;
+                                ptw_state   <= PTW_FAULT;
+                            end else begin
+                                // Effective PPN: upper PPN bits + VPN[1:0] from VA
+                                ptw_res_ppn <= {pte_ppn44[43:18], ptw_vpn[17:0]};
+                                ptw_res_r   <= pte_r; ptw_res_w <= pte_w;
+                                ptw_res_x   <= pte_x; ptw_res_u <= pte_u;
+                                ptw_res_d   <= pte_d;
+                                ptw_fault_r <= 1'b0;
+                                ptw_state   <= PTW_DONE;
+                            end
                         end else begin
+                            // Non-leaf: proceed to L1
                             ptw_ppn_cur <= pte_ppn44;
                             ptw_state   <= PTW_L1;
-                            // ptw_wait: memory latched OLD address this cycle;
-                            // skip next cycle so memory re-samples ptw_l1_addr.
                             ptw_wait    <= 1'b1;
                         end
                     end
@@ -329,14 +463,34 @@ module rv_mmu
                     if (ptw_wait) begin
                         ptw_wait <= 1'b0;
                     end else if (ptw_ready) begin
-                        if (!pte_v || (!pte_r && pte_w) || pte_leaf) begin
-                            // Invalid PTE or megapage (not supported)
+                        if (!pte_v || (!pte_r && pte_w)) begin
                             ptw_fault_r <= 1'b1;
                             ptw_state   <= PTW_FAULT;
+                        end else if (pte_leaf) begin
+                            // Sv39 megapage (2 MB): PPN[8:0] must be 0
+                            // Sv32 megapage (4 MB): PPN[9:0] must be 0
+                            logic [17:0] align_mask;
+                            logic        misaligned;
+                            align_mask  = (XLEN == 64) ? 18'h1ff : 18'h3ff;
+                            misaligned  = |(pte_ppn44[17:0] & align_mask);
+                            if (misaligned || !pte_a) begin
+                                ptw_fault_r <= 1'b1;
+                                ptw_state   <= PTW_FAULT;
+                            end else begin
+                                // Effective PPN: upper bits + VPN[0] from VA
+                                ptw_res_ppn <= (XLEN == 64)
+                                    ? {pte_ppn44[43:9], ptw_vpn[8:0]}
+                                    : {pte_ppn44[43:10], ptw_vpn[9:0]};
+                                ptw_res_r   <= pte_r; ptw_res_w <= pte_w;
+                                ptw_res_x   <= pte_x; ptw_res_u <= pte_u;
+                                ptw_res_d   <= pte_d;
+                                ptw_fault_r <= 1'b0;
+                                ptw_state   <= PTW_DONE;
+                            end
                         end else begin
+                            // Non-leaf: proceed to L0
                             ptw_ppn_cur <= pte_ppn44;
                             ptw_state   <= PTW_L0;
-                            // Same reason: skip 1 cycle for memory to latch ptw_l0_addr.
                             ptw_wait    <= 1'b1;
                         end
                     end
@@ -361,7 +515,13 @@ module rv_mmu
                 end
 
                 PTW_DONE:  ptw_state <= PTW_IDLE;
-                PTW_FAULT: ptw_state <= PTW_IDLE;
+                PTW_FAULT: begin
+                    ptw_state <= PTW_IDLE;
+                    if (ptw_for_if && !tlb_flush) begin
+                        if_dead_vld <= 1'b1;      // remember the dead IF VPN
+                        if_dead_vpn <= ptw_vpn;
+                    end
+                end
                 default:   ptw_state <= PTW_IDLE;
 
             endcase
@@ -399,15 +559,29 @@ module rv_mmu
     end
 
     // =========================================================================
-    // Stall output
+    // Stall outputs
     // =========================================================================
-    assign mmu_stall = (ptw_state != PTW_IDLE)
-                       && (ptw_state != PTW_DONE)
-                       && (ptw_state != PTW_FAULT);
+    // mem_stall: the MEM-stage load/store cannot complete because its data
+    // translation has not been PRESENTED yet -- the capture-cycle bubble, or a TLB
+    // miss being walked.  Driven by the REGISTERED mem_reg_ready / mem_fault (NOT
+    // the live TLB compare), so the data TLB is off this stall_if path.  It drops
+    // as soon as the registered translation is presented (mem_reg_ready: access
+    // proceeds to the D$) or the access faults (trap is taken).  Freezes EX/MEM so
+    // the access stays in MEM until the translation is ready.
+    wire mem_xlate_pending = vm_data && mem_req && !mem_reg_ready && !mem_fault;
+    assign mem_stall = mem_xlate_pending;
 
-    // Pre-truncated physical addresses (avoids parametric selects in always_comb)
+    // mmu_stall: stall IF/ID whenever any PTW is walking (IF or MEM) or a MEM
+    // translation is pending.  PTW_FAULT does NOT stall (the fault is taken as
+    // a trap immediately).  IF-port PTW does not freeze EX/MEM (that path keeps
+    // running, matching the original pipeline behavior).
+    wire ptw_walking = (ptw_state == PTW_L2)
+                       || (ptw_state == PTW_L1)
+                       || (ptw_state == PTW_L0);
+    assign mmu_stall = ptw_walking || mem_xlate_pending;
+
+    // Pre-truncated physical address for the IF port (MEM port uses mt_pa_xlat)
     wire [XLEN-1:0] if_pa_xlat  = if_pa64 [XLEN-1:0];
-    wire [XLEN-1:0] mem_pa_xlat = mem_pa64[XLEN-1:0];
 
     // =========================================================================
     // IF port output (combinational)
@@ -427,10 +601,20 @@ module rv_mmu
             if_req_out = if_perm_ok;
             if_fault   = !if_perm_ok;
         end else begin
-            // TLB miss: block request, signal fault if PTW faulted
+            // TLB miss: block request, signal fault if PTW faulted.
+            // (ptw_vpn == if_vpn): report the fault ONLY to the VA that was
+            // actually walked.  A walk launched for an earlier presented VA can
+            // complete (fault) after a redirect has switched if_va to a new
+            // address (e.g. an instruction-page-fault trap redirecting to the
+            // -- mapped -- handler while the dead target's relaunched walk is
+            // still in flight); without the compare that zombie fault would be
+            // attributed to the new fetch address (a spurious page fault on a
+            // mapped page).  Strict no-op whenever the presented VA is the
+            // walked VA -- every case that correctly faulted before (bug #17).
             if_pa      = '0;
             if_req_out = 1'b0;
-            if_fault   = ptw_fault_r && ptw_for_if && (ptw_state == PTW_FAULT);
+            if_fault   = ptw_fault_r && ptw_for_if && (ptw_state == PTW_FAULT)
+                         && (ptw_vpn == if_vpn);
         end
     end
 
@@ -438,7 +622,9 @@ module rv_mmu
     // MEM port output (combinational)
     // =========================================================================
     always_comb begin
-        if (!vm_enabled) begin
+        if (!vm_data) begin
+            // VM disabled for data accesses (bare mode or MPRV→M-mode): strict
+            // combinational passthrough (no bubble; non-destructive no-op).
             mem_pa      = mem_va;
             mem_req_out = mem_req;
             mem_we_out  = mem_we;
@@ -448,12 +634,15 @@ module rv_mmu
             mem_req_out = 1'b0;
             mem_we_out  = 1'b0;
             mem_fault   = 1'b0;
-        end else if (mem_tlb_hit) begin
-            mem_pa      = mem_pa_xlat;
-            mem_req_out = mem_perm_ok;
-            mem_we_out  = mem_we && mem_perm_ok;
-            mem_fault   = !mem_perm_ok;
+        end else if (mem_reg_ready) begin
+            // Present the REGISTERED translation (captured on the strobe/PTW-fill).
+            mem_pa      = mt_pa_xlat;
+            mem_req_out = mt_perm;
+            mem_we_out  = mt_we && mt_perm;
+            mem_fault   = !mt_perm;
         end else begin
+            // Capture-cycle bubble or PTW in progress: hold the access (mem_stall).
+            // A PTW page fault is still reported here (register-driven, rare path).
             mem_pa      = '0;
             mem_req_out = 1'b0;
             mem_we_out  = 1'b0;

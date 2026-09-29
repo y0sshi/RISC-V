@@ -69,8 +69,42 @@ package rv_pkg;
         OP_SYSTEM   = 7'b1110011,   // System (ECALL, EBREAK, CSR*)
         OP_IMM_W    = 7'b0011011,   // RV64I: Word-width Register-Immediate
         OP_REG_W    = 7'b0111011,   // RV64I: Word-width Register-Register
-        OP_AMO      = 7'b0101111    // A extension: Atomic Memory Operations
+        OP_AMO      = 7'b0101111,   // A extension: Atomic Memory Operations
+        // F extension opcodes
+        OP_LOAD_FP  = 7'b0000111,   // FLW (single-precision load)
+        OP_STORE_FP = 7'b0100111,   // FSW (single-precision store)
+        OP_FMADD    = 7'b1000011,   // FMADD.S
+        OP_FMSUB    = 7'b1000111,   // FMSUB.S
+        OP_FNMSUB   = 7'b1001011,   // FNMSUB.S
+        OP_FNMADD   = 7'b1001111,   // FNMADD.S
+        OP_FP       = 7'b1010011    // All other FP ops (FADD/FSUB/FMUL/FDIV/etc.)
     } opcode_t;
+
+    // =========================================================================
+    // F/D-Extension Floating-Point Operation Codes
+    // fp_double in ctrl_signals_t selects D (double) vs S (single) precision.
+    // =========================================================================
+    typedef enum logic [4:0] {
+        FPU_ADD    = 5'd0,   // FADD.S/.D
+        FPU_SUB    = 5'd1,   // FSUB.S/.D
+        FPU_MUL    = 5'd2,   // FMUL.S/.D
+        FPU_DIV    = 5'd3,   // FDIV.S/.D  (multi-cycle)
+        FPU_SQRT   = 5'd4,   // FSQRT.S/.D (multi-cycle)
+        FPU_SGNJ   = 5'd5,   // FSGNJ/FSGNJN/FSGNJX .S/.D  (rm selects)
+        FPU_MINMAX = 5'd6,   // FMIN/FMAX .S/.D  (rm selects: 0=min, 1=max)
+        FPU_CMP    = 5'd7,   // FEQ/FLT/FLE .S/.D  (rm selects)
+        FPU_CVTWS  = 5'd8,   // FCVT.W.S/.D / FCVT.WU.S/.D  (fp_rs2_sel selects)
+        FPU_CVTSW  = 5'd9,   // FCVT.S.W/.D.W / FCVT.S.WU/.D.WU  (fp_rs2_sel selects)
+        FPU_MVXW   = 5'd10,  // FMV.X.W (S) / FMV.X.D (D)
+        FPU_MVWX   = 5'd11,  // FMV.W.X (S) / FMV.D.X (D)
+        FPU_CLASS  = 5'd12,  // FCLASS.S/.D
+        FPU_MADD   = 5'd13,  // FMADD.S/.D  (rd = rs1*rs2 + rs3)
+        FPU_MSUB   = 5'd14,  // FMSUB.S/.D  (rd = rs1*rs2 - rs3)
+        FPU_NMSUB  = 5'd15,  // FNMSUB.S/.D (rd = -(rs1*rs2 - rs3))
+        FPU_NMADD  = 5'd16,  // FNMADD.S/.D (rd = -(rs1*rs2 + rs3))
+        FPU_CVTSD  = 5'd17,  // FCVT.S.D  (double -> single, result=S)
+        FPU_CVTDS  = 5'd18   // FCVT.D.S  (single -> double, result=D)
+    } fpu_op_t;
 
     // =========================================================================
     // M-Extension (Multiply-Divide) Operations
@@ -210,11 +244,12 @@ package rv_pkg;
     // =========================================================================
     // Writeback Source Selection
     // =========================================================================
-    typedef enum logic [1:0] {
-        WB_SRC_ALU  = 2'b00,   // ALU result
-        WB_SRC_MEM  = 2'b01,   // Memory read data
-        WB_SRC_PC4  = 2'b10,   // PC + 4 (for JAL/JALR)
-        WB_SRC_CSR  = 2'b11    // CSR read data
+    typedef enum logic [2:0] {
+        WB_SRC_ALU  = 3'b000,   // ALU result
+        WB_SRC_MEM  = 3'b001,   // Memory read data
+        WB_SRC_PC4  = 3'b010,   // PC + 4 (for JAL/JALR)
+        WB_SRC_CSR  = 3'b011,   // CSR read data
+        WB_SRC_FPU  = 3'b100    // FPU integer result (FMV.X.W/FCVT.W.S/FCMP/FCLASS)
     } wb_src_t;
 
     // =========================================================================
@@ -237,6 +272,10 @@ package rv_pkg;
         logic       is_ebreak;      // EBREAK
         logic       is_mret;        // MRET (machine trap return)
         logic       is_sret;        // SRET (supervisor trap return, reserved for S-mode)
+        // C extension
+        logic       is_compressed;  // 1 = 16-bit compressed instruction (PC += 2, link = PC+2)
+        // Illegal-instruction detection
+        logic       is_illegal;     // 1 = undecodable / reserved encoding -> illegal-instruction trap
         // M extension
         logic       is_muldiv;      // Multiply/divide instruction (M extension)
         muldiv_op_t muldiv_op;      // M-extension operation selector
@@ -247,6 +286,19 @@ package rv_pkg;
         amo_op_t    amo_op;         // AMO operation selector
         // Zicsr / privileged
         logic       is_sfence_vma;  // SFENCE.VMA — flush TLB
+        logic       is_fence_i;     // FENCE.I — flush instruction cache (Zifencei)
+        // F/D extension floating-point
+        logic       is_fp;        // FP instruction (not FLW/FSW but any FPU op)
+        logic       fp_load;      // FLW/FLD: DMEM -> f-regfile
+        logic       fp_store;     // FSW/FSD: f-regfile -> DMEM (store data is float)
+        logic       freg_write;   // Write result to FP register file
+        logic       fp_to_int;    // FPU result -> integer regfile (FMV.X.W, FCVT.W.S, CMP, FCLASS)
+        logic       int_to_fp;    // rs1 from integer regfile (FMV.W.X, FCVT.S.W)
+        logic       fp_use_rs3;   // Read rs3 (FMADD / FMSUB / FNMADD / FNMSUB)
+        logic       fp_double;    // 1 = double precision (D-ext), 0 = single precision (F-ext)
+        fpu_op_t    fpu_op;       // FPU operation selector
+        logic [2:0] fp_rm;        // Rounding mode from instruction field
+        logic [4:0] fp_rs2_sel;   // inst[24:20]: FCVT sub-type / FSQRT rs2 field
     } ctrl_signals_t;
 
     // =========================================================================
@@ -261,6 +313,10 @@ package rv_pkg;
     // =========================================================================
     // CSR Addresses (subset of commonly used ones)
     // =========================================================================
+    // F-extension floating-point CSRs
+    parameter logic [11:0] CSR_FFLAGS     = 12'h001;  // fp exception flags (fflags)
+    parameter logic [11:0] CSR_FRM        = 12'h002;  // fp rounding mode   (frm)
+    parameter logic [11:0] CSR_FCSR       = 12'h003;  // fp control/status  (frm|fflags)
     // Machine-level CSRs
     parameter logic [11:0] CSR_MSTATUS    = 12'h300;
     parameter logic [11:0] CSR_MISA       = 12'h301;
@@ -276,6 +332,15 @@ package rv_pkg;
     parameter logic [11:0] CSR_MCYCLE     = 12'hB00;
     parameter logic [11:0] CSR_MINSTRET   = 12'hB02;
     parameter logic [11:0] CSR_MHARTID    = 12'hF14;
+    parameter logic [11:0] CSR_MCOUNTEREN = 12'h306;  // M counter-enable (CY/TM/IR for S)
+    // User-mode read-only counter shadows (Linux rdcycle/rdtime/rdinstret).
+    // 'time' (0xC01) shadows the CLINT mtime supplied on the timer_val input.
+    parameter logic [11:0] CSR_CYCLE      = 12'hC00;
+    parameter logic [11:0] CSR_TIME       = 12'hC01;
+    parameter logic [11:0] CSR_INSTRET    = 12'hC02;
+    parameter logic [11:0] CSR_CYCLEH     = 12'hC80;  // RV32 high halves
+    parameter logic [11:0] CSR_TIMEH      = 12'hC81;
+    parameter logic [11:0] CSR_INSTRETH   = 12'hC82;
 
     // Supervisor-level CSRs (for Linux support)
     parameter logic [11:0] CSR_SSTATUS    = 12'h100;
@@ -287,6 +352,7 @@ package rv_pkg;
     parameter logic [11:0] CSR_STVAL      = 12'h143;
     parameter logic [11:0] CSR_SIP        = 12'h144;
     parameter logic [11:0] CSR_SATP       = 12'h180;
+    parameter logic [11:0] CSR_SCOUNTEREN = 12'h106;  // S counter-enable (CY/TM/IR for U)
 
     // =========================================================================
     // Exception Codes (mcause / scause)

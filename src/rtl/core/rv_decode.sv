@@ -5,7 +5,7 @@
 /// Decodes 32-bit RISC-V instructions and generates:
 /// - **ctrl**: Control signals (ALU operation, memory access type, jump flags)
 /// - **imm**: Sign-extended immediate value (12-20 bits depending on format)
-/// - **rs1_addr, rs2_addr, rd_addr**: Register addresses
+/// - **rs1_addr, rs2_addr, rs3_addr, rd_addr**: Register addresses
 /// - **rs1_used, rs2_used**: Flags indicating which operands are actually used
 ///
 /// **Supported Instructions:**
@@ -14,6 +14,8 @@
 /// - RV32A / RV64A: Atomic operations (via ctrl.is_amo)
 /// - Zicsr: CSR read/write operations
 /// - ECALL, EBREAK, MRET, SRET: Privilege instructions
+/// - RV32F: FLW/FSW, FADD/FSUB/FMUL/FDIV/FSQRT, FMADD family,
+///          FSGNJ/FMIN/FMAX, FEQ/FLT/FLE, FCLASS, FMV, FCVT
 ///
 /// **Immediate Encoding (I/S/B/U/J types):**
 /// - I-type: imm = inst[31:20] sign-extended (12 bits)
@@ -41,9 +43,11 @@ module rv_decode
     output logic [XLEN-1:0]   imm,
     output reg_addr_t         rs1_addr,
     output reg_addr_t         rs2_addr,
+    output reg_addr_t         rs3_addr,   // FP rs3 for FMADD family (inst[31:27])
     output reg_addr_t         rd_addr,
     output logic              rs1_used,   // instruction actually reads rs1
-    output logic              rs2_used    // instruction actually reads rs2
+    output logic              rs2_used,   // instruction actually reads rs2
+    output logic              illegal     // 1 = undecodable / reserved encoding
 );
 
     // =========================================================================
@@ -53,8 +57,21 @@ module rv_decode
     wire [2:0] funct3 = inst[14:12];
     wire [6:0] funct7 = inst[31:25];
 
+    // Shift-immediate amount validity (XLEN-dependent).
+    // RV32: shamt is 5 bits, inst[31:25] must be 0000000 (logical) / 0100000 (arith only f3=101).
+    // RV64: shamt is 6 bits, inst[31:26] must be 000000 / 010000.
+    localparam bit DEC_RV64 = (XLEN == 64);
+    wire shll_illegal = DEC_RV64 ? (inst[31:26] != 6'b000000)
+                                 : (inst[31:25] != 7'b0000000);
+    wire shrl_illegal = DEC_RV64 ? (inst[31:26] != 6'b000000 && inst[31:26] != 6'b010000)
+                                 : (inst[31:25] != 7'b0000000 && inst[31:25] != 7'b0100000);
+    // W-form shifts (RV64 only) always use a 5-bit shamt: inst[25] must be 0.
+    wire shllw_illegal = (inst[31:25] != 7'b0000000);
+    wire shrlw_illegal = (inst[31:25] != 7'b0000000 && inst[31:25] != 7'b0100000);
+
     assign rs1_addr = inst[19:15];
     assign rs2_addr = inst[24:20];
+    assign rs3_addr = inst[31:27];   // R4-type: FMADD/FMSUB/FNMSUB/FNMADD
     assign rd_addr  = inst[11:7];
 
     // =========================================================================
@@ -63,11 +80,13 @@ module rv_decode
     always_comb begin
         case (opcode)
             // I-type
-            OP_IMM, OP_LOAD, OP_JALR, OP_IMM_W: begin
+            OP_IMM, OP_LOAD, OP_JALR, OP_IMM_W,
+            OP_LOAD_FP: begin                         // FLW: I-type
                 imm = {{(XLEN-12){inst[31]}}, inst[31:20]};
             end
             // S-type
-            OP_STORE: begin
+            OP_STORE,
+            OP_STORE_FP: begin                        // FSW: S-type
                 imm = {{(XLEN-12){inst[31]}}, inst[31:25], inst[11:7]};
             end
             // B-type
@@ -100,6 +119,7 @@ module rv_decode
         ctrl     = '0;
         rs1_used = 1'b0;
         rs2_used = 1'b0;
+        illegal  = 1'b0;
 
         case (opcode)
             OP_LUI: begin
@@ -165,11 +185,12 @@ module rv_decode
                 // Decode ALU operation from funct3 + funct7
                 case (funct3)
                     F3_ADD_SUB: ctrl.alu_op = ALU_ADD;   // ADDI (no SUB for immediate)
-                    F3_SLL:     ctrl.alu_op = ALU_SLL;
+                    F3_SLL:   begin ctrl.alu_op = ALU_SLL;  if (shll_illegal) illegal = 1'b1; end // SLLI
                     F3_SLT:     ctrl.alu_op = ALU_SLT;
                     F3_SLTU:    ctrl.alu_op = ALU_SLTU;
                     F3_XOR:     ctrl.alu_op = ALU_XOR;
-                    F3_SRL_SRA: ctrl.alu_op = inst[30] ? ALU_SRA : ALU_SRL;
+                    F3_SRL_SRA: begin ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SRA : ALU_SRL);
+                                      if (shrl_illegal) illegal = 1'b1; end                       // SRLI/SRAI
                     F3_OR:      ctrl.alu_op = ALU_OR;
                     F3_AND:     ctrl.alu_op = ALU_AND;
                     default:    ctrl.alu_op = ALU_ADD;
@@ -197,12 +218,12 @@ module rv_decode
                 end else begin
                     // RV32I / RV64I base integer R-type
                     case (funct3)
-                        F3_ADD_SUB: ctrl.alu_op = inst[30] ? ALU_SUB : ALU_ADD;
+                        F3_ADD_SUB: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SUB : ALU_ADD);
                         F3_SLL:     ctrl.alu_op = ALU_SLL;
                         F3_SLT:     ctrl.alu_op = ALU_SLT;
                         F3_SLTU:    ctrl.alu_op = ALU_SLTU;
                         F3_XOR:     ctrl.alu_op = ALU_XOR;
-                        F3_SRL_SRA: ctrl.alu_op = inst[30] ? ALU_SRA : ALU_SRL;
+                        F3_SRL_SRA: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SRA : ALU_SRL);
                         F3_OR:      ctrl.alu_op = ALU_OR;
                         F3_AND:     ctrl.alu_op = ALU_AND;
                         default:    ctrl.alu_op = ALU_ADD;
@@ -218,12 +239,16 @@ module rv_decode
                 ctrl.alu_src2  = ALU_SRC2_IMM;
                 ctrl.wb_src    = WB_SRC_ALU;
                 rs1_used       = 1'b1;
+                if (!DEC_RV64) illegal = 1'b1;   // W-type ops do not exist on RV32
                 case (funct3)
                     F3_ADD_SUB: ctrl.alu_op = ALU_ADDW;               // ADDIW
-                    F3_SLL:     ctrl.alu_op = ALU_SLLW;               // SLLIW
-                    F3_SRL_SRA: ctrl.alu_op = inst[30] ? ALU_SRAW     // SRAIW
-                                                       : ALU_SRLW;    // SRLIW
-                    default:    ctrl.alu_op = ALU_ADDW;
+                    F3_SLL:   begin ctrl.alu_op = ALU_SLLW;           // SLLIW
+                                    if (shllw_illegal) illegal = 1'b1; end
+                    F3_SRL_SRA: begin ctrl.alu_op = alu_op_t'(inst[30]
+                                                ? ALU_SRAW            // SRAIW
+                                                : ALU_SRLW);          // SRLIW
+                                      if (shrlw_illegal) illegal = 1'b1; end
+                    default:    illegal = 1'b1;   // ADDIW only valid base f3=000
                 endcase
             end
 
@@ -235,6 +260,7 @@ module rv_decode
                 ctrl.wb_src    = WB_SRC_ALU;
                 rs1_used       = 1'b1;
                 rs2_used       = 1'b1;
+                if (!DEC_RV64) illegal = 1'b1;   // W-type ops do not exist on RV32
                 if (funct7 == 7'b0000001) begin
                     // RV64M: W-type multiply-divide
                     ctrl.is_muldiv = 1'b1;
@@ -249,9 +275,9 @@ module rv_decode
                 end else begin
                     // RV64I base W-type
                     case (funct3)
-                        F3_ADD_SUB: ctrl.alu_op = inst[30] ? ALU_SUBW : ALU_ADDW;
+                        F3_ADD_SUB: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SUBW : ALU_ADDW);
                         F3_SLL:     ctrl.alu_op = ALU_SLLW;
-                        F3_SRL_SRA: ctrl.alu_op = inst[30] ? ALU_SRAW : ALU_SRLW;
+                        F3_SRL_SRA: ctrl.alu_op = alu_op_t'(inst[30] ? ALU_SRAW : ALU_SRLW);
                         default:    ctrl.alu_op = ALU_ADDW;
                     endcase
                 end
@@ -270,6 +296,8 @@ module rv_decode
             OP_AMO: begin
                 ctrl.reg_write = 1'b1;
                 ctrl.is_amo    = 1'b1;
+                ctrl.alu_op    = ALU_ADD;        // addr = rs1 + 0
+                ctrl.alu_src2  = ALU_SRC2_IMM;   // imm = 0 for AMO (no offset)
                 ctrl.wb_src    = WB_SRC_MEM;   // default: return old memory value
                 rs1_used       = 1'b1;          // rs1 = address
                 unique case (inst[31:27])
@@ -297,8 +325,271 @@ module rv_decode
                 endcase
             end
 
+            // -----------------------------------------------------------------
+            // F/D extension: FLW (funct3=010) / FLD (funct3=011) — I-type
+            // -----------------------------------------------------------------
+            OP_LOAD_FP: begin
+                ctrl.is_fp      = 1'b1;
+                ctrl.fp_load    = 1'b1;
+                ctrl.freg_write = 1'b1;
+                ctrl.mem_read   = 1'b1;
+                ctrl.alu_op     = ALU_ADD;
+                ctrl.alu_src2   = ALU_SRC2_IMM;
+                ctrl.fp_double  = (funct3 == 3'b011);  // FLD uses funct3=011
+                rs1_used        = 1'b1;
+            end
+
+            // -----------------------------------------------------------------
+            // F/D extension: FSW (funct3=010) / FSD (funct3=011) — S-type
+            // -----------------------------------------------------------------
+            OP_STORE_FP: begin
+                ctrl.is_fp     = 1'b1;
+                ctrl.fp_store  = 1'b1;
+                ctrl.mem_write = 1'b1;
+                ctrl.alu_op    = ALU_ADD;
+                ctrl.alu_src2  = ALU_SRC2_IMM;
+                ctrl.fp_double = (funct3 == 3'b011);  // FSD uses funct3=011
+                rs1_used       = 1'b1;
+            end
+
+            // -----------------------------------------------------------------
+            // F/D extension: FMADD — R4-type (rd = rs1*rs2 + rs3)
+            //   inst[26:25] = fmt: 00=S, 01=D
+            // -----------------------------------------------------------------
+            OP_FMADD: begin
+                ctrl.is_fp      = 1'b1;
+                ctrl.freg_write = 1'b1;
+                ctrl.fp_use_rs3 = 1'b1;
+                ctrl.fpu_op     = FPU_MADD;
+                ctrl.fp_rm      = funct3;
+                ctrl.fp_double  = (inst[26:25] == 2'b01);
+            end
+
+            // -----------------------------------------------------------------
+            // F/D extension: FMSUB — R4-type (rd = rs1*rs2 - rs3)
+            // -----------------------------------------------------------------
+            OP_FMSUB: begin
+                ctrl.is_fp      = 1'b1;
+                ctrl.freg_write = 1'b1;
+                ctrl.fp_use_rs3 = 1'b1;
+                ctrl.fpu_op     = FPU_MSUB;
+                ctrl.fp_rm      = funct3;
+                ctrl.fp_double  = (inst[26:25] == 2'b01);
+            end
+
+            // -----------------------------------------------------------------
+            // F/D extension: FNMSUB — R4-type (rd = -(rs1*rs2 - rs3))
+            // -----------------------------------------------------------------
+            OP_FNMSUB: begin
+                ctrl.is_fp      = 1'b1;
+                ctrl.freg_write = 1'b1;
+                ctrl.fp_use_rs3 = 1'b1;
+                ctrl.fpu_op     = FPU_NMSUB;
+                ctrl.fp_rm      = funct3;
+                ctrl.fp_double  = (inst[26:25] == 2'b01);
+            end
+
+            // -----------------------------------------------------------------
+            // F/D extension: FNMADD — R4-type (rd = -(rs1*rs2 + rs3))
+            // -----------------------------------------------------------------
+            OP_FNMADD: begin
+                ctrl.is_fp      = 1'b1;
+                ctrl.freg_write = 1'b1;
+                ctrl.fp_use_rs3 = 1'b1;
+                ctrl.fpu_op     = FPU_NMADD;
+                ctrl.fp_rm      = funct3;
+                ctrl.fp_double  = (inst[26:25] == 2'b01);
+            end
+
+            // -----------------------------------------------------------------
+            // F/D extension: OP_FP — all other FP ops
+            //   funct7[1:0] = fmt: 00=S, 01=D
+            // -----------------------------------------------------------------
+            OP_FP: begin
+                ctrl.is_fp      = 1'b1;
+                ctrl.fp_rm      = funct3;
+                ctrl.fp_rs2_sel = inst[24:20];
+
+                case (funct7)
+                    // --- Single-precision (fmt=00) ---
+                    // FADD.S
+                    7'b0000000: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fpu_op     = FPU_ADD;
+                    end
+                    // FSUB.S
+                    7'b0000100: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fpu_op     = FPU_SUB;
+                    end
+                    // FMUL.S
+                    7'b0001000: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fpu_op     = FPU_MUL;
+                    end
+                    // FDIV.S
+                    7'b0001100: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fpu_op     = FPU_DIV;
+                    end
+                    // FSQRT.S
+                    7'b0101100: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fpu_op     = FPU_SQRT;
+                    end
+                    // FSGNJ.S / FSGNJN.S / FSGNJX.S
+                    7'b0010000: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fpu_op     = FPU_SGNJ;
+                    end
+                    // FMIN.S / FMAX.S
+                    7'b0010100: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fpu_op     = FPU_MINMAX;
+                    end
+                    // FCVT.S.D: double -> single (funct7=0100000, rs2_sel=00001)
+                    7'b0100000: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;  // source is double; result is single
+                        ctrl.fpu_op     = FPU_CVTSD;
+                    end
+                    // FCVT.D.S: single -> double (funct7=0100001, rs2_sel=00000)
+                    7'b0100001: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;  // result is double
+                        ctrl.fpu_op     = FPU_CVTDS;
+                    end
+                    // FCVT.S.W / FCVT.S.WU / FCVT.S.L / FCVT.S.LU (int -> single)
+                    7'b1101000: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.int_to_fp  = 1'b1;
+                        ctrl.fpu_op     = FPU_CVTSW;
+                        rs1_used        = 1'b1;
+                    end
+                    // FMV.W.X (int bits -> float reg)
+                    7'b1111000: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.int_to_fp  = 1'b1;
+                        ctrl.fpu_op     = FPU_MVWX;
+                        rs1_used        = 1'b1;
+                    end
+                    // FEQ.S / FLT.S / FLE.S
+                    7'b1010000: begin
+                        ctrl.reg_write  = 1'b1;
+                        ctrl.fp_to_int  = 1'b1;
+                        ctrl.wb_src     = WB_SRC_FPU;
+                        ctrl.fpu_op     = FPU_CMP;
+                    end
+                    // FCLASS.S (funct3=001) / FMV.X.W (funct3=000)
+                    7'b1110000: begin
+                        ctrl.reg_write  = 1'b1;
+                        ctrl.fp_to_int  = 1'b1;
+                        ctrl.wb_src     = WB_SRC_FPU;
+                        if (funct3 == 3'b001) ctrl.fpu_op = FPU_CLASS;
+                        else                  ctrl.fpu_op = FPU_MVXW;
+                    end
+                    // FCVT.W.S / FCVT.WU.S / FCVT.L.S / FCVT.LU.S (single -> int)
+                    7'b1100000: begin
+                        ctrl.reg_write  = 1'b1;
+                        ctrl.fp_to_int  = 1'b1;
+                        ctrl.wb_src     = WB_SRC_FPU;
+                        ctrl.fpu_op     = FPU_CVTWS;
+                    end
+
+                    // --- Double-precision (fmt=01) ---
+                    // FADD.D
+                    7'b0000001: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fpu_op     = FPU_ADD;
+                    end
+                    // FSUB.D
+                    7'b0000101: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fpu_op     = FPU_SUB;
+                    end
+                    // FMUL.D
+                    7'b0001001: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fpu_op     = FPU_MUL;
+                    end
+                    // FDIV.D
+                    7'b0001101: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fpu_op     = FPU_DIV;
+                    end
+                    // FSQRT.D
+                    7'b0101101: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fpu_op     = FPU_SQRT;
+                    end
+                    // FSGNJ.D / FSGNJN.D / FSGNJX.D
+                    7'b0010001: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fpu_op     = FPU_SGNJ;
+                    end
+                    // FMIN.D / FMAX.D
+                    7'b0010101: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fpu_op     = FPU_MINMAX;
+                    end
+                    // FCVT.D.W / FCVT.D.WU / FCVT.D.L / FCVT.D.LU (int -> double)
+                    7'b1101001: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.int_to_fp  = 1'b1;
+                        ctrl.fpu_op     = FPU_CVTSW;
+                        rs1_used        = 1'b1;
+                    end
+                    // FMV.D.X (int bits -> double reg, RV64D only)
+                    7'b1111001: begin
+                        ctrl.freg_write = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.int_to_fp  = 1'b1;
+                        ctrl.fpu_op     = FPU_MVWX;
+                        rs1_used        = 1'b1;
+                    end
+                    // FEQ.D / FLT.D / FLE.D
+                    7'b1010001: begin
+                        ctrl.reg_write  = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fp_to_int  = 1'b1;
+                        ctrl.wb_src     = WB_SRC_FPU;
+                        ctrl.fpu_op     = FPU_CMP;
+                    end
+                    // FCLASS.D (funct3=001) / FMV.X.D (funct3=000, RV64D)
+                    7'b1110001: begin
+                        ctrl.reg_write  = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fp_to_int  = 1'b1;
+                        ctrl.wb_src     = WB_SRC_FPU;
+                        if (funct3 == 3'b001) ctrl.fpu_op = FPU_CLASS;
+                        else                  ctrl.fpu_op = FPU_MVXW;
+                    end
+                    // FCVT.W.D / FCVT.WU.D / FCVT.L.D / FCVT.LU.D (double -> int)
+                    7'b1100001: begin
+                        ctrl.reg_write  = 1'b1;
+                        ctrl.fp_double  = 1'b1;
+                        ctrl.fp_to_int  = 1'b1;
+                        ctrl.wb_src     = WB_SRC_FPU;
+                        ctrl.fpu_op     = FPU_CVTWS;
+                    end
+                    default: ;
+                endcase
+            end
+
             OP_FENCE: begin
-                // NOP for now; fence is a hint in simple implementations
+                // FENCE (funct3=000) is a NOP in this simple implementation.
+                // FENCE.I (funct3=001, Zifencei) flushes the instruction cache so
+                // self-modified / newly loaded code is re-fetched from memory.
+                if (funct3 == 3'b001)
+                    ctrl.is_fence_i = 1'b1;
             end
 
             OP_SYSTEM: begin
@@ -331,7 +622,8 @@ module rv_decode
             end
 
             default: begin
-                // Illegal instruction - keep default (NOP)
+                // Unknown opcode -> illegal instruction
+                illegal = 1'b1;
             end
         endcase
     end

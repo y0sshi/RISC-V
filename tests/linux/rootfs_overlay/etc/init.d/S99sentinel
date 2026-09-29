@@ -1,0 +1,19 @@
+#!/bin/sh
+# Sim auto-verification sentinel (busybox init runs /etc/init.d/S* at boot).
+#
+# The boot testbench ties UART RX to 1 (no interactive input in sim), so we
+# prove "rootfs mounted + busybox init + real bash runs" by emitting a fixed
+# marker line plus the bash version and kernel uname to the ttyS0 console.  The
+# Verilator/iverilog harness deserializes UART TX, so these lines appear on the
+# captured console exactly like the old LINUX-USERSPACE-OK sentinel.
+#
+# On real hardware this is harmless (it just prints once at boot); the
+# interactive bash prompt is provided by the ttyS0 getty (-n -l /bin/bash).
+
+case "$1" in
+    start|"")
+        /bin/bash -c 'echo "ROOTFS-BASH-OK: $(bash --version | head -n1)"'
+        uname -a
+        ;;
+esac
+exit 0

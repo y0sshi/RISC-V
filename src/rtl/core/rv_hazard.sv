@@ -1,17 +1,25 @@
 // =============================================================================
-// rv_hazard.sv - Hazard Detection Unit
-// =============================================================================
-// Detects load-use hazards that cannot be resolved by forwarding alone.
-//
-// A load-use hazard occurs when a LOAD instruction in the EX stage writes to
-// a register that the immediately following instruction (in ID) needs to read.
-// The loaded data is not available until the WB stage, one cycle too late for
-// the consumer instruction's EX stage even with MEM/WB forwarding.
-//
-// Resolution: stall IF and ID for 1 cycle, insert a bubble into ID/EX.
-// After the stall, MEM/WB forwarding provides the loaded data to EX.
-//
-// Author: Naofumi Yoshinaga
+/// @file rv_hazard.sv
+/// @brief Hazard Detection Unit
+///
+/// Detects load-use hazards that cannot be resolved by forwarding alone.
+///
+/// An integer load-use hazard occurs when a LOAD (or AMO) instruction in EX
+/// writes to a register that the following instruction in ID needs to read.
+/// The loaded data is not available until WB, one cycle too late for EX even
+/// with MEM/WB forwarding.
+///
+/// An FP load-use hazard occurs when an FP load (FLW/FLD) is in EX or MEM and a
+/// following FP instruction (in ID) reads from the same FP register.  The FP-load
+/// result is registered one cycle at the core boundary (fpld; see rv_core) to
+/// break the long D$-data -> FP-datapath route, so it is forwardable one cycle
+/// later than an ordinary value -- hence the consumer must be held until the load
+/// reaches WB (FP load in EX -> 2 stall cycles, FP load in MEM -> 1 stall cycle;
+/// thereafter the fpld forward / regfile supplies it).
+///
+/// Resolution: stall IF+ID for 1 cycle, insert a bubble into ID/EX.
+///
+/// @author Naofumi Yoshinaga
 // =============================================================================
 
 `default_nettype none
@@ -22,29 +30,102 @@ module rv_hazard
     parameter int XLEN = rv_pkg::XLEN
 ) (
     // ID/EX register: instruction currently in EX stage
-    input  logic          id_ex_valid,
-    input  ctrl_signals_t id_ex_ctrl,
-    input  reg_addr_t     id_ex_rd_addr,
+    input  wire           id_ex_valid,
+    input  wire ctrl_signals_t id_ex_ctrl,
+    input  wire reg_addr_t id_ex_rd_addr,
+
+    // EX/MEM register: instruction currently in MEM stage (FP-load only -- used to
+    // extend the FP load-use stall by one cycle for the late fpld writeback).
+    input  wire           ex_mem_valid,
+    input  wire ctrl_signals_t ex_mem_ctrl,
+    input  wire reg_addr_t ex_mem_rd_addr,
 
     // Decoded fields of instruction currently in ID stage (from IF/ID)
-    input  reg_addr_t     id_rs1_addr,
-    input  reg_addr_t     id_rs2_addr,
-    input  logic          id_rs1_used,   // ID instruction actually reads rs1
-    input  logic          id_rs2_used,   // ID instruction actually reads rs2
+    input  wire reg_addr_t id_rs1_addr,
+    input  wire reg_addr_t id_rs2_addr,
+    input  wire reg_addr_t id_rs3_addr,   // FP rs3 for FMADD family
+    input  wire ctrl_signals_t id_ctrl,       // ID decoded control (for FP hazard)
+    input  wire           id_rs1_used,   // ID instruction actually reads int rs1
+    input  wire           id_rs2_used,   // ID instruction actually reads int rs2
 
     // Hazard output
     output logic          load_use_hazard
 );
 
+    // Determine whether ID instruction reads FP registers
+    // (conservative: most FP ops read frs1; fp_store reads frs2; FMADD reads frs3)
+    wire id_fp_reads_rs1 = id_ctrl.is_fp && !id_ctrl.int_to_fp && !id_ctrl.fp_load;
+    wire id_fp_reads_rs2 = (id_ctrl.is_fp && !id_ctrl.int_to_fp && !id_ctrl.fp_load) ||
+                            id_ctrl.fp_store;
+    wire id_fp_reads_rs3 = id_ctrl.fp_use_rs3;
+
     always_comb begin
         load_use_hazard = 1'b0;
-        // Load-use hazard: LOAD or AMO in EX whose result consumer is in ID.
+
+        // ---- Integer load-use: LOAD or AMO in EX, consumer in ID ----
         // AMO (including LR/SC) writes rd one cycle after MEM (like a load).
         if (id_ex_valid && (id_ex_ctrl.mem_read || id_ex_ctrl.is_amo)
                         && (id_ex_rd_addr != '0)) begin
             if (id_rs1_used && (id_ex_rd_addr == id_rs1_addr))
                 load_use_hazard = 1'b1;
             if (id_rs2_used && (id_ex_rd_addr == id_rs2_addr))
+                load_use_hazard = 1'b1;
+        end
+
+        // ---- FP load-use: FP load in EX, FP consumer in ID ----
+        // The FP-load value is forwardable one cycle later than usual (it is
+        // registered into fpld at the core boundary), so the consumer must wait
+        // until the load reaches WB.  Stalling while the load is in EX *and* again
+        // while it is in MEM yields the required 2-cycle hold for a back-to-back
+        // dependent FP op; a 2-instruction-apart consumer (load already in MEM)
+        // gets the single remaining stall.
+        // Note: no `!= '0` guard here -- f0 is a real, writable FP register
+        // (unlike integer x0), so a load targeting f0 must still stall.
+        if (id_ex_valid && id_ex_ctrl.fp_load) begin
+            if (id_fp_reads_rs1 && (id_ex_rd_addr == id_rs1_addr))
+                load_use_hazard = 1'b1;
+            if (id_fp_reads_rs2 && (id_ex_rd_addr == id_rs2_addr))
+                load_use_hazard = 1'b1;
+            if (id_fp_reads_rs3 && (id_ex_rd_addr == id_rs3_addr))
+                load_use_hazard = 1'b1;
+        end
+
+        // ---- FP load-use: FP load in MEM, FP consumer in ID ----
+        // Second stall cycle of the extended FP load-use hold (see above).
+        if (ex_mem_valid && ex_mem_ctrl.fp_load) begin
+            if (id_fp_reads_rs1 && (ex_mem_rd_addr == id_rs1_addr))
+                load_use_hazard = 1'b1;
+            if (id_fp_reads_rs2 && (ex_mem_rd_addr == id_rs2_addr))
+                load_use_hazard = 1'b1;
+            if (id_fp_reads_rs3 && (ex_mem_rd_addr == id_rs3_addr))
+                load_use_hazard = 1'b1;
+        end
+
+        // ---- Integer load -> conditional-branch interlock (50 MHz timing) ----
+        // A conditional branch resolves taken/not-taken in EX, and branch_taken
+        // drives the redirect/flush that gates the ID/EX clock-enable IN THE SAME
+        // CYCLE.  If the branch compares a value forwarded combinationally from a
+        // load still in MEM/WB (the live D$-read shaped data), the path
+        //   D$ BRAM -> load shape -> MEM/WB forward -> branch compare -> flush ->
+        //   ID/EX CE
+        // is the 50 MHz binding path (docs/freq_50mhz.md sec 22).  The generic
+        // integer load-use rule above already holds the branch one cycle while the
+        // load is in EX (so the branch would otherwise reach EX aligned with the
+        // load's WB and read the MEM/WB combinational forward).  Add a second hold
+        // while the load is in MEM so the branch reaches EX only AFTER the load has
+        // retired and its value is captured into id_ex_rs*_data via the regfile
+        // write bypass -- the branch then compares a REGISTERED operand (rv_core
+        // feeds the branch from br_rs*_data, whose MEM/WB tier never sources the
+        // live load-shaped data).  This is the integer-branch analog of the FP
+        // load-in-MEM extension above.  Strict refinement: only adds stalls; data
+        // paths are unchanged.  Limited to conditional branches (id_ctrl.branch):
+        // JALR resolves its target via the ALU (a path that ends at the registered
+        // redirect-target latch, not the flush CE) and its taken is data-independent.
+        if (ex_mem_valid && (ex_mem_ctrl.mem_read || ex_mem_ctrl.is_amo)
+                         && (ex_mem_rd_addr != '0) && id_ctrl.branch) begin
+            if (id_rs1_used && (ex_mem_rd_addr == id_rs1_addr))
+                load_use_hazard = 1'b1;
+            if (id_rs2_used && (ex_mem_rd_addr == id_rs2_addr))
                 load_use_hazard = 1'b1;
         end
     end

@@ -1,236 +1,140 @@
-# RISC-V Linux移植ロードマップ
+# RISC-V コア 開発ロードマップ
 
-**プロジェクト全体進捗: 65% (Phase 0完了、Phase 1完了)**
+最終更新: 2026-07-03
+
+自作 RV64GC 5段パイプラインコア (educational) の到達点と今後の計画。
+ISA/テスト詳細は `CLAUDE.md`、RTL バグ史 (#1〜#18) は `docs/rtl_bug_history.md` を参照。
 
 ---
 
-## Phase 0: CPU/MMU基盤構築 ✅ **100% 完了**
+## 現状サマリ
 
-CPU、メモリ管理、基本的な割り込みシステムの実装。
+**実機 Zybo Z7-20 (50 MHz) で OpenSBI v1.2 フルブート + Linux 6.12 + Buildroot RootFS が
+bash シェル到達 (`ROOTFS-BASH-OK`) を達成** (2026-07-03、sim/実機とも)。
+- compliance RV64 117/117・RV32 88/88、全ユニットテスト PASS。RTL バグ #1〜#18 修正済み。
+- RV64GC + Zicsr + S-mode + Sv39 + トラップ委譲 + CLINT/UART(8250)/PLIC/GPIO。
+- DDR over AXI (2 マスタ) + I/D キャッシュ、Verilator 高速 sim、JTAG bring-up。
+- FPGA timing met @50 MHz (WNS=+0.313ns, Failing Endpoints 0/74618。LUT 64.6%・DSP 26.8%)。
 
-| 項目 | 進捗 | 説明 |
+---
+
+## 達成済みフェーズ
+
+| フェーズ | 内容 | 状態 |
 |---|---|---|
-| **RV32I/RV64I基本命令セット** | ✅ 100% | 5段パイプラインで完全実装 |
-| **M拡張（乗算・除算）** | ✅ 100% | rv_muldiv.sv、MUL/DIV/REM対応 |
-| **A拡張（アトミック操作）** | ✅ 100% | rv_amo.sv、LR/SC/AMO* 実装 |
-| **C拡張（圧縮命令）** | ⏸ 0% | 未実装（RV32C/RV64Cの展開デコーダ） |
-| **Zicsr拡張（CSR命令）** | ✅ 100% | rv_csr.sv で Machine/Supervisor CSR 完全実装 |
-| **MMU (Sv32/Sv39)** | ✅ 100% | rv_mmu.sv、TLB(16entry)、ページングフル対応 |
-| **M-mode トラップハンドリング** | ✅ 100% | mtvec/mepc/mcause/mstatus 実装 |
-| **S-mode トラップハンドリング** | ✅ 100% | stvec/sepc/scause/sstatus 実装 |
-| **割り込み優先度** | ✅ 100% | MEIP(11) > MSIP(3) > MTIP(7) > SEIP(9) > SSIP(1) > STIP(5) |
-| **機械タイマー（MTIP）** | ✅ 100% | rv_timer.sv、mtime/mtimecmp レジスタ |
-| **スーパーバイザータイマー（STIP）** | ✅ 100% | mideleg経由で委譲可能 |
-| **テストベンチ** | ✅ 100% | tb_rv_csr.sv / tb_rv_timer.sv / tb_rv_supervisor.sv（全 PASS） |
+| **0. CPU/MMU/ISA 基盤** | 5段パイプライン、I/M/A/F/D/C/Zicsr、M/S-mode、Sv32/Sv39、トラップ/割込優先度 | ✅ |
+| **1. SoC 統合・ボード雛形** | CLINT/UART/PLIC/GPIO、`rv_soc`/`rv_soc_bram`/`rv_soc_act`、Zybo/KV260 トップ | ✅ |
+| **2. メモリ拡張・キャッシュ** | BRAM → PS DDR over AXI4 (命令+データ/PTW 2マスタ)、I$/D$ + burst bridge | ✅ |
+| **3. OpenSBI v1.2 フルブート** | 共有 DDR + fw_payload、16550 互換 UART、M→S、sim + **実機**で banner+payload | ✅ |
+| **4. Linux 6.12 → userspace** | earlycon=sbi → ttyS0 切替 → PID1 → `LINUX-USERSPACE-OK`、sim + **実機** | ✅ |
+| **5. FPGA timing 収束・実機 bring-up** | muldiv 多サイクル化・cache BRAM 化・FPU パイプライン化・JTAG bring-up | ✅ |
+| **① atomic 整合性バグ修正 (NET=y)** | 真因=`rv_soc` の IF-PTW が D$ wait を隠し AMO 書込喪失。修正+実機 4連続 userspace 到達 (2026-06-19) | ✅ |
+| **② 動作周波数 25→50MHz** | step1〜11 (decoupled fetch/FTQ block fetch・muldiv/FPU 段化・load→branch interlock)。実機 50MHz timing met | ✅ |
+| **③ RootFS (Buildroot bash)** | musl 静的 rootfs を initramfs 埋込 (`ROOTFS=buildroot`)。途中 #17 (fetch/PTW livelock)・#18 (faulting load の garbage retire) を根治し **sim+実機で `ROOTFS-BASH-OK`** (2026-07-03) | ✅ |
 
-**成果物:**
-- `rv_core.sv`: 5段パイプラインCPU (XLEN=32/64 切り替え可)
-- `rv_csr.sv`: CSR実装（machine/supervisor privilege）
-- `rv_mmu.sv`: MMU + PTW（ページテーブルウォーカー）
-- `rv_timer.sv`: CLINT互換タイマー周辺機器
+②③ の過程で RTL バグ #14〜#18 を発見・根治 (各 bare repro `src/software/boot/*_test.S` で回帰固定)。
+詳細は `docs/rtl_bug_history.md`・`docs/freq_50mhz.md`。
 
 ---
 
-## Phase 1: SoC統合・周辺機器 ⏳ **60% 進行中**
+## 今後のロードマップ (優先度順)
 
-CPU + メモリ + I/O周辺機器の統合、ボード対応。
+旧①②③ (atomic 修正・周波数・RootFS) は完了。残りは独立項目で、いつでも着手可能。
 
-### Phase 1a: 周辺機器実装 ✅ **100%**
+| # | 項目 | 種別 | 工数 | リスク | 依存 |
+|---|---|---|---|---|---|
+| ④ | 他ボード対応 (PYNQ-Z1/Z2・KV260) | 横展開 | 小〜中 | 低 | 独立 |
+| ⑤ | Vector (RVV) 拡張 | 新機能 | 大 | 中 | 独立 |
+| ⑥ | RootFS の発展 (永続ストレージ / より大きな userspace) | 発展 | 中〜大 | 中 | ③ (済) |
 
-| 周辺機器 | 進捗 | 説明 |
+### ④ 他ボード対応 (横展開・低リスク)
+
+- **PYNQ-Z1 / PYNQ-Z2 = Zynq-7000 で Zybo Z7-20 とほぼ同系**。RTL 不変、XDC ピン + ボードプリセット +
+  DDR/クロックのみ。小工数の確実な勝ち。
+  - **✅ スクリプト整備完了 (2026-07-04)**: `boards/pynq_z1/` `boards/pynq_z2/` に Zybo と同型の
+    ビルド一式 (`build_all.py`/`set_pl_freq.py`/`vivado/build_pynq_z{1,2}.tcl`/`vitis/*`) を新設。
+    board_files は `pynq-z1/1.0` (vendor `www.digilentinc.com`, 大文字混在の旧規約) /
+    `pynq-z2/A.0` (vendor `tul.com.tw`) をコミュニティ配布元から vendoring (詳細は各
+    `board_files/README.md`)。board_part VLNV はハードコードせず `get_board_parts -filter` で
+    実行時解決 (旧規約の casing に非依存)。UART は Pmod JC が無いため **Pmod JB (JB1=W14
+    uart_tx, JB2=Y14 uart_rx, 両ボード共通)** に配線。`vivado.bat -tclargs project` (BD 生成のみ、
+    非synth) を両ボードで実行し board_part 解決 + BD 生成が無エラーで通ることを確認済み
+    (`www.digilentinc.com:pynq-z1:part0:1.0` / `tul.com.tw:pynq-z2:part0:1.0` に解決)。
+    同一チップ (`xc7z020clg400-1`) のため 50MHz timing closure は Zybo の結果がそのまま適用できる
+    想定 (再計測不要)。**残作業 = 実機での bitstream 合成 (`build_all.py`) + JTAG bring-up
+    (`vitis/bringup_jtag.tcl`) + `ROOTFS-BASH-OK` 到達確認** (実機所有者が実施)。
+- **KV260 = Zynq UltraScale+ (PS8/A53/DDR4)**。PS 初期化・FSBL・SmartConnect が別物で中工数。
+  - **✅ スクリプト整備完了 (2026-07-04)**: `boards/kv260/` に `build_all.py`/`set_pl_freq.py`/
+    `vivado/build_kv260.tcl`(207行の旧プレースホルダから本番品質へ全面書換)/`vivado/export_xsa.tcl`/
+    `vitis/{fsbl.py,bringup_jtag.tcl}` を新設。board_part (`xilinx.com:kv260_som:part0:1.4`) は
+    Vivado 2024.2 に同梱済みのため vendoring 不要。`apply_bd_automation ... apply_board_preset` を
+    board_part のみ (carrier の board_connections 無し) で実行し **DDR4 64bit 構成が CRITICAL
+    WARNING 無しで通ることを実測確認済み** (Vivado `project` ステージ実行、exit code 0、無害な
+    PS8 特有 WARNING 2件 [AWUSER/ARUSER_WIDTH mismatch] のみ)。UART は J2 Pmod 互換ヘッダの
+    `som240_1_b21`(E12)/`som240_1_b22`(D11) に配線 (Xilinx 公式 part0_pins.xml とコミュニティ
+    gist の2系統で座標一致を確認済みだが、実配線前にユーザー側でのスキーマティック再確認を推奨)。
+    **⚠️ 3点の未検証/簡略化**: ①UART ピンの物理配線は上記の通りクロスチェック止まり
+    (実配線前確認推奨)、②JTAG bring-up は Zynq-7000 と異なり FSBL+PMUFW の実行が必須
+    (`ps7_init` 相当のレジスタ叩きのみでは完結しない) でドキュメントベースの組立につき
+    実機未検証、③PL クロック実現値は PS7 と異なり複数 PLL 構成のため `set_pl_freq.py` は
+    実現値の自動計算をせず PL_FREQMHZ 書換のみに留めた (詳細は各 README/スクリプト冒頭コメント)。
+    **残作業 = 実機での bitstream 合成 + Vitis FSBL/PMUFW ビルド + JTAG bring-up (要デバッグの
+    可能性あり) + `ROOTFS-BASH-OK` 到達確認** (実機所有者が実施)。
+
+### ⑤ Vector (RVV) 拡張 (新機能)
+
+ベクタレジスタファイル・レーン演算・`vsetvl` 等の大規模 RTL 追加。Linux には不要 (RVV はオプション)。
+着手時は `rv_core.sv` の EX/regfile 周辺の surgical な分割を併せて検討 (下記リファクタリング方針)。
+
+### ⑥ RootFS の発展
+
+現状 = Buildroot musl 静的 (bash+busybox) を initramfs として Image に埋込。次の段階:
+1. **initramfs の拡充** (coreutils/テストプログラム追加) — 新ペリフェラル不要。
+2. **永続ストレージ** — PL に SD/SPI コントローラ IP、または PS-PL 共有メモリ経由の virtio-block
+   (A9 をバックエンド) → 本物のディストリビューション RootFS (Debian/Ubuntu base)。
+3. DDR マッピング拡張 (現状 64MB → 実機 1GB) は 2. と併せて。
+
+### (リスト外) SMP / マルチハート
+
+現状 LR/SC にコヒーレンシ無し → キャッシュコヒーレンシ機構が必要な超大型項目。
+プラットフォーム安定後 (④⑤ より先送り) の検討対象。
+
+---
+
+## 解決済みの実機バグ (アーカイブ)
+
+| バグ | 状態 | 対応 |
 |---|---|---|
-| **UART（8N1）** | ✅ 100% | rv_uart.sv、TX/RX状態機、ボーレート可変 |
-| **タイマー** | ✅ 100% | rv_timer.sv（既述） |
-| **GPIO入出力** | ✅ 100% | rv_soc.sv で 4-bit GPIO バス |
-| **割り込みコントローラ（PLIC）** | ✅ 100% | rv_plic.sv 実装済み (8src/2ctx) |
-| **シリアルドライバ（CLINT）** | ✅ 100% | 機械タイマー+割り込みトリガ |
-
-**成果物:**
-- `rv_uart.sv`: メモリマップ UART（DATA/STAT/CTRL/DIV レジスタ）
-- `rv_timer.sv`: mtime/mtimecmp レジスタ、MTIP生成
-
-### Phase 1b: SoC統合 ✅ **100%**
-
-| 項目 | 進捗 | 説明 |
-|---|---|---|
-| **SoC トップモジュール** | ✅ 100% | rv_soc.sv（CPU+MMU+Mem統合） |
-| **UART統合** | ✅ 100% | rv_uart.sv 統合（0xC001_0000） |
-| **タイマー統合** | ✅ 100% | rv_timer.sv 統合（0xC000_0000） |
-| **GPIO統合** | ✅ 100% | rv_gpio.sv 統合（0xC002_0000、OUT/IN/DIR/IRQ_EN） |
-| **PLIC統合** | ✅ 100% | rv_plic.sv 統合（0xC010_0000、8src/2ctx、Claim/Complete） |
-| **メモリレイアウト** | ✅ 100% | 確定：IMEM@0x0, DMEM@0x8000_0000, Timer@0xC000_0000, UART@0xC001_0000, GPIO@0xC002_0000, PLIC@0xC010_0000 |
-
-**統合内容:**
-- 全周辺機器を物理アドレス [31:16] で選択、組み合わせ論理で即座にready
-- Timer割り込み(MTIP) → rv_core.timer_irq
-- UART RX/TX、GPIO変化 → PLICソース → rv_core.ext_irq（Mモード外部割り込み）
-- PLICがSモードコンテキスト(ext_irq[1])も持ち、将来のmideleg委譲に対応
-
-### Phase 1c: ボード対応 ✅ **100%**
-
-| ボード | 進捗 | 説明 |
-|---|---|---|
-| **Zybo Z7-20** | ✅ 100% | zybo_z7_top.sv（rv_soc 接続） |
-| **Kria KV260** | ✅ 100% | kv260_top.sv（rv_soc 接続） |
-| **XDC制約** | ✅ 100% | clock/button/LED/Pmod UART定義 |
-
-**成果物:**
-- `boards/zybo_z720/zybo_z7_top.sv`: Zybo Z7-20 トップ
-  - sysclk (125MHz) → clk
-  - btn[0] (active-H) → rst_n (active-L)
-  - sw[3:0] → gpio_in、gpio_out → led[3:0]
-  - Pmod JE[0]=UART_TX, JE[1]=UART_RX
-- `boards/kv260/kv260_top.sv`: Kria KV260 トップ
+| **I$ straddle** (redirect 先 straddle の squash race / 実 S_AXI_HP 非アライン AXI) | ✅ 解決 (2026-06-18) | rv_icache 2-line 化 + S_BYPASS 全廃 (commit fd382da)。sim + 実機検証済 |
+| **netlink/atomic ハング** (`nl_table_users` 1 固着 = AMO 書込喪失) | ✅ 解決 (2026-06-19) | 真因=`rv_soc.sv` IF-PTW が D$ wait を隠蔽。`ptw_for_if` ゲートで修正、実機 NET=y 4連続 userspace 到達。repro=`ptw_amo_test.S` |
+| **step8 fetch skid** (FTQ head 先行 pop → 4 バイト skid → NULL deref) | ✅ 解決 (2026-06-30) | `ftq_pop` narrow 化 (commit 6335611)。repro=`skid_*_test.S`、`sim_cache_soc` で決定的再現 |
+| **#17 fetch/PTW livelock** (demand-paged CALL 先 IF page fault) | ✅ 解決 (2026-07-02) | `fetch_dead_q` + ifpf take ゲート (commit 21094bb)。repro=`callfault_test.S` |
+| **#18 faulting load の garbage retire** (MEM/WB ゲート漏れ) | ✅ 解決 (2026-07-03) | MEM/WB バブル条件に `mem_trap_enter` 追加 (commit 5e5d52d)。userspace 散発 SIGSEGV 根治 |
 
 ---
 
-## Phase 2: ブートシーケンス ⏹ **0% (未開始)**
+## リファクタリング方針 (2026-07-03 更新)
 
-FPGA初期化、リセットからLinuxカーネル起動まで。
+**構成は概ね良好。大規模リファクタは引き続きやらない。** コードは「実機 Linux + RootFS bash 到達」という
+hard-won な known-good 状態 (RTL バグ #1〜#18 修正済) にあり、検証済みパイプラインの分割は同クラスの
+subtle bug を再混入するリスクが高い。
 
-| 項目 | 進捗 | 説明 |
-|---|---|---|
-| **ブートローダー（OpenSBI）** | ⏹ 0% | M-mode ファームウェア、ページングセットアップ |
-| **デバイスツリー（.dts）** | ⏹ 0% | RISC-V CPU/MMU/UART/Timer定義 |
-| **ブートプロトコル** | ⏹ 0% | kernel entry @ 0x80200000、a0=hartid, a1=fdt |
-| **メモリレイアウト（最終）** | ⏹ 0% | OpenSBI @ 0x80000000, Kernel @ 0x80200000, DTB, Rootfs |
-| **システムクロック** | ⏹ 0% | 125MHz（Zybo）or PL clock（KV260） |
-
-**必要な作業:**
-1. OpenSBI をコンパイル・カスタマイズ
-2. Device Tree Compiler（DTC）でボード用 .dts 作成
-3. 初期化コード（CRT0）：M-mode 割り込みハンドラ、page table setup
+- `rv_core.sv` (~2240 行) は stall/flush 条件が多いが、各条件に「なぜ・no-op 証明」のコメントが
+  付いており、履歴は `docs/rtl_bug_history.md` と対応。**分割は ⑤ (RVV) 等で該当箇所を触るときに
+  その範囲だけ surgical に**。先回りの全面分割はしない。
+- `tb_rv_boot_soc.sv` のデバッグ計装 (`BOOT_*` ifdef 群) は「恒久検出器」と「バグ調査用の使い捨て」が
+  混在。分類は TB 冒頭のコメント参照。削除は full Linux ゲート再実行とセットでのみ行う。
+- マイクロアーキ変更は **full Linux boot (`ROOTFS-BASH-OK`) を必須ゲート** にする (CLAUDE.md 参照)。
 
 ---
 
-## Phase 3: Linuxカーネル移植 ⏹ **0% (未開始)**
+## 関連ドキュメント
 
-Linux 5.x以上の RISC-V ポート活用・ビルド。
-
-| 項目 | 進捗 | 説明 |
-|---|---|---|
-| **カーネルソース** | ⏹ 0% | linux-riscv リポジトリ clone |
-| **コンフィグ** | ⏹ 0% | .config（RISC-V, MMU, 32/64-bit選択） |
-| **.ko ビルド** | ⏹ 0% | defconfig or custom config → bzImage/vmlinux |
-| **デバイスドライバ** | ⏹ 0% | UART driver（既存 8250 利用 or カスタム） |
-| **割り込みハンドラ** | ⏹ 0% | Linux PLIC driver（if needed） |
-| **ページング** | ⏹ 0% | Sv32/Sv39 サポート確認 |
-| **システムコール** | ⏹ 0% | glibc ABI 互換 |
-
-**必要な作業:**
-1. `make ARCH=riscv defconfig` で基本設定
-2. UART, MMU デバイス有効化
-3. `make ARCH=riscv CROSS_COMPILE=riscv64-unknown-elf- -j8`
-
----
-
-## Phase 4: ユーザースペース・ルートFS ⏹ **0% (未開始)**
-
-Linuxアプリケーション環境構築。
-
-| 項目 | 進捗 | 説明 |
-|---|---|---|
-| **ツールチェーン** | ⏹ 0% | riscv64-unknown-elf-gcc/binutils（既存使用） |
-| **glibc** | ⏹ 0% | RISC-V glibc ビルド |
-| **BusyBox** | ⏹ 0% | initramfs 用ミニシェル・ユーティリティ |
-| **ルートファイルシステム** | ⏹ 0% | ext4/initramfs で / 構築 |
-| **ブートスクリプト** | ⏹ 0% | /etc/init.d/rcS で UART init |
-
----
-
-## Phase 5: 検証・最適化 ⏹ **0% (未開始)**
-
-パフォーマンス、スケーラビリティ。
-
-| 項目 | 進捗 | 説明 |
-|---|---|---|
-| **性能測定** | ⏹ 0% | dhrystone/coremark ベンチマーク |
-| **マルチコア** | ⏹ 0% | 現在はシングルコア |
-| **仮想化（KVM）** | ⏹ 0% | Hypervisor 実装 |
-
----
-
-## 現在地：Phase 1 完了 → Phase 2 (ブートローダー) 開始へ
-
-```
-Phase 0:  ████████████████████ 100% ✅  CPU/MMU基盤
-Phase 1a: ████████████████████ 100% ✅  周辺機器実装 (Timer/UART/GPIO/PLIC)
-Phase 1b: ████████████████████ 100% ✅  SoC統合 (アドレスデコード+割り込み)
-Phase 1c: ████████████████████ 100% ✅  ボード対応 (Zybo Z7-20)
----
-Phase 2:  ░░░░░░░░░░░░░░░░░░░░ 0%   ⏹  ブート (OpenSBI + DTB)
-Phase 3:  ░░░░░░░░░░░░░░░░░░░░ 0%   ⏹  Linux カーネル
-Phase 4:  ░░░░░░░░░░░░░░░░░░░░ 0%   ⏹  ユーザー空間
-Phase 5:  ░░░░░░░░░░░░░░░░░░░░ 0%   ⏹  最適化
-
-全体: █████████████░░░░░░░ 65%
-```
-
-### フルSoCメモリマップ（確定版）
-| 物理アドレス | 周辺機器 | 説明 |
-|---|---|---|
-| 0x0000_0000 | IMEM | 命令メモリ（最大32KB） |
-| 0x8000_0000 | DMEM | データメモリ（最大16KB） |
-| 0xC000_0000 | Timer/CLINT | mtime/mtimecmp (MTIP) |
-| 0xC001_0000 | UART | 8N1 115200bps DATA/STAT/CTRL/DIV |
-| 0xC002_0000 | GPIO | OUT/IN/DIR/IRQ_EN (LED/SW) |
-| 0xC010_0000 | PLIC | 8src/2ctx Priority/Pending/Enable/Threshold/Claim |
-
----
-
-## 次の優先タスク（Phase 2: OpenSBIブートローダー）
-
-1. **OpenSBI ビルド環境構築** (medium) ⏳ **次のステップ**
-   - riscv-gnu-toolchain（既インストール）を確認
-   - OpenSBI リポジトリのclone・ビルド
-   - Zybo Z7-20 プラットフォーム設定作成
-
-2. **Device Tree (.dts) 作成** (medium)
-   - CPUノード（RV32I + M/A/Zicsr拡張、Sv32ページング）
-   - メモリノード（IMEM@0x0, DMEM@0x8000_0000）
-   - Timer/CLINT、UART、GPIO、PLICのデバイス記述
-   - Zybo Z7-20 ボード用 .dtsi 作成
-
-3. **ブートプロトコル実装** (large)
-   - リセットエントリー (0x0) → M-modeファームウェア
-   - OpenSBI @ 0x8000_0000 → カーネルに委譲
-   - a0=hartid, a1=DTBアドレスの受け渡し
-
-**完了したタスク（Phase 1）:**
-- ✅ Timer統合（0xC000_0000）, UART統合（0xC001_0000）
-- ✅ GPIO統合（0xC002_0000、LEDとスイッチ対応）
-- ✅ PLIC統合（0xC010_0000、M/Sモード2コンテキスト）
-- ✅ ユニットテスト：121/121 全パス
-- ✅ フルSoCコンパイル：0エラー
-
----
-
-## 必要な外部リソース
-
-- **RISC-V ISA仕様**: https://riscv.org/technical/specifications/
-- **OpenSBI**: https://github.com/riscv-software-src/opensbi
-- **Linux RISC-V**: https://github.com/torvalds/linux (arch/riscv)
-- **Device Tree**: https://devicetree.org/
-- **RISC-V Tools**: riscv-gnu-toolchain (既インストール: riscv64-unknown-elf-gcc)
-
----
-
-## リスク・制約
-
-| リスク | 影響 | 対策 |
-|---|---|---|
-| **XLEN 32/64の自動切り替え不安定** | Medium | 32-bit 固定でLinux 32-bit版を目指す |
-| **PLIC未実装** | Medium | ひとまず割り込みなしで起動、後付け |
-| **C拡張未実装** | Low | Linux自体は使用するが、ユーザーアプリには影響小 |
-| **FPU（浮動小数点）未実装** | Low | ソフトウェアFP で対応 |
-| **外部割り込み（PLIC）** | Medium | MMIO レジスタで手動制御（開発段階） |
-
----
-
-## 参考：他のRISC-V Linux実装例
-
-- **Rocket Chip（UC Berkeley）**: フル64-bit RISC-V、Berkeley Boot ROM + Linux
-- **SiFive HiFive**（商用）: SoC実装、Linux対応
-- **VexRISCV（LiteX SoC）**: オープンソース、Linuxベースシステム
-
-本プロジェクトは SiFive 相当の規模を目指しているが、単一の小コアのため性能は低め。
+- `CLAUDE.md` — ISA/テスト状況・ビルド手順・設計判断・実機 bring-up の総合インデックス。
+- `docs/architecture.md` — アーキテクチャ概要。
+- `docs/axi_ddr.md` / `docs/cache.md` — メモリサブシステム・キャッシュ。
+- `docs/opensbi_sim.md` / `docs/linux_sim.md` / `docs/verilator_sim.md` — ブート sim 環境。
+- `docs/fpga_timing_bringup.md` — FPGA timing 収束・実機 bring-up (25MHz 期)。
+- `docs/freq_50mhz.md` — 周波数 25→50MHz キャンペーンの記録 (冒頭にサマリ、以降は詳細ログ)。
+- `docs/rtl_bug_history.md` — RTL バグ #1〜#18 詳細。
+- memory `linux_boot_roadmap` / `freq-50mhz-roadmap2` — 経緯の要約。

@@ -1,0 +1,83 @@
+# =============================================================================
+# .gitattributes - deterministic line endings across Windows / Linux.
+# =============================================================================
+# This project is developed on Windows but almost every script and build input is
+# consumed by Linux tooling (bash, docker, dtc, gcc, iverilog/verilator, riscof),
+# where a stray CR breaks shell scripts, Makefiles and device-tree sources.  The
+# repo currently even ships CRLF blobs for build.sh / Makefile (the Makefiles work
+# around it with `tr -d '\015'`); this file removes the need for such hacks.
+#
+# Policy: store and check out ALL text files as LF on EVERY platform.  The
+# explicit `eol=lf` overrides whatever the user's `core.autocrlf` is set to, so
+# behaviour no longer depends on git config.  Binary files are auto-detected and
+# left untouched; the explicit `binary` rules below are a safety net.
+#
+# After adding/changing this file, renormalize the working tree once:
+#     git add --renormalize .
+#     git commit -m "normalize line endings (LF) via .gitattributes"
+# =============================================================================
+
+# ---- Default: every text file is LF, everywhere ----
+* text=auto eol=lf
+
+# ---- Build-critical text re-asserted as LF (intent + robustness) -------------
+# A CR in any of these directly breaks a Linux build / boot step.
+*.sh         text eol=lf
+*.py         text eol=lf
+*.tcl        text eol=lf
+*.mk         text eol=lf
+Makefile     text eol=lf
+makefile     text eol=lf
+GNUmakefile  text eol=lf
+Dockerfile   text eol=lf
+Dockerfile.* text eol=lf
+*.dts        text eol=lf
+*.dtsi       text eol=lf
+*.ld         text eol=lf
+*.S          text eol=lf
+*.s          text eol=lf
+*.c          text eol=lf
+*.h          text eol=lf
+*.sv         text eol=lf
+*.v          text eol=lf
+*.config     text eol=lf
+*.bif        text eol=lf
+*.xdc        text eol=lf
+
+# ---- Windows-only scripts that MUST stay CRLF (cmd.exe) ----------------------
+# (none committed today; here so they are correct if ever added.)
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+
+# ---- Binary: never normalize / never diff as text ---------------------------
+# FPGA / Vivado / Vitis
+*.bit        binary
+*.dcp        binary
+*.xsa        binary
+*.ltx        binary
+*.mcs        binary
+*.bin        binary
+# firmware / objects / device-tree blobs
+*.elf        binary
+*.o          binary
+*.a          binary
+*.so         binary
+*.ko         binary
+*.dtb        binary
+*.dtbo       binary
+# archives
+*.zip        binary
+*.gz         binary
+*.tgz        binary
+*.bz2        binary
+*.xz         binary
+*.7z         binary
+*.tar        binary
+# images / docs
+*.png        binary
+*.jpg        binary
+*.jpeg       binary
+*.gif        binary
+*.bmp        binary
+*.ico        binary
+*.pdf        binary
